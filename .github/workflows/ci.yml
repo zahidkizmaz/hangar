@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# A new push to the same branch cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # cargo-binstall looks tools up on GitHub; anonymous requests share the
+    # runner's IP rate limit and time out. The token is read-only here.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    # Each runner checks its own system: the darwin module only evaluates on
+    # macOS, the NixOS module on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      # The cache only saves time: it must never block or fail CI.
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          use-flakehub: false
+          use-gha-cache: true
+      - uses: DeterminateSystems/flake-checker-action@786422608c7bded2bbc9741ad9f91356842bf520 # v14
+      - run: nix flake check --print-build-logs
+      # The bay's NixOS system, with hangar-start's shellcheck; the image
+      # itself is published by image.yml.
+      - if: runner.os == 'Linux'
+        run: nix build --print-build-logs .#bay-image
+      - run: nix develop --command prek run --all-files --show-diff-on-failure
+      - run: nix develop --command cargo deny check
+      # The baseline was measured on macOS (keychain code differs per OS).
+      # Raise the floor as tests are added; never lower it.
+      - if: runner.os == 'macOS'
+        run: nix develop --command cargo llvm-cov nextest --summary-only --fail-under-lines 98
+      # The prek hook only scans staged changes; CI scans the full history.
+      - run: nix develop --command gitleaks git --redact --no-banner

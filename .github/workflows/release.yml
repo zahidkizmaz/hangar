@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  # Built by the runner's rustup (rust-toolchain.toml), not Nix: a
+  # Nix-built binary links /nix/store paths and wouldn't run without Nix.
+  # Linux builds are static (musl) so they run on any distro.
+  build:
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - {runner: macos-26, target: aarch64-darwin, rust: aarch64-apple-darwin}
+          - {runner: ubuntu-26.04, target: x86_64-linux, rust: x86_64-unknown-linux-musl}
+          - {runner: ubuntu-26.04-arm, target: aarch64-linux, rust: aarch64-unknown-linux-musl}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+      RUST_TARGET: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup target add "$RUST_TARGET"
+      - run: cargo build --release --locked --target "$RUST_TARGET"
+      - run: cp "target/$RUST_TARGET/release/hangar" "hangar-$TARGET"
+      # Only debug builds may take the CLI tests' fake keychain.
+      - run: |
+          if grep -q HANGAR_TEST_KEYCHAIN_TOOL "hangar-$TARGET"; then
+            echo "release binary reads HANGAR_TEST_KEYCHAIN_TOOL" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hangar-${{ matrix.target }}
+          path: hangar-${{ matrix.target }}
+
+  # One job creates the release: parallel jobs racing to create the same
+  # release fail with "already_exists".
+  release:
+    timeout-minutes: 30
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+      - run: sha256sum hangar-* >SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --generate-notes hangar-* SHA256SUMS

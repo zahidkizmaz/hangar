@@ -1,0 +1,53 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  nix: {
+    enabled: true,
+  },
+  // Refreshes flake.lock and Cargo.lock within existing constraints.
+  lockFileMaintenance: {
+    enabled: true,
+    automerge: true,
+  },
+  platformAutomerge: true,
+  // Automerged updates wait out the window in which bad releases get yanked.
+  minimumReleaseAge: "14 days",
+  customManagers: [
+    {
+      // Dev tools pinned for cargo-run-bin in Cargo.toml [package.metadata.bin].
+      customType: "regex",
+      managerFilePatterns: ["/^Cargo\\.toml$/"],
+      matchStrings: ['(?<depName>cargo-[a-z0-9-]+) = \\{ version = "(?<currentValue>[^"]+)"'],
+      datasourceTemplate: "crate",
+    },
+    {
+      // The vault image: security fixes must arrive.
+      customType: "regex",
+      managerFilePatterns: ["/^config/defaults\\.json$/"],
+      matchStrings: ['"image": "(?<depName>infisical/agent-vault):(?<currentValue>[^@"]+)@(?<currentDigest>sha256:[a-f0-9]+)"'],
+      datasourceTemplate: "docker",
+    },
+    {
+      // microsandbox release binaries; the hashes need a manual update.
+      customType: "regex",
+      managerFilePatterns: ["/^nix/microsandbox\\.nix$/"],
+      matchStrings: ['version = "(?<currentValue>[^"]+)";'],
+      depNameTemplate: "superradcompany/microsandbox",
+      datasourceTemplate: "github-releases",
+      extractVersionTemplate: "^v(?<version>.*)$",
+    },
+  ],
+  packageRules: [
+    {
+      // Majors stay manual.
+      matchManagers: ["cargo", "github-actions", "rust-toolchain", "custom.regex"],
+      matchUpdateTypes: ["minor", "patch", "pin", "digest"],
+      automerge: true,
+    },
+    {
+      // Its hashes must be updated by hand before merging.
+      matchDepNames: ["superradcompany/microsandbox"],
+      automerge: false,
+    },
+  ],
+}

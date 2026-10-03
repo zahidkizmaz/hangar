@@ -1,0 +1,6 @@
+# GitHub-hosted labels newer than actionlint's built-in list. Drop an entry
+# once actionlint knows it.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

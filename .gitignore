@@ -1,0 +1,40 @@
+# Rust
+/target
+/.bin/
+**/*.rs.bk
+*.profraw
+*.profdata
+lcov.info
+
+# Nix
+result
+result-*
+.direnv/
+
+# Secrets and local config: never part of the repo
+.env
+.env.*
+*.pem
+*.key
+hangar.json
+
+# Logs and scratch
+*.log
+*.tmp
+
+# Editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tracked here even though some global gitignores exclude it.
+!AGENTS.md

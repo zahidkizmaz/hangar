@@ -1,0 +1,183 @@
+# The bay as a NixOS system. msb's agentd sets up the VM, then hands PID 1
+# to /sbin/init (`--init`): NixOS stage 2, then systemd
+# (docs/architecture.md, "The bay image").
+{
+  config,
+  lib,
+  pkgs,
+  modulesPath,
+  ...
+}:
+let
+  hangarStart = pkgs.writeShellApplication {
+    name = "hangar-start";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.diffutils
+      pkgs.gnused
+      pkgs.util-linux
+      config.systemd.package
+      config.virtualisation.docker.rootless.package
+    ];
+    runtimeEnv.CACERT_BUNDLE = config.security.pki.caBundle;
+    text = builtins.readFile ../../guest/start.sh;
+  };
+in
+{
+  imports = [ "${modulesPath}/profiles/minimal.nix" ];
+
+  # msb brings the kernel and agentd is stage 1: no initrd, bootloader or
+  # hardware units.
+  boot.isContainer = true;
+  networking.hostName = "";
+  # agentd writes resolv.conf and /etc/hosts and configures eth0.
+  networking.resolvconf.enable = false;
+  environment.etc.hosts.enable = false;
+  networking.dhcpcd.enable = false;
+  networking.firewall.enable = false;
+  # agentd owns hvc0; the gettys would wait 90 s for it.
+  systemd.services =
+    lib.genAttrs
+      [
+        "serial-getty@hvc0"
+        "console-getty"
+        "getty@tty1"
+        "autovt@tty1"
+      ]
+      (_: {
+        enable = false;
+      })
+    // {
+      # Written by hangar-start at `up`; `-` lets it start before.
+      nix-daemon.serviceConfig.EnvironmentFile = "-/etc/hangar/proxy.env";
+    };
+
+  # Nobody logs in: hangar reaches root through `msb exec`.
+  users.mutableUsers = false;
+  users.allowNoPasswordLogin = true;
+  security.sudo.enable = false;
+  # Left: newuidmap/newgidmap (capabilities) for rootless Docker, and
+  # setuid unix_chkpwd, without which PAM fails user@1000.
+  security.wrappers =
+    lib.genAttrs
+      [
+        "su"
+        "sg"
+        "newgrp"
+        "mount"
+        "umount"
+      ]
+      (_: {
+        enable = lib.mkForce false;
+      });
+  users.users.pilot = {
+    isNormalUser = true;
+    uid = 1000;
+    group = "pilot";
+    home = "/home/pilot";
+    # Often a host mount: NixOS must never create or chmod it.
+    createHome = false;
+    subUidRanges = [
+      {
+        startUid = 100000;
+        count = 65536;
+      }
+    ];
+    subGidRanges = [
+      {
+        startGid = 100000;
+        count = 65536;
+      }
+    ];
+    # Starts user@1000, and so pilot's dockerd, without a login.
+    linger = true;
+  };
+  users.groups.pilot.gid = 1000;
+
+  virtualisation.docker.rootless = {
+    enable = true;
+    setSocketVariable = true;
+    daemon.settings.data-root = "/var/lib/pilot/docker";
+  };
+  systemd.user.services.docker.serviceConfig = {
+    EnvironmentFile = "-/etc/hangar/proxy.env";
+    # Overrides the module's TimeoutSec = 0 for starts, so hangar-start
+    # can't hang `up`.
+    TimeoutStartSec = "60s";
+  };
+
+  nix.settings = {
+    experimental-features = [
+      "nix-command"
+      "flakes"
+    ];
+    sandbox = false;
+    # llm-agents.nix's binary cache, for agent CLIs in a bay's packages.
+    extra-substituters = [ "https://cache.numtide.com" ];
+    extra-trusted-public-keys = [
+      "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+    ];
+  };
+  nix.channel.enable = false;
+  # Image size: no nixos-rebuild and no copy of nixpkgs.
+  system.disableInstallerTools = true;
+  nixpkgs.flake.setNixPath = false;
+  nixpkgs.flake.setFlakeRegistry = false;
+
+  # agentd appends to both on every boot, before activation: through a
+  # store symlink it would write into /nix/store.
+  environment.etc.profile.mode = "0644";
+  environment.etc."ssl/certs/ca-certificates.crt".mode = "0644";
+
+  systemd.tmpfiles.rules = [
+    "d /etc/hangar 0755 root root -"
+    "d /var/lib/hangar 0755 root root -"
+    "z /dev/net/tun 0666 root root -"
+    "d /var/lib/pilot 0755 pilot pilot -"
+    "d /var/log/hangar 0755 pilot pilot -"
+    "d /run/hangar-run 0755 pilot pilot -"
+  ];
+  environment.profiles = lib.mkBefore [ "/nix/var/nix/profiles/hangar" ];
+
+  # `msb exec` is no PAM login. hangar-start writes proxy.env and `up`
+  # bay.env, both KEY='value' lines.
+  environment.extraInit = lib.mkBefore ''
+    : "''${USER:=$(id -un)}" "''${LOGNAME:=$USER}"
+    export USER LOGNAME
+    if [ -z "''${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    fi
+    for f in /etc/hangar/proxy.env /etc/hangar/bay.env; do
+      if [ -r "$f" ]; then set -a; . "$f"; set +a; fi
+    done
+    unset f
+  '';
+  # agent-vault swaps in the real token; git only needs a placeholder.
+  environment.etc.gitconfig.text = ''
+    [credential "https://github.com"]
+    	helper = "!f() { echo username=x-access-token; echo password=__placeholder__; }; f"
+  '';
+  programs.direnv = {
+    enable = true;
+    nix-direnv.enable = true;
+  };
+
+  # On top of NixOS's core packages (coreutils, curl, …), nix and docker.
+  environment.systemPackages = with pkgs; [
+    hangarStart
+    file
+    unzip
+    git
+    gh
+    uv
+    gnumake
+    just
+    ripgrep
+    fd
+    jq
+    yq-go
+    ast-grep
+  ];
+
+  system.stateVersion = "26.05";
+}

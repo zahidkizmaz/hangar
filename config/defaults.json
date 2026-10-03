@@ -1,0 +1,28 @@
+{
+  "sandbox": {
+    "backend": "msb"
+  },
+  "tower": {
+    "backend": "agent-vault",
+    "agentVault": {
+      "image": "infisical/agent-vault:0.40.0@sha256:4d490e2586c553ea121fa404b66812ad40c246cc841b0cc746682d0a360bdf1e",
+      "adminPort": 14321,
+      "proxyPort": 14322
+    },
+    "credentialFiles": {}
+  },
+  "bay": {
+    "image": null,
+    "imageRepository": "ghcr.io/zahidkizmaz/hangar-bay",
+    "cpus": 4,
+    "memory": "6G",
+    "disk": "40G",
+    "packages": [],
+    "env": {},
+    "run": {},
+    "files": {},
+    "mounts": {},
+    "home": true,
+    "cache": true
+  }
+}
