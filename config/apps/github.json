@@ -1,0 +1,13 @@
+{
+  "routes": [
+    { "name": "github-api", "host": "api.github.com", "auth": { "type": "passthrough" } },
+    { "name": "github-git", "host": "github.com", "auth": { "type": "passthrough" } },
+    { "name": "github-codeload", "host": "codeload.github.com", "auth": { "type": "passthrough" } },
+    { "name": "github-objects", "host": "objects.githubusercontent.com", "auth": { "type": "passthrough" } },
+    {
+      "name": "github-release-assets",
+      "host": "release-assets.githubusercontent.com",
+      "auth": { "type": "passthrough" }
+    }
+  ]
+}

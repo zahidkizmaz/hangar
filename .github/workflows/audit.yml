@@ -1,0 +1,28 @@
+name: audit
+
+# New advisories appear without any change to the repo, so PR CI never
+# sees them.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  advisories:
+    timeout-minutes: 30
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    # cargo-binstall looks tools up on GitHub; anonymous requests share the
+    # runner's IP rate limit and time out. The token is read-only here.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      # The cargo-deny pinned in Cargo.toml, as in CI.
+      - run: nix develop --command cargo deny check advisories

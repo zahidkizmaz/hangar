@@ -1,0 +1,71 @@
+# Run `prek install` once inside `nix develop`; the local hooks use the
+# devShell's tools.
+repos:
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-json
+      - id: check-json5
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+      # Advisories need the network; CI checks them.
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny --offline check licenses bans sources
+        language: system
+        files: ^(Cargo\.(toml|lock)|deny\.toml)$
+        pass_filenames: false
+      - id: nixfmt
+        name: nixfmt
+        entry: nixfmt --check
+        language: system
+        types: [nix]
+      - id: yamlfmt
+        name: yamlfmt
+        entry: yamlfmt
+        language: system
+        files: \.(yml|yaml)$
+      - id: yamllint
+        name: yamllint
+        entry: yamllint --strict
+        language: system
+        files: \.(yml|yaml)$
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+      - id: actionlint
+        name: actionlint
+        entry: actionlint
+        language: system
+        files: ^\.github/workflows/
+      - id: zizmor
+        name: zizmor
+        entry: zizmor --offline
+        language: system
+        files: ^\.github/workflows/
+      - id: gitleaks
+        name: gitleaks
+        entry: gitleaks git --pre-commit --redact --staged --no-banner
+        language: system
+        pass_filenames: false

@@ -1,0 +1,7 @@
+{
+  "routes": [
+    { "name": "pypi", "host": "pypi.org", "auth": { "type": "passthrough" } },
+    { "name": "pypi-files", "host": "files.pythonhosted.org", "auth": { "type": "passthrough" } },
+    { "name": "uv-python", "host": "releases.astral.sh", "auth": { "type": "passthrough" } }
+  ]
+}

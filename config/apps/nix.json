@@ -1,0 +1,8 @@
+{
+  "routes": [
+    { "name": "nix-cache", "host": "cache.nixos.org", "auth": { "type": "passthrough" } },
+    { "name": "numtide-cache", "host": "cache.numtide.com", "auth": { "type": "passthrough" } },
+    { "name": "nix-channels", "host": "channels.nixos.org", "auth": { "type": "passthrough" } },
+    { "name": "nix-releases", "host": "releases.nixos.org", "auth": { "type": "passthrough" } }
+  ]
+}

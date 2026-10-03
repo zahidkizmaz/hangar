@@ -1,0 +1,10 @@
+{
+  "packages": ["github:numtide/llm-agents.nix#claude-code"],
+  "routes": [
+    {
+      "name": "anthropic",
+      "host": "api.anthropic.com",
+      "auth": { "type": "bearer", "token": "CLAUDE_CODE_OAUTH_TOKEN" }
+    }
+  ]
+}

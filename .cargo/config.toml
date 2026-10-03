@@ -1,0 +1,4 @@
+[alias]
+deny = ["bin", "cargo-deny"]
+llvm-cov = ["bin", "cargo-llvm-cov"]
+nextest = ["bin", "cargo-nextest"]

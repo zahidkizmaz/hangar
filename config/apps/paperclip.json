@@ -1,0 +1,14 @@
+{
+  "packages": ["github:numtide/llm-agents.nix#paperclip"],
+  "env": {
+    "PAPERCLIP_DEPLOYMENT_MODE": "authenticated",
+    "PAPERCLIP_DEPLOYMENT_EXPOSURE": "private",
+    "PAPERCLIP_BIND": "lan"
+  },
+  "setup": {
+    "command": "paperclipai onboard",
+    "check": "test -f ~/.paperclip/instances/default/config.json"
+  },
+  "run": "paperclipai run",
+  "ports": [{ "name": "paperclip", "vm": 3100, "purpose": "Paperclip web UI" }]
+}

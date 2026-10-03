@@ -1,0 +1,14 @@
+extends: default
+rules:
+  document-start:
+    present: false
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  line-length:
+    # SHA-pinned actions (`uses: owner/action@<sha> # vX.Y.Z`) can't wrap.
+    max: 120
+  # GitHub workflows use `on:` as a key, not a boolean.
+  truthy:
+    check-keys: false

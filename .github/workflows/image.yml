@@ -1,0 +1,81 @@
+name: bay image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+# A new push to the same branch cancels the image build it supersedes.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hangar-bay
+
+jobs:
+  build:
+    # Cold Nix builds plus a large push.
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-26.04, system: x86_64-linux, arch: amd64}
+          - {runner: ubuntu-26.04-arm, system: aarch64-linux, arch: arm64}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      # No Nix cache: a published image must not build from a cache that
+      # pull requests can write to.
+      - run: nix build ".#packages.$SYSTEM.bay-image"
+        env:
+          SYSTEM: ${{ matrix.system }}
+      - name: SBOM
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: >-
+          nix run --inputs-from . nixpkgs#sbomnix -- ./result --cdx "sbom-$ARCH.cdx.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom-${{ matrix.arch }}.cdx.json
+      - name: push ${{ matrix.arch }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          skopeo() { nix run --inputs-from . nixpkgs#skopeo -- "$@"; }
+          echo "$TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" \
+            --password-stdin
+          ./result | gzip --fast | skopeo copy docker-archive:/dev/stdin \
+            "docker://$IMAGE:$GITHUB_SHA-$ARCH"
+
+  manifest:
+    timeout-minutes: 30
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      packages: write
+    steps:
+      - name: multi-arch manifest
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" \
+            --password-stdin
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" -t "$IMAGE:$GITHUB_SHA" \
+            "$IMAGE:$GITHUB_SHA-amd64" "$IMAGE:$GITHUB_SHA-arm64"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Pin this: \`$IMAGE@$digest\`" >>"$GITHUB_STEP_SUMMARY"

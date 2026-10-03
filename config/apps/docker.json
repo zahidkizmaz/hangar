@@ -1,0 +1,7 @@
+{
+  "routes": [
+    { "name": "docker-io", "host": "*.docker.io", "auth": { "type": "passthrough" } },
+    { "name": "docker-com", "host": "*.docker.com", "auth": { "type": "passthrough" } },
+    { "name": "docker-cdn", "host": "production.cloudfront.docker.com", "auth": { "type": "passthrough" } }
+  ]
+}
