@@ -11,14 +11,13 @@ let
   inherit (lib) mkOption types;
 
   msb = pkgs.callPackage ./microsandbox.nix { };
-  nonEmpty = lib.filterAttrs (_: value: value != null && value != [ ] && value != { });
 
   # Only what's set here; the CLI fills in config/defaults.json for the rest.
   settings = lib.recursiveUpdate cfg.settings (
     {
       tower = {
         inherit (cfg.tower) credentialFiles;
-        routes = map renderRoute cfg.tower.routes;
+        routes = map (lib.filterAttrs (_: value: value != null)) cfg.tower.routes;
       }
       // lib.optionalAttrs (cfg.tower.masterPasswordFile != null) {
         inherit (cfg.tower) masterPasswordFile;
@@ -26,41 +25,17 @@ let
     }
     // lib.optionalAttrs (cfg.bays != [ ]) { bays = map renderBay cfg.bays; }
     // lib.optionalAttrs (cfg.appDefinitions != { }) { inherit (cfg) appDefinitions; }
-    // lib.optionalAttrs (cfg.stateDir != null) {
-      inherit (cfg) stateDir;
-    }
+    // lib.optionalAttrs (cfg.stateDir != null) { inherit (cfg) stateDir; }
   );
-
-  renderRoute =
-    route:
-    lib.filterAttrs (_: value: value != null) {
-      inherit (route)
-        name
-        host
-        auth
-        extra
-        ;
-    };
 
   renderBay =
     bay:
-    nonEmpty (
-      {
-        inherit (bay)
-          name
-          apps
-          ports
-          image
-          cpus
-          memory
-          disk
-          packages
-          env
-          run
-          files
-          mounts
-          ;
-      }
+    lib.filterAttrs (_: value: value != null && value != [ ] && value != { }) (
+      removeAttrs bay [
+        "imagePackage"
+        "home"
+        "cache"
+      ]
       // lib.optionalAttrs (bay.imagePackage != null) {
         image = "${bay.imagePackage.imageName}:${bay.imagePackage.imageTag}";
         imageLoader = "${bay.imagePackage}";
@@ -412,10 +387,22 @@ in
       type = types.package;
       readOnly = true;
       internal = true;
-      default = pkgs.callPackage ./package.nix {
-        inherit settings;
-        inherit (cfg) cli msbPackage;
-      };
+      # The CLI with the settings baked into one JSON file.
+      default =
+        let
+          json = pkgs.writeText "hangar.json" (builtins.toJSON settings);
+        in
+        pkgs.runCommand "hangar"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            passthru.config = json;
+            meta.mainProgram = "hangar";
+          }
+          ''
+            makeWrapper ${lib.getExe cfg.cli} $out/bin/hangar \
+              --set HANGAR_NIX_CONFIG ${json} \
+              ${lib.optionalString (cfg.msbPackage != null) "--prefix PATH : ${cfg.msbPackage}/bin"}
+          '';
     };
   };
 }

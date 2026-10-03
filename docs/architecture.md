@@ -128,7 +128,7 @@ DB): a root of `/sbin/init` (the system's `init`), `/etc`, `/root` and
 `/home/pilot` (for `home = false`). Its `Env` is only
 `PATH=/run/wrappers/bin:/run/current-system/sw/bin`, the `PATH` of root's
 `sh -c` steps, so it never holds hangar's profile, where a bay package
-could ship its own `mv` (`nix/image.nix` asserts it). Pilot's login shell
+could ship its own `mv`. Pilot's login shell
 puts the profile first (`environment.profiles`).
 
 - Boot: `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
@@ -183,7 +183,8 @@ puts the profile first (`environment.profiles`).
   `USER`, `LOGNAME` and `XDG_RUNTIME_DIR`, then sources `proxy.env` and
   `bay.env` with `set -a`. Root's package step sources only `proxy.env`.
 - pilot: uid and gid 1000, `createHome = false` (the home is usually a
-  host mount), subuid and subgid 100000:65536. msb doesn't map uids by
+  host mount), subuid and subgid 100000:65536 (NixOS's automatic range
+  for the only normal user). msb doesn't map uids by
   identity: a mounted file shows the mount's `uid=,gid=` (`Mount.owner`),
   so the host uid doesn't matter.
 - Privileges left: `newuidmap`/`newgidmap` (capabilities, for rootless
@@ -458,7 +459,7 @@ reach them by name.
   (generic tools only).
 - `nix/module.nix`, `nix/darwin.nix`, `nix/nixos.nix`: Nix modules
   (render `hangar.json`, autostart).
-- `nix/cli.nix` builds the binary; `nix/package.nix` wraps it with the
+- `nix/cli.nix` builds the binary, which `nix/module.nix` wraps with the
   rendered config; `nix/microsandbox.nix` packages msb.
 - `tests/cli.rs`: integration tests; `nix/tests/module.nix`: the module
   check, which renders `hangar.json` and diffs it against

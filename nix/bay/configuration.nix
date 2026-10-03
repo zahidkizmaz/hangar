@@ -75,21 +75,8 @@ in
     isNormalUser = true;
     uid = 1000;
     group = "pilot";
-    home = "/home/pilot";
     # Often a host mount: NixOS must never create or chmod it.
     createHome = false;
-    subUidRanges = [
-      {
-        startUid = 100000;
-        count = 65536;
-      }
-    ];
-    subGidRanges = [
-      {
-        startGid = 100000;
-        count = 65536;
-      }
-    ];
     # Starts user@1000, and so pilot's dockerd, without a login.
     linger = true;
   };
@@ -154,21 +141,19 @@ in
     done
     unset f
   '';
-  # agent-vault swaps in the real token; git only needs a placeholder.
-  environment.etc.gitconfig.text = ''
-    [credential "https://github.com"]
-    	helper = "!f() { echo username=x-access-token; echo password=__placeholder__; }; f"
-  '';
-  programs.direnv = {
+  programs.git = {
     enable = true;
-    nix-direnv.enable = true;
+    # agent-vault swaps in the real token; git only needs a placeholder.
+    config.credential."https://github.com".helper =
+      "!f() { echo username=x-access-token; echo password=__placeholder__; }; f";
   };
+  # With nix-direnv.
+  programs.direnv.enable = true;
 
   # On top of NixOS's core packages (coreutils, curl, …), nix and docker.
   environment.systemPackages = with pkgs; [
     file
     unzip
-    git
     gh
     uv
     gnumake
