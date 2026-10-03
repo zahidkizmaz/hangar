@@ -10,7 +10,7 @@ use crate::bay::{VM_CACHE, VM_HOME};
 use crate::error::{Context, Error, Result};
 use crate::files::{host_path, is_credentials_file};
 
-const HINT: &str = "see the README, \"Mounting folders\"";
+const HINT: &str = "see docs/configuration.md, \"Mounting folders\"";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountSpec {
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(
             error,
             "the bay's mount at /w: /home/you/work/x holds hangar's own \
-             state: see the README, \"Mounting folders\""
+             state: see docs/configuration.md, \"Mounting folders\""
         );
     }
 

@@ -117,7 +117,7 @@ let
           "paperclip"
         ];
         description = ''
-          Apps to set up in the bay: built-ins (see the README) or
+          Apps to set up in the bay: built-ins (see docs/configuration.md) or
           `appDefinitions` names. Each brings its packages, routes, env,
           run entry and ports.
         '';
@@ -392,7 +392,7 @@ in
         tower.agentVault.adminPort = 14421;
       };
       description = ''
-        Any other hangar.json setting (see the README), such as the sandbox
+        Any other hangar.json setting (see docs/configuration.md), such as the sandbox
         and the tower's backend settings (`sandbox`, `tower.backend`,
         `tower.agentVault`). Lists here replace the generated ones whole,
         so set bays and routes with the typed options.

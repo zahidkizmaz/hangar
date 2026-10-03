@@ -105,11 +105,14 @@ downloads the whole NVD feed on every run, so it's left out for now.
 - `ci.yml`: `nix flake check`, `prek run --all-files`, `cargo deny check`
   and a full-history gitleaks scan, on Linux and macOS.
 - `audit.yml`: weekly RustSec advisory check.
-- `image.yml`: builds the bay image on native amd64 and arm64 runners,
-  writes its SBOM, and pushes a multi-arch image to
-  GHCR; the run summary prints the digest.
-- `release.yml`: on `v*` tags, builds the binaries in a matrix and
-  publishes them with `SHA256SUMS` from one release job. Release builds
+- `image.yml`: on every push to `main` or a `v*` tag, builds the bay
+  image on native amd64 and arm64 runners, writes its SBOM, and pushes a
+  multi-arch image to `ghcr.io/zahidkizmaz/hangar-bay`; the run summary
+  prints the digest. A `v*` tag's image is the one that hangar version
+  uses by default.
+- `release.yml`: on `v*` tags, builds the binaries (aarch64-darwin,
+  x86_64-linux, aarch64-linux) in a matrix and attaches them with
+  `SHA256SUMS` to the GitHub release from one release job. Release builds
   use the runner's Rust, because a Nix-built Linux binary links Nix's
   glibc.
 - Renovate (`renovate.json5`): Cargo, GitHub Actions and flake inputs, with

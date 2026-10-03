@@ -3,7 +3,8 @@
 hangar is a Rust CLI that runs AI coding agents in locked-down sandbox
 VMs (microsandbox), the bays. A bay can only reach the proxy of the
 credential broker (agent-vault) in the tower, another VM, which injects
-real credentials for allowlisted hosts. User docs: `README.md`.
+real credentials for allowlisted hosts. User docs: `README.md` (short
+overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
 
 ## Invariants (never break)
 
@@ -86,8 +87,10 @@ real credentials for allowlisted hosts. User docs: `README.md`.
 - Pure logic unit-tested, I/O at the edges; errors name the file or item.
 - Tests cover all code: every new or changed path gets a test (unit tests
   for logic, `tests/cli.rs` for CLI behavior). Untested code isn't done.
-- Docs move with the code: update `README.md` (users) and `docs/`
-  (internals) in the same change. A stale doc is a bug.
+- Docs move with the code: update the user docs (`docs/usage.md`,
+  `docs/configuration.md`, `docs/nix.md`; `README.md` stays a short
+  overview) and the internals (other `docs/`) in the same change. A
+  stale doc is a bug.
 - Comments only for genuine traps; 80 columns.
 
 ## Gates
@@ -104,5 +107,7 @@ Run the checks in `docs/development.md` ("Checks") before calling work done.
   Renovate or releases.
 - `docs/sandbox-backends.md`: before touching `src/sandbox/` or adding a
   sandbox backend; `src/broker/mod.rs` for the `Broker` trait.
+- `docs/configuration.md`, `docs/usage.md`, `docs/nix.md`: before
+  changing a setting, an app, a command's behavior or a module option.
 - `docs/cli.md`: before driving hangar from a script or agent, or changing
   output, `--json` schemas or exit codes.

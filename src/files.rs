@@ -22,8 +22,8 @@ const MAX_TOTAL: u64 = 10 * 1024 * 1024;
 const MAX_FILES: usize = 1000;
 
 const HINT: &str = "files never copies secrets; store them with \
-                    'hangar credential set NAME' (see the README, \"Your \
-                    config files in the VM\")";
+                    'hangar credential set NAME' (see docs/configuration.md, \
+                    \"Your config files in the VM\")";
 
 #[derive(Debug, PartialEq)]
 struct FileCopy {

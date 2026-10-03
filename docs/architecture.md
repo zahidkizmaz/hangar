@@ -348,7 +348,8 @@ from the bays' apps and `tower.routes`.
 
 Apps (`src/apps.rs`) are data: `config/apps/<name>.json` (built in via
 `include_str!`) or `appDefinitions.<name>` (replaces a built-in whole),
-enabled per bay by its `apps` (the built-ins are listed in the README).
+enabled per bay by its `apps` (the built-ins are listed in
+[configuration.md](configuration.md#built-in-apps)).
 `config::resolve`:
 
 1. Per bay: its `apps` (`apps::Catalog::enabled`).
