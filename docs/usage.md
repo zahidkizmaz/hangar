@@ -130,9 +130,40 @@ start fresh. `destroy --state` also deletes the keychain item.
 ## First run
 
 ```sh
-hangar up       # creates the VMs; prints the ports below
-hangar status   # the same overview, any time
+hangar up             # creates the VMs; prints the overview below
+hangar status         # the same overview, any time
+hangar status --all   # plus apps, hosts, credential names, mounts, routes
 ```
+
+`status` starts with the overall health, then each bay with its run
+entries and its apps' URLs, then the tower with its own ports:
+
+```
+hangar: healthy
+hangar-bay-default: Running
+  run paperclip: running
+  PORT       URL                    STATE      PURPOSE
+  paperclip  http://127.0.0.1:3100  reachable  Paperclip web UI
+hangar-tower: Running
+  vault: healthy, unlisted hosts: deny
+  PORT      URL                     STATE      PURPOSE
+  vault-ui  http://127.0.0.1:14321  reachable  agent-vault admin UI and API
+  proxy     127.0.0.1:14322         -          the bays' only way out
+all ports bind to 127.0.0.1 only
+```
+
+`--all` adds each bay's apps (hosts and credential names), mounts and
+package cache, and every route the tower serves, with its source (`app
+NAME` or `config` for `tower.routes`):
+
+```
+  ROUTE      HOST               AUTH                            SOURCE
+  anthropic  api.anthropic.com  bearer CLAUDE_CODE_OAUTH_TOKEN  app claude-code
+  mirror     mirror.example     passthrough                     config
+```
+
+Neither prints a credential's value; `hangar credential list` lists the
+stored ones.
 
 ### Accounts and the vault UI
 

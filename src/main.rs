@@ -90,12 +90,21 @@ enum Command {
         /// Bays to stop (default: all, and the tower)
         bays: Vec<String>,
     },
-    /// Show the tower, each bay (apps, run entries, mounts) and ports
-    #[command(after_help = "Exits 3 when something isn't healthy.\n\n\
+    /// Show health, each bay (run entries, ports) and the tower
+    #[command(after_help = "Exits 3 when something isn't healthy. --all \
+                            adds each bay's apps (hosts and credential \
+                            names), mounts and package cache, and the \
+                            tower's routes; --json always has everything. \
+                            Stored credentials: 'hangar credential list'.\n\n\
                             Examples:\n  hangar status\n  \
+                            hangar status --all\n  \
                             hangar status --json | jq .tower\n  \
                             hangar status --json || hangar up")]
-    Status,
+    Status {
+        /// Also show apps, mounts, the package cache and the routes
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Open a login shell in the bay, or run CMD there
     #[command(after_help = "Examples:\n  hangar shell\n  \
                             hangar shell gh --help\n  \
@@ -276,7 +285,9 @@ fn run(command: Command) -> Result<Outcome> {
         Command::Init { .. } => unreachable!("handled above"),
         Command::Up { bays } => Outcome::Up(commands::up(&hangar, &bays)?),
         Command::Down { bays } => done(commands::down(&hangar, &bays))?,
-        Command::Status => Outcome::Status(StatusReport::collect(&hangar)),
+        Command::Status { all } => {
+            Outcome::Status(StatusReport::collect(&hangar), all)
+        }
         Command::Shell { bay, args } => {
             streamed(commands::shell(&hangar, bay.bay.as_deref(), &args))?
         }

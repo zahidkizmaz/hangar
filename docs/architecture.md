@@ -300,8 +300,8 @@ changed):
     records a fingerprint (FNV-1a of the command, the env file and the
     `files` record) in `run-fingerprints`; a running entry whose
     inputs differ only gets a warning (`run_decision`).
-14. Print one line per app (its hosts and credentials) and the port
-    overview (also in `status`). Every published port is probed the same
+14. Print `status`'s short view: health, each bay's run entries and
+    ports, the tower and its ports. Every published port is probed the same
     way: an HTTP GET for HTTP ports, a TCP connect otherwise; the proxy,
     which only the bays use, isn't probed.
 

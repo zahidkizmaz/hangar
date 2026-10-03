@@ -110,11 +110,13 @@ is in [usage.md](usage.md#claude-code-codex-and-paperclip). `rust` covers
 fetching crates and toolchains, not `cargo search` or `cargo publish`
 (those use `crates.io`; add a route if you need them).
 
-`up` and `status` show one line per app with its hosts:
+`hangar status --all` shows each bay's apps with their hosts and the
+credential each one gets (names only, never values):
 
 ```
-app claude-code: api.anthropic.com ← CLAUDE_CODE_OAUTH_TOKEN
-app paperclip: no hosts
+  APP          HOST               CREDENTIAL
+  claude-code  api.anthropic.com  CLAUDE_CODE_OAUTH_TOKEN
+  paperclip    -                  -
 ```
 
 ### How apps merge
@@ -290,7 +292,7 @@ cache, never shared: a bay can only reach its own. Packages
 in a bay live on its own disk, so a new VM (`hangar destroy NAME &&
 hangar up NAME`) would download all of them again; with the cache it gets
 them from your machine first and only goes to the internet for what's
-missing. `up` fills the cache after it installs something; `hangar status`
+missing. `up` fills the cache after it installs something; `hangar status --all`
 shows its size.
 
 The cache is writable from the VM, so it's never trusted on its own: each
@@ -402,7 +404,7 @@ either copied or mounted, never both, and `mounts` don't nest in each
 other; they may sit inside the bay's home (microsandbox applies the
 enclosing mount first), but not cover it. Mounts are fixed when the VM is
 created: after changing them, `hangar destroy NAME && hangar up NAME` (`up`
-and `status` say so).
+and `status --all` say so).
 
 ## The bay image
 
