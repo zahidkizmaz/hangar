@@ -352,7 +352,11 @@ fn wait_for_docker(
         Probe::Done => Ok(()),
         Probe::Pending(state) | Probe::Failed(state) => Err(Error::with_hint(
             format!("dockerd in {} did not start: {state}", bay.vm),
-            "see 'journalctl --user -M pilot@ -u docker' in the bay, as root",
+            format!(
+                "in 'hangar shell -b {}', run 'systemctl --user reset-failed \
+                 docker && systemctl --user restart docker'",
+                bay.name
+            ),
         )),
     }
 }
@@ -1316,7 +1320,13 @@ mod tests {
             error.starts_with("dockerd in hangar-bay-default did not start: "),
             "{error}"
         );
-        assert!(error.ends_with("-u docker' in the bay, as root"), "{error}");
+        assert!(
+            error.ends_with(
+                "in 'hangar shell -b default', run 'systemctl --user \
+                 reset-failed docker && systemctl --user restart docker'"
+            ),
+            "{error}"
+        );
     }
 
     fn started(sandbox: &FakeSandbox) -> Vec<String> {

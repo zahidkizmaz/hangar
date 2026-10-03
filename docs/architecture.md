@@ -167,7 +167,13 @@ puts the profile first (`environment.profiles`).
 - Restarts are declared: the `hangar-proxy-env.path` unit
   (`PathChanged=/etc/hangar/proxy.env`) starts the oneshot
   `hangar-proxy-env.service`, which runs `systemctl try-restart
-  nix-daemon` and `systemctl --user -M pilot@.host restart docker`. The
+  nix-daemon`, then `systemctl --user -M pilot@.host reset-failed docker`
+  and `restart docker`. The reset is there because the upstream unit
+  allows 3 starts per 60 s (`StartLimitBurst`): a new bay uses two (boot,
+  the first `proxy.env`), so one crash or a renewed token in that minute
+  would hit `start-limit-hit`, and with nothing changed no later `up`
+  would restart it. The limit itself stays, so a broken dockerd doesn't
+  restart forever on its own (`Restart=always`). The
   path unit fires when the file is created or replaced (inotify on the
   file's inode, and on its folder until it exists), never on its own
   start (systemd.path(5)). It watches only `proxy.env`, written last:

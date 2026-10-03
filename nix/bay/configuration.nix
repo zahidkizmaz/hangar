@@ -42,6 +42,10 @@ in
         Type = "oneshot";
         ExecStart = [
           "${systemctl} try-restart nix-daemon.service"
+          # Upstream's StartLimitBurst = 3 per 60 s: boot and the first
+          # proxy.env already use two, so one crash would leave docker
+          # refusing this restart.
+          "-${systemctl} --user --machine=pilot@.host reset-failed docker.service"
           "${systemctl} --user --machine=pilot@.host restart docker.service"
         ];
       };

@@ -306,3 +306,7 @@ Never write the proxy URL (it carries the bay's token) into
 - `NAME needs setup: run 'hangar setup NAME'`: the app's one-time setup
   hasn't run yet; run that command (see
   [Claude Code and Paperclip](#claude-code-and-paperclip)).
+- `dockerd in hangar-bay-NAME did not start`: in `hangar shell -b NAME`,
+  run `systemctl --user reset-failed docker && systemctl --user restart
+  docker` (systemd stops restarting docker after three starts in a
+  minute); `systemctl --user status docker` says why it stopped.
