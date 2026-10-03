@@ -153,7 +153,8 @@ puts the profile first (`environment.profiles`).
   on the host.
 - Daemons are systemd units: socket-activated `nix-daemon` and pilot's
   rootless `docker` user unit (`linger`, so it starts without a login;
-  `TimeoutStartSec = 60s`, so a hanging start can't hang `up`). Both read
+  `TimeoutStartSec = 60s` and `TimeoutStopSec = 30s` over the module's
+  `TimeoutSec = 0`, so a hanging start or stop can't hang `up`). Both read
   `EnvironmentFile=-/etc/hangar/proxy.env`, plain `KEY='value'` lines
   (systemd rejects `export`); the `-` lets them start on the first boot,
   before the file exists.
@@ -167,7 +168,13 @@ puts the profile first (`environment.profiles`).
 - Restarts are declared: the `hangar-proxy-env.path` unit
   (`PathChanged=/etc/hangar/proxy.env`) starts the oneshot
   `hangar-proxy-env.service`, which runs `systemctl try-restart
-  nix-daemon` and `systemctl --user -M pilot@.host restart docker`. The
+  nix-daemon`, then `systemctl --user -M pilot@.host reset-failed docker`
+  and `restart docker`. The reset is there because the upstream unit
+  allows 3 starts per 60 s (`StartLimitBurst`): a new bay uses two (boot,
+  the first `proxy.env`), so one crash or a renewed token in that minute
+  would hit `start-limit-hit`, and with nothing changed no later `up`
+  would restart it. The limit itself stays, so a broken dockerd doesn't
+  restart forever on its own (`Restart=always`). The
   path unit fires when the file is created or replaced (inotify on the
   file's inode, and on its folder until it exists), never on its own
   start (systemd.path(5)). It watches only `proxy.env`, written last:
@@ -293,8 +300,8 @@ changed):
     records a fingerprint (FNV-1a of the command, the env file and the
     `files` record) in `run-fingerprints`; a running entry whose
     inputs differ only gets a warning (`run_decision`).
-14. Print one line per app (its hosts and credentials) and the port
-    overview (also in `status`). Every published port is probed the same
+14. Print `status`'s short view: health, each bay's run entries and
+    ports, the tower and its ports. Every published port is probed the same
     way: an HTTP GET for HTTP ports, a TCP connect otherwise; the proxy,
     which only the bays use, isn't probed.
 

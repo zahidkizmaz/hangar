@@ -44,8 +44,8 @@ an error (exit 1).
 
 | Command | Result (`--json`) |
 |---|---|
-| `up [BAY…]` | the status document below plus `failed` (as text: the app lines and the port summary) |
-| `status` | the status document; exit 3 when unhealthy |
+| `up [BAY…]` | the status document below plus `failed` (as text: `status`'s short view) |
+| `status [--all]` | the status document, always complete (`--all` changes only the text); exit 3 when unhealthy |
 | `down`, `init`, `destroy`, `credential set`, `credential rm` | `{"ok":true,"version":1}` |
 | `credential list` | names and who manages them, never values |
 | `vault-ui` | where the vault login is, never the password |
@@ -69,7 +69,12 @@ disappears. Key order isn't significant.
     { "name": "vault-ui", "app": null, "url": "http://127.0.0.1:14321",
       "purpose": "agent-vault admin UI and API", "reachable": true },
     { "name": "proxy", "app": null, "url": "127.0.0.1:14322",
-      "purpose": "the bays' only way out", "reachable": null } ] },
+      "purpose": "the bays' only way out", "reachable": null } ],
+             "routes": [
+    { "name": "anthropic", "host": "api.anthropic.com", "auth": "bearer",
+      "credentials": ["CLAUDE_CODE_OAUTH_TOKEN"], "app": "claude-code" },
+    { "name": "mirror", "host": "mirror.example", "auth": "passthrough",
+      "credentials": [], "app": null } ] },
   "bays": [
     { "name": "work", "vm": "hangar-bay-work", "state": "running",
       "healthy": true,
@@ -97,8 +102,11 @@ disappears. Key order isn't significant.
 - `tower`: the VM running the credential broker; `vm` is its state
   (`running`, `stopped`, `missing` or `unknown`: the sandbox failed),
   `backend` is `tower.backend` (`agent-vault` is the only one so far),
-  `unlistedHosts` is `deny`, `allow`, or `null` while unreachable, and
-  `ports` its ports (`app: null`).
+  `unlistedHosts` is `deny`, `allow`, or `null` while unreachable,
+  `ports` its ports (`app: null`), and `routes` every route it serves:
+  `auth` is the route's `type`, `credentials` the names it injects (never
+  values), `app` the first enabled app that brings it, `null` for one of
+  `tower.routes`.
 - `bays`: each configured bay, in config order. `state` as for the
   tower; `healthy` is the bay running with every `run` entry running.
 - `bays[].apps.<name>.routes`: each enabled app's routes and the credential

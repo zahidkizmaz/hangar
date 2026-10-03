@@ -254,11 +254,42 @@ pub(crate) struct UpReport {
     pub(crate) failed: Vec<(String, String)>,
 }
 
+/// A route the tower serves, credential names only; `app` is the first
+/// enabled app that brings it, `None` for `tower.routes`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TowerRoute {
+    pub(crate) name: String,
+    pub(crate) host: String,
+    pub(crate) auth: &'static str,
+    pub(crate) credentials: Vec<String>,
+    pub(crate) app: Option<String>,
+}
+
+fn tower_routes(settings: &Settings) -> Vec<TowerRoute> {
+    settings
+        .routes
+        .values()
+        .map(|route| TowerRoute {
+            name: route.name.clone(),
+            host: route.host.clone(),
+            auth: route.auth.kind(),
+            credentials: route.auth.credentials().into_iter().collect(),
+            app: settings
+                .bays
+                .iter()
+                .flat_map(|bay| &bay.apps)
+                .find(|app| app.routes.contains(&route.name))
+                .map(|app| app.name.clone()),
+        })
+        .collect()
+}
+
 pub(crate) struct StatusReport {
     pub(crate) tower: Vm,
     pub(crate) broker_backend: String,
     pub(crate) broker: BrokerHealth,
     pub(crate) tower_ports: Ports,
+    pub(crate) routes: Vec<TowerRoute>,
     pub(crate) bays: Vec<BayStatus>,
     pub(crate) leftovers: Vec<Leftover>,
 }
@@ -271,6 +302,7 @@ impl StatusReport {
             broker_backend: hangar.settings.broker_backend.clone(),
             broker: hangar.broker.health(),
             tower_ports: Ports::probe(hangar.broker.ports()),
+            routes: tower_routes(&hangar.settings),
             bays: hangar
                 .bays()
                 .iter()

@@ -82,7 +82,7 @@ Then:
 hangar up                                     # create the tower and bays
 claude setup-token                            # on your machine
 hangar credential set CLAUDE_CODE_OAUTH_TOKEN # paste it (hidden)
-hangar status                                 # health, apps and ports
+hangar status                                 # health, bays and ports
 hangar shell                                  # a shell in the bay
 ```
 

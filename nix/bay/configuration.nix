@@ -42,6 +42,10 @@ in
         Type = "oneshot";
         ExecStart = [
           "${systemctl} try-restart nix-daemon.service"
+          # Upstream's StartLimitBurst = 3 per 60 s: boot and the first
+          # proxy.env already use two, so one crash would leave docker
+          # refusing this restart.
+          "-${systemctl} --user --machine=pilot@.host reset-failed docker.service"
           "${systemctl} --user --machine=pilot@.host restart docker.service"
         ];
       };
@@ -89,9 +93,11 @@ in
   };
   systemd.user.services.docker.serviceConfig = {
     EnvironmentFile = "-/etc/hangar/proxy.env";
-    # Overrides the module's TimeoutSec = 0 for starts, so a restart can't
-    # hang `up`.
+    # Override the module's TimeoutSec = 0, so a restart can't hang `up`:
+    # stop + start stay under wait_for_docker's 2 minutes. 30 s outlasts
+    # dockerd's own shutdown-timeout (15 s), then systemd kills the rest.
     TimeoutStartSec = "60s";
+    TimeoutStopSec = "30s";
   };
 
   nix.settings = {

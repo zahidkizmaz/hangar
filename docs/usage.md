@@ -130,9 +130,40 @@ start fresh. `destroy --state` also deletes the keychain item.
 ## First run
 
 ```sh
-hangar up       # creates the VMs; prints the ports below
-hangar status   # the same overview, any time
+hangar up             # creates the VMs; prints the overview below
+hangar status         # the same overview, any time
+hangar status --all   # plus apps, hosts, credential names, mounts, routes
 ```
+
+`status` starts with the overall health, then each bay with its run
+entries and its apps' URLs, then the tower with its own ports:
+
+```
+hangar: healthy
+hangar-bay-default: Running
+  run paperclip: running
+  PORT       URL                    STATE      PURPOSE
+  paperclip  http://127.0.0.1:3100  reachable  Paperclip web UI
+hangar-tower: Running
+  vault: healthy, unlisted hosts: deny
+  PORT      URL                     STATE      PURPOSE
+  vault-ui  http://127.0.0.1:14321  reachable  agent-vault admin UI and API
+  proxy     127.0.0.1:14322         -          the bays' only way out
+all ports bind to 127.0.0.1 only
+```
+
+`--all` adds each bay's apps (hosts and credential names), mounts and
+package cache, and every route the tower serves, with its source (`app
+NAME` or `config` for `tower.routes`):
+
+```
+  ROUTE      HOST               AUTH                            SOURCE
+  anthropic  api.anthropic.com  bearer CLAUDE_CODE_OAUTH_TOKEN  app claude-code
+  mirror     mirror.example     passthrough                     config
+```
+
+Neither prints a credential's value; `hangar credential list` lists the
+stored ones.
 
 ### Accounts and the vault UI
 
@@ -183,9 +214,9 @@ injects, and the vault swaps in the real value on the way out.
 `hangar credential list` shows the names and who manages them, never the
 values; `hangar credential rm NAME` deletes one of yours.
 
-## Claude Code and Paperclip
+## Claude Code, Codex and Paperclip
 
-Both are built-in [apps](configuration.md#built-in-apps) and bring
+All three are built-in [apps](configuration.md#built-in-apps) and bring
 packages, so they need `nix` and `github` (or `github-token`):
 
 ```nix
@@ -206,6 +237,21 @@ accept its unfree license. Claude Code may need hosts beyond
 `api.anthropic.com` for some features (not verified); the vault's `403`
 names any it hits, see
 [Allowing another host](configuration.md#allowing-another-host).
+
+Codex uses an OpenAI API key, which stays in the vault:
+
+```sh
+hangar credential set OPENAI_API_KEY             # paste it (hidden)
+hangar setup codex                               # once per home
+```
+
+`hangar setup codex` logs Codex in with the bay's placeholder (it writes
+only the placeholder to `~/.codex/auth.json`), and the vault swaps in the
+real key on `api.openai.com`. Sign in with ChatGPT doesn't work through
+the vault: Codex keeps that login's refresh token in the bay and renews it
+itself (`auth.openai.com`, `chatgpt.com`), so the real secret would live
+in the VM. `up` warns `codex needs setup` until Codex is logged in with
+an API key.
 
 **Paperclip needs onboarding once.** `paperclipai run` refuses to start
 until it's set up, so the first `hangar up` skips it and warns
@@ -305,4 +351,8 @@ Never write the proxy URL (it carries the bay's token) into
   `hangar destroy NAME && hangar up NAME` (the home is kept).
 - `NAME needs setup: run 'hangar setup NAME'`: the app's one-time setup
   hasn't run yet; run that command (see
-  [Claude Code and Paperclip](#claude-code-and-paperclip)).
+  [Claude Code, Codex and Paperclip](#claude-code-codex-and-paperclip)).
+- `dockerd in hangar-bay-NAME did not start`: in `hangar shell -b NAME`,
+  run `systemctl --user reset-failed docker && systemctl --user restart
+  docker` (systemd stops restarting docker after three starts in a
+  minute); `systemctl --user status docker` says why it stopped.

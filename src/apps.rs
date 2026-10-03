@@ -16,11 +16,12 @@ use miniserde::json::Object;
 
 /// The built-in definitions; `appDefinitions` replaces one whole. The
 /// route-only ones hold the hosts tools and `packages` need.
-const BUILTINS: [(&str, &str); 8] = [
+const BUILTINS: [(&str, &str); 10] = [
     (
         "claude-code",
         include_str!("../config/apps/claude-code.json"),
     ),
+    ("codex", include_str!("../config/apps/codex.json")),
     ("docker", include_str!("../config/apps/docker.json")),
     ("github", include_str!("../config/apps/github.json")),
     (
@@ -31,6 +32,7 @@ const BUILTINS: [(&str, &str); 8] = [
     ("node", include_str!("../config/apps/node.json")),
     ("paperclip", include_str!("../config/apps/paperclip.json")),
     ("python", include_str!("../config/apps/python.json")),
+    ("rust", include_str!("../config/apps/rust.json")),
 ];
 
 #[derive(Clone)]
@@ -549,8 +551,8 @@ mod tests {
 
     #[test]
     fn apps_must_be_known_once_and_well_named() {
-        let known = "claude-code, docker, github, github-token, nix, node, \
-                     paperclip, python";
+        let known = "claude-code, codex, docker, github, github-token, nix, \
+                     node, paperclip, python, rust";
         assert_eq!(
             error(&one_bay(r#""apps": ["hermes"]"#, "")),
             format!("unknown app hermes; known: {known}")

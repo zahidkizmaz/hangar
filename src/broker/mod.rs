@@ -82,6 +82,17 @@ impl Auth {
         }
     }
 
+    /// The config's `type`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Bearer { .. } => "bearer",
+            Self::Basic { .. } => "basic",
+            Self::ApiKey { .. } => "api-key",
+            Self::Custom { .. } => "custom",
+            Self::Passthrough => "passthrough",
+        }
+    }
+
     /// The config's form: `{"type": …, …}`.
     pub(crate) fn to_json(&self) -> Json {
         let mut auth = Object::new();
@@ -90,15 +101,11 @@ impl Auth {
                 auth.insert(key.into(), json::string(value));
             }
         };
-        let kind = match self {
-            Self::Bearer { token } => {
-                put("token", Some(token));
-                "bearer"
-            }
+        match self {
+            Self::Bearer { token } => put("token", Some(token)),
             Self::Basic { username, password } => {
                 put("username", Some(username));
                 put("password", password.as_ref());
-                "basic"
             }
             Self::ApiKey {
                 key,
@@ -108,7 +115,6 @@ impl Auth {
                 put("key", Some(key));
                 put("header", header.as_ref());
                 put("prefix", prefix.as_ref());
-                "api-key"
             }
             Self::Custom { headers } => {
                 let headers = headers
@@ -116,11 +122,10 @@ impl Auth {
                     .map(|(name, value)| (name.clone(), json::string(value)))
                     .collect();
                 auth.insert("headers".into(), Json::Object(headers));
-                "custom"
             }
-            Self::Passthrough => "passthrough",
-        };
-        auth.insert("type".into(), json::string(kind));
+            Self::Passthrough => {}
+        }
+        auth.insert("type".into(), json::string(self.kind()));
         Json::Object(auth)
     }
 }

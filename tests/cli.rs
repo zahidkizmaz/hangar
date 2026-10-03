@@ -456,21 +456,26 @@ fn status_down_and_restart() {
     let status = stdout(ok(&run(&machine, &config, &["status"])));
     assert!(
         status.starts_with(
-            "hangar-tower: Running\nvault: healthy, unlisted hosts: deny\n\
-             hangar-bay-default: Running\n"
+            "hangar: healthy\nhangar-bay-default: Running\n\
+             hangar-tower: Running\n  vault: healthy, unlisted hosts: deny\n  \
+             PORT      URL                     STATE      PURPOSE\n"
         ),
         "{status}"
     );
     let vault_ui = format!("http://127.0.0.1:{} ", vault.port);
     let vault_ui = lines_with(&status, &vault_ui);
-    assert!(vault_ui[0].starts_with("vault-ui "), "{status}");
+    assert!(vault_ui[0].starts_with("  vault-ui "), "{status}");
     assert!(vault_ui[0].contains("  reachable  "), "{status}");
     assert!(
-        status.contains("proxy     127.0.0.1:14322"),
+        status.contains("  proxy     127.0.0.1:14322"),
         "the proxy isn't probed: {status}"
     );
-    assert!(status.contains("-            the bays' only way out"));
+    assert!(status.contains("-          the bays' only way out"));
     assert!(status.ends_with("all ports bind to 127.0.0.1 only\n"));
+    assert!(!status.contains("mount "), "details only with --all");
+    let all = stdout(ok(&run(&machine, &config, &["status", "--all"])));
+    assert!(all.contains("\n  mount /home/pilot <- "), "{all}");
+    assert!(all.contains("\n  ROUTE "), "{all}");
 
     let down = stderr(ok(&run(&machine, &config, &["down"])));
     assert_eq!(
@@ -480,8 +485,8 @@ fn status_down_and_restart() {
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
         status.starts_with(
-            "hangar-tower: Stopped\nvault: healthy, unlisted hosts: deny\n\
-             hangar-bay-default: Stopped\n"
+            "hangar: not healthy\nhangar-bay-default: Stopped\n\
+             hangar-tower: Stopped\n  vault: healthy, unlisted hosts: deny\n"
         ),
         "{status}"
     );
@@ -761,25 +766,35 @@ fn status_reports_missing_vms_and_an_unreachable_vault() {
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
         status.starts_with(
-            "hangar-tower: missing\nvault: unreachable\n\
-             hangar-bay-default: missing\nmount /home/pilot <- "
+            "hangar: not healthy\nhangar-bay-default: missing\n\
+             hangar-tower: missing\n  vault: unreachable\n  PORT "
+        ),
+        "{status}"
+    );
+    let status =
+        stdout(unhealthy(&run(&machine, &config, &["status", "--all"])));
+    assert!(
+        status.starts_with(
+            "hangar: not healthy\nhangar-bay-default: missing\n  \
+             mount /home/pilot <- "
         ),
         "{status}"
     );
     assert!(
         status.contains(
-            "/state/bays/default/home (rw, home)\nmount /var/cache/hangar <- "
+            "/state/bays/default/home (rw, home)\n  mount /var/cache/hangar <- "
         ),
         "{status}"
     );
     assert!(
         status.contains(
-            "/.cache/hangar/bays/default (rw, cache)\npackage cache: 0 B ("
+            "/.cache/hangar/bays/default (rw, cache)\n  package cache: 0 B ("
         ),
         "{status}"
     );
     assert!(
-        status.contains("/.cache/hangar/bays/default)\nvault-ui "),
+        status
+            .contains("/.cache/hangar/bays/default)\nhangar-tower: missing\n"),
         "{status}"
     );
     assert!(!status.contains("run "), "no run entries without a VM");
@@ -806,9 +821,9 @@ fn status_shows_why_msb_failed() {
     ));
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
-        status.starts_with(
-            "hangar-tower: unknown (msb inspect hangar-tower: error: \
-             permission denied)"
+        status.contains(
+            "\nhangar-tower: unknown (msb inspect hangar-tower: error: \
+             permission denied)\n"
         ),
         "{status}"
     );
@@ -1002,7 +1017,7 @@ fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
         .filter(|line| line.contains("hangar-bay-default"))
         .collect();
     assert_eq!(bay, Vec::<&str>::new());
-    let status = stdout(&run(&machine, &config, &["status"]));
+    let status = stdout(&run(&machine, &config, &["status", "--all"]));
     assert!(status.contains("unknown (no record of the VM)"), "{status}");
 
     ok(&run(&machine, &config, &["destroy"]));
@@ -1159,7 +1174,7 @@ fn mounts_are_passed_when_the_vm_is_created_and_changes_warn() {
         "{output}"
     );
     assert_eq!(calls(&machine.msb_log(), "create "), 2);
-    let status = stdout(&run(&machine, &changed, &["status"]));
+    let status = stdout(&run(&machine, &changed, &["status", "--all"]));
     assert!(
         status.contains(
             "(ro), not in the VM: hangar destroy default && hangar up default"
@@ -1822,7 +1837,7 @@ fn log_levels_come_from_flags_or_hangar_log() {
 
     // Command output on stdout, diagnostics on stderr.
     let status = run(&machine, &config, &["-v", "status"]);
-    assert!(stdout(ok(&status)).starts_with("hangar-tower: Running\n"));
+    assert!(stdout(ok(&status)).starts_with("hangar: healthy\n"));
     assert!(!stdout(&status).contains("debug:"));
     assert!(!stderr(&status).contains("hangar-tower: Running"));
 }
@@ -1986,8 +2001,11 @@ fn json_status_and_up_follow_the_documented_schema() {
     machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let web = closed_port();
-    let config = machine.config(&vault_config(
+    let mirror = r#", "routes": [{"name": "mirror", "host": "mirror.example",
+                     "auth": {"type": "passthrough"}}]"#;
+    let config = machine.config(&tower_config(
         vault.port,
+        mirror,
         &web_app(web),
         r#", "apps": ["web"]"#,
     ));
@@ -2009,6 +2027,19 @@ fn json_status_and_up_follow_the_documented_schema() {
     let host = at(&report, &["bays", "0", "apps", "web", "routes", "0"]);
     assert_eq!(text(at(host, &["name"])), "web-api");
     assert_eq!(text(at(host, &["host"])), "api.web.example");
+    // The tower's routes: the config's own too, with where each came from.
+    let config_route = at(&report, &["tower", "routes", "0"]);
+    assert_eq!(text(at(config_route, &["name"])), "mirror");
+    assert_eq!(text(at(config_route, &["auth"])), "passthrough");
+    assert!(matches!(
+        at(config_route, &["app"]),
+        miniserde::json::Value::Null
+    ));
+    let app_route = at(&report, &["tower", "routes", "1"]);
+    assert_eq!(text(at(app_route, &["name"])), "web-api");
+    assert_eq!(text(at(app_route, &["auth"])), "bearer");
+    assert_eq!(text(at(app_route, &["credentials", "0"])), "WEB_TOKEN");
+    assert_eq!(text(at(app_route, &["app"])), "web");
     assert_eq!(text(at(&report, &["bays", "0", "name"])), "default");
     assert!(
         matches!(at(&report, &["failed"]), miniserde::json::Value::Array(failed) if failed.is_empty())
@@ -2026,9 +2057,13 @@ fn json_status_and_up_follow_the_documented_schema() {
     )));
     let human = stdout(ok(&run(&machine, &config, &["up"])));
     assert!(
-        human.starts_with("app web: api.web.example ← WEB_TOKEN\nvault-ui "),
+        human.starts_with(
+            "hangar: healthy\nhangar-bay-default: Running\n  run web: \
+             running\n  PORT  URL "
+        ),
         "{human}"
     );
+    assert!(human.contains("\n  web   http://127.0.0.1:"), "{human}");
 
     // `-v --json` and `status --json -v`: flags work on either side.
     let status = run(&machine, &config, &["status", "--json"]);
@@ -2041,8 +2076,25 @@ fn json_status_and_up_follow_the_documented_schema() {
     assert!(!flag(at(&status, &["healthy"])));
     assert_eq!(text(at(&status, &["bays", "0", "run", "web"])), "stopped");
     let human = stdout(unhealthy(&run(&machine, &config, &["status"])));
-    assert!(human.contains("app web: api.web.example ← WEB_TOKEN\n"));
     assert!(human.contains("run web: stopped"), "{human}");
+    assert!(!human.contains("WEB_TOKEN"), "only with --all: {human}");
+    let all = stdout(unhealthy(&run(&machine, &config, &["status", "-a"])));
+    assert!(
+        all.contains(
+            "  APP  HOST             CREDENTIAL\n  \
+             web  api.web.example  WEB_TOKEN\n"
+        ),
+        "{all}"
+    );
+    assert!(
+        all.contains(
+            "  ROUTE    HOST             AUTH              SOURCE\n  \
+             mirror   mirror.example   passthrough       config\n  \
+             web-api  api.web.example  bearer WEB_TOKEN  app web\n"
+        ),
+        "{all}"
+    );
+    assert!(!human.contains("mirror"), "routes only with --all: {human}");
 
     // Stopped VMs too; their run entries count as stopped.
     ok(&run(&machine, &config, &["--json", "down"]));
