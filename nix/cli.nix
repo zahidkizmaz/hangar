@@ -1,4 +1,4 @@
-# The `hangar` binary on its own; package.nix adds the module's settings.
+# The `hangar` binary on its own; module.nix adds the module's settings.
 {
   lib,
   stdenv,

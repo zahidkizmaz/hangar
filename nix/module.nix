@@ -1,4 +1,5 @@
-# Options and the CLI, shared by the nixos and darwin modules.
+# Options and the CLI with its rendered hangar.json, shared by the nixos
+# and darwin modules; they put it on PATH and add autostart.
 {
   config,
   lib,
@@ -10,14 +11,13 @@ let
   inherit (lib) mkOption types;
 
   msb = pkgs.callPackage ./microsandbox.nix { };
-  nonEmpty = lib.filterAttrs (_: value: value != null && value != [ ] && value != { });
 
   # Only what's set here; the CLI fills in config/defaults.json for the rest.
   settings = lib.recursiveUpdate cfg.settings (
     {
       tower = {
         inherit (cfg.tower) credentialFiles;
-        routes = map renderRoute cfg.tower.routes;
+        routes = map (lib.filterAttrs (_: value: value != null)) cfg.tower.routes;
       }
       // lib.optionalAttrs (cfg.tower.masterPasswordFile != null) {
         inherit (cfg.tower) masterPasswordFile;
@@ -25,41 +25,17 @@ let
     }
     // lib.optionalAttrs (cfg.bays != [ ]) { bays = map renderBay cfg.bays; }
     // lib.optionalAttrs (cfg.appDefinitions != { }) { inherit (cfg) appDefinitions; }
-    // lib.optionalAttrs (cfg.stateDir != null) {
-      inherit (cfg) stateDir;
-    }
+    // lib.optionalAttrs (cfg.stateDir != null) { inherit (cfg) stateDir; }
   );
-
-  renderRoute =
-    route:
-    lib.filterAttrs (_: value: value != null) {
-      inherit (route)
-        name
-        host
-        auth
-        extra
-        ;
-    };
 
   renderBay =
     bay:
-    nonEmpty (
-      {
-        inherit (bay)
-          name
-          apps
-          ports
-          image
-          cpus
-          memory
-          disk
-          packages
-          env
-          run
-          files
-          mounts
-          ;
-      }
+    lib.filterAttrs (_: value: value != null && value != [ ] && value != { }) (
+      removeAttrs bay [
+        "imagePackage"
+        "home"
+        "cache"
+      ]
       // lib.optionalAttrs (bay.imagePackage != null) {
         image = "${bay.imagePackage.imageName}:${bay.imagePackage.imageTag}";
         imageLoader = "${bay.imagePackage}";
@@ -117,7 +93,7 @@ let
           "paperclip"
         ];
         description = ''
-          Apps to set up in the bay: built-ins (see the README) or
+          Apps to set up in the bay: built-ins (see docs/configuration.md) or
           `appDefinitions` names. Each brings its packages, routes, env,
           run entry and ports.
         '';
@@ -147,8 +123,9 @@ let
         default = null;
         description = ''
           Build the bay image locally instead, e.g.
-          `inputs.hangar.packages.''${system}.bay-image`. On macOS this
-          needs a Linux builder.
+          `inputs.hangar.packages.''${system}.bay-image`. It's Linux only:
+          on macOS use `inputs.hangar.packages.aarch64-linux.bay-image`,
+          which needs a Linux builder.
         '';
       };
 
@@ -392,37 +369,40 @@ in
         tower.agentVault.adminPort = 14421;
       };
       description = ''
-        Any other hangar.json setting (see the README), such as the sandbox
+        Any other hangar.json setting (see docs/configuration.md), such as the sandbox
         and the tower's backend settings (`sandbox`, `tower.backend`,
         `tower.agentVault`). Lists here replace the generated ones whole,
         so set bays and routes with the typed options.
       '';
     };
 
-    # The flake's modules set this to hangar's own build, so the CLI never
-    # depends on the consumer's (possibly older) Rust toolchain.
     cli = mkOption {
       type = types.package;
-      internal = true;
       default = pkgs.callPackage ./cli.nix { };
+      defaultText = lib.literalExpression "hangar built with your nixpkgs";
+      description = "The `hangar` CLI the module wraps with its settings.";
     };
 
     package = mkOption {
       type = types.package;
       readOnly = true;
       internal = true;
-      default = pkgs.callPackage ./package.nix {
-        inherit settings;
-        inherit (cfg) cli msbPackage;
-      };
+      # The CLI with the settings baked into one JSON file.
+      default =
+        let
+          json = pkgs.writeText "hangar.json" (builtins.toJSON settings);
+        in
+        pkgs.runCommand "hangar"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            passthru.config = json;
+            meta.mainProgram = "hangar";
+          }
+          ''
+            makeWrapper ${lib.getExe cfg.cli} $out/bin/hangar \
+              --set HANGAR_NIX_CONFIG ${json} \
+              ${lib.optionalString (cfg.msbPackage != null) "--prefix PATH : ${cfg.msbPackage}/bin"}
+          '';
     };
-  };
-
-  config = lib.mkIf cfg.enable {
-    # msb on PATH too, for `msb ls` and friends.
-    environment.systemPackages = [
-      cfg.package
-    ]
-    ++ lib.optional (cfg.msbPackage != null) cfg.msbPackage;
   };
 }

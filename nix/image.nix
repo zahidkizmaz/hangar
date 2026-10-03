@@ -6,18 +6,14 @@
   runCommand,
   toplevel,
 }:
-let
-  root = runCommand "hangar-bay-root" { } ''
-    mkdir -p $out/sbin
-    ln -s ${toplevel}/init $out/sbin/init
-  '';
-  imageConfig.Env = [
-    "PATH=/run/wrappers/bin:/run/current-system/sw/bin"
-  ];
-in
 dockerTools.streamLayeredImage {
   name = "hangar-bay";
-  contents = [ root ];
+  contents = [
+    (runCommand "hangar-bay-root" { } ''
+      mkdir -p $out/sbin
+      ln -s ${toplevel}/init $out/sbin/init
+    '')
+  ];
   includeNixDB = true;
   # /home/pilot is there for bays with `home = false`. agentd makes /tmp
   # and tmpfiles /var/empty.
@@ -28,9 +24,7 @@ dockerTools.streamLayeredImage {
   fakeRootCommands = ''
     chown 1000:1000 home/pilot
   '';
-  config = imageConfig;
-  passthru = {
-    inherit toplevel;
-    env = imageConfig.Env;
-  };
+  # Root's `sh -c` steps find cat, mv and co. here: never hangar's package
+  # profile, where a bay package could shadow them.
+  config.Env = [ "PATH=/run/wrappers/bin:/run/current-system/sw/bin" ];
 }

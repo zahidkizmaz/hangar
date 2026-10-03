@@ -132,7 +132,7 @@ pub(crate) struct BaySettings {
 
 impl BaySettings {
     /// `image` when set; otherwise the image released with this hangar, so
-    /// the CLI and the image's `hangar-start` always match.
+    /// the CLI and the image always match.
     pub(crate) fn image_ref(&self) -> String {
         self.image.clone().unwrap_or_else(|| {
             format!("{}:v{}", self.image_repository, env!("CARGO_PKG_VERSION"))

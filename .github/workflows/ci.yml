@@ -21,8 +21,7 @@ jobs:
     # runner's IP rate limit and time out. The token is read-only here.
     env:
       GITHUB_TOKEN: ${{ github.token }}
-    # Each runner checks its own system: the darwin module only evaluates on
-    # macOS, the NixOS module on Linux.
+    # Each runner builds and tests the CLI on its own system.
     strategy:
       fail-fast: false
       matrix:
@@ -43,8 +42,7 @@ jobs:
           use-gha-cache: true
       - uses: DeterminateSystems/flake-checker-action@786422608c7bded2bbc9741ad9f91356842bf520 # v14
       - run: nix flake check --print-build-logs
-      # The bay's NixOS system, with hangar-start's shellcheck; the image
-      # itself is published by image.yml.
+      # The bay's NixOS system; the image itself is published by image.yml.
       - if: runner.os == 'Linux'
         run: nix build --print-build-logs .#bay-image
       - run: nix develop --command prek run --all-files --show-diff-on-failure

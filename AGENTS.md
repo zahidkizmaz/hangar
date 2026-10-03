@@ -3,7 +3,8 @@
 hangar is a Rust CLI that runs AI coding agents in locked-down sandbox
 VMs (microsandbox), the bays. A bay can only reach the proxy of the
 credential broker (agent-vault) in the tower, another VM, which injects
-real credentials for allowlisted hosts. User docs: `README.md`.
+real credentials for allowlisted hosts. User docs: `README.md` (short
+overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
 
 ## Invariants (never break)
 
@@ -12,9 +13,9 @@ real credentials for allowlisted hosts. User docs: `README.md`.
   tokens live in `stateDir` at mode 0600. Start every child via
   `process::command`.
 - The proxy URL carries the bay's own token (one per bay, in
-  `agent-tokens/<bay>`): it reaches that bay on `hangar-start`'s stdin
-  only, never in argv, `guest/` (the bays' read-only mount: `ca.pem`
-  only) or an `info!`/`debug!` line.
+  `agent-tokens/<bay>`): it reaches that bay on stdin only, into its
+  proxy env, never in argv, `guest/` (the bays' read-only mount:
+  `ca.pem` only) or an `info!`/`debug!` line.
 - No default or suggested master-password file. The keychain password is
   generated per install; file/env are explicit opt-ins.
 - Deny mode is set, and read back from the broker, before routes and
@@ -24,8 +25,9 @@ real credentials for allowlisted hosts. User docs: `README.md`.
 - Only hangar-managed credentials, packages, copied files and the vault
   agents hangar created (`hangar-<bay>`, the ones with a token file) are
   ever deleted. `up` never restarts a VM or run entry; only `hangar
-  restart` restarts run entries. `hangar-start` restarts a bay's daemons
-  only when their proxy env or CA changed.
+  restart` restarts run entries. A bay restarts its daemons only when
+  their proxy env (which names the CA) changed: hangar never replaces an
+  unchanged one.
 - Every bay gets placeholders only: a bay's `env` refuses real-looking
   values. Never print or change the broker admin login (hangar logs in
   with it on every `up`).
@@ -54,7 +56,8 @@ real credentials for allowlisted hosts. User docs: `README.md`.
   hand-written users, setuid copies or daemon launches. Bays boot its
   systemd (`VmSpec.init`, the sandbox's own `/run`) and `up` waits for
   it; hangar never restores snapshots (they lose the init handoff).
-  `hangar-start` only does what is unknown until `up`.
+  Daemon restarts are systemd units (`hangar-proxy-env.path`), not
+  hangar's execs; `up` writes only what is unknown until then.
 - In a bay, root's execs name absolute programs and never start a login
   shell, and the image's `PATH` (root's `sh -c` steps) never holds
   hangar's package profile. Pilot can't write anything root runs or
@@ -86,8 +89,10 @@ real credentials for allowlisted hosts. User docs: `README.md`.
 - Pure logic unit-tested, I/O at the edges; errors name the file or item.
 - Tests cover all code: every new or changed path gets a test (unit tests
   for logic, `tests/cli.rs` for CLI behavior). Untested code isn't done.
-- Docs move with the code: update `README.md` (users) and `docs/`
-  (internals) in the same change. A stale doc is a bug.
+- Docs move with the code: update the user docs (`docs/usage.md`,
+  `docs/configuration.md`, `docs/nix.md`; `README.md` stays a short
+  overview) and the internals (other `docs/`) in the same change. A
+  stale doc is a bug.
 - Comments only for genuine traps; 80 columns.
 
 ## Gates
@@ -97,12 +102,14 @@ Run the checks in `docs/development.md` ("Checks") before calling work done.
 ## Read when relevant
 
 - `docs/architecture.md`: before changing how VMs, the broker, config,
-  packages or the bay image work (`guest/start.sh`, how a bay boots); has
-  the file map, the naming rules (bay, tower, broker, agent) and what the
-  core verifies of a backend.
+  packages or the bay image work (how a bay boots and starts its
+  daemons); has the file map, the naming rules (bay, tower, broker,
+  agent) and what the core verifies of a backend.
 - `docs/development.md`: before running end-to-end tests or touching CI,
   Renovate or releases.
 - `docs/sandbox-backends.md`: before touching `src/sandbox/` or adding a
   sandbox backend; `src/broker/mod.rs` for the `Broker` trait.
+- `docs/configuration.md`, `docs/usage.md`, `docs/nix.md`: before
+  changing a setting, an app, a command's behavior or a module option.
 - `docs/cli.md`: before driving hangar from a script or agent, or changing
   output, `--json` schemas or exit codes.

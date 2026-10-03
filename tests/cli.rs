@@ -273,14 +273,35 @@ fn a_keychain_service_name_with_odd_characters_is_refused() {
     assert!(failed(&output).contains("only letters, digits"));
 }
 
+/// The proxy URL in the bay's proxy env.
+fn proxy_url(machine: &Machine) -> String {
+    let env = machine.fake_file("proxy-env");
+    let line = env.lines().find(|line| line.starts_with("HTTPS_PROXY="));
+    line.unwrap()["HTTPS_PROXY=".len()..]
+        .trim_matches('\'')
+        .into()
+}
+
+/// Root wrote the CA bundle and the proxy env, then docker answered.
+fn assert_bay_started(machine: &Machine, log: &str) {
+    let root = "exec --no-tty --user root hangar-bay-default -- /bin/sh -c";
+    for name in [" hangar-ca ", " hangar-proxy-env "] {
+        let writes = lines_with(log, name);
+        assert_eq!(writes.len(), 1, "{log}");
+        assert!(writes[0].starts_with(root), "{log}");
+    }
+    assert_eq!(lines_with(log, " hangar-docker ").len(), 1, "{log}");
+    assert!(machine.fake.join("ca-bundle").exists());
+}
+
 /// Secrets reach the VMs on stdin only, never in argv.
 fn assert_secrets_on_stdin_only(machine: &Machine, log: &str) {
     let owner = read(machine.state.join("owner-password"));
     assert_eq!(machine.fake_file("vault-password"), PASSWORD);
     assert_eq!(machine.fake_file("owner-register"), owner);
     assert_eq!(
-        machine.fake_file("proxy-url"),
-        "http://agent-token-1:default@host.microsandbox.internal:14322\n"
+        proxy_url(machine),
+        "http://agent-token-1:default@host.microsandbox.internal:14322"
     );
     for secret in [PASSWORD, GITHUB_TOKEN, owner.as_str(), "agent-token-1"] {
         assert!(!log.contains(secret), "{secret} in argv:\n{log}");
@@ -379,9 +400,7 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
         )
     );
     assert!(vault_vm[0].contains(&format!("-p 127.0.0.1:{}:", vault.port)));
-    let start = "exec --no-tty --user root hangar-bay-default -- \
-                 /run/current-system/sw/bin/hangar-start";
-    assert!(log.lines().any(|line| line.trim_end() == start), "{log}");
+    assert_bay_started(&machine, &log);
 
     assert_secrets_on_stdin_only(&machine, &log);
 
@@ -414,6 +433,8 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     let second = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(!second.contains("creating"), "{second}");
     assert!(!second.contains("installing"), "{second}");
+    // The same proxy env isn't replaced, so the daemons keep running.
+    assert_eq!(machine.fake_file("daemon-restarts"), "restart\n");
     let log = machine.msb_log();
     assert_eq!(calls(&log, "create "), 2, "{log}");
     assert_eq!(lines_with(&log, "hangar-tower -- sh -c").len(), 1, "{log}");
@@ -914,17 +935,15 @@ fn a_vault_that_keeps_allowing_unlisted_hosts_gets_no_routes_or_credentials() {
 fn a_failing_bay_start_is_reported() {
     let machine = Machine::new("start-fails");
     machine.install_fake_msb();
-    machine.fail("hangar-start");
+    machine.fail("proxy-env");
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     let error = failed(&run(&machine, &config, &["up"]));
     assert!(
-        error.contains(
-            "msb exec hangar-bay-default: \
-             /run/current-system/sw/bin/hangar-start"
-        ),
+        error.contains("msb exec hangar-bay-default: /bin/sh -c"),
         "{error}"
     );
+    assert!(error.contains("read-only file system"), "{error}");
 }
 
 /// Vault data and an agent token next to running VMs that have no
@@ -998,8 +1017,8 @@ fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
     );
     assert_eq!(entries(&machine.state.join("guest")), ["ca.pem"]);
     assert_eq!(
-        machine.fake_file("proxy-url"),
-        "http://agent-token-0:default@host.microsandbox.internal:14322\n"
+        proxy_url(&machine),
+        "http://agent-token-0:default@host.microsandbox.internal:14322"
     );
     assert_eq!(
         calls(

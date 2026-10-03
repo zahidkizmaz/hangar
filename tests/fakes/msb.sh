@@ -43,12 +43,13 @@ exec)
 esac
 
 # Every bay exec names its user: the apps' commands run as pilot,
-# hangar's own steps (start, env, packages) as root. Root never looks a
+# hangar's own steps (files, packages) as root. Root never looks a
 # program up on PATH or starts a login shell: pilot can sway both.
 want=root
 case "$1 $2" in
 "sh -c")
-  case $4 in hangar-run | hangar-run-status | hangar-setup-check | hangar-file)
+  case $4 in
+  hangar-run | hangar-run-status | hangar-setup-check | hangar-file | hangar-docker)
     want=pilot ;;
   esac ;;
 "rm -f" | "sh -l" | "sh -lc") want=pilot ;;
@@ -79,6 +80,18 @@ case "$1 $2" in
   # Bay scripts, told apart by their $0.
   case $4 in
   hangar-env) cat >"$fake/bay-env" ;;
+  hangar-ca) touch "$fake/ca-bundle" ;;
+  hangar-proxy-env)
+    # Replaced only when it changed: each replace restarts the daemons.
+    fails proxy-env && { echo "read-only file system" >&2; exit 1; }
+    cat >"$fake/proxy-env.new"
+    if cmp -s "$fake/proxy-env.new" "$fake/proxy-env"; then
+      rm "$fake/proxy-env.new"
+    else
+      mv "$fake/proxy-env.new" "$fake/proxy-env"
+      echo restart >>"$fake/daemon-restarts"
+    fi ;;
+  hangar-docker) ;;
   hangar-booted) echo running ;;
   hangar-install)
     # . <proxy env> && exec nix profile add … --profile <p>
@@ -135,9 +148,6 @@ case "$1 $2" in
 "agent-vault agent") echo agent-token-1 ;;
 "agent-vault vault") cat >"$fake/services.json" ;;
 "agent-vault ca") echo FAKE-CA ;;
-"hangar-start "*)
-  fails hangar-start && exit 1
-  cat >"$fake/proxy-url" ;;
 "nix profile")
   # nix profile remove --profile <profile> <element>…
   shift 5

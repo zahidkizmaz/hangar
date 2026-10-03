@@ -169,19 +169,22 @@ credential set`.
   One-off: `hangar copy SRC [DEST]`, same checks, not managed. A refusal
   names the file and why (credentials file, secret-looking content,
   symlink, limits); fix the config, never work around it.
-- **Set up a tool**: add its app (a built-in from the README's Apps
-  section, or one of `appDefinitions`) to a bay's `apps`, then
+- **Set up a tool**: add its app (a built-in from
+  [configuration.md](configuration.md#built-in-apps), or one of
+  `appDefinitions`) to a bay's `apps`, then
   `hangar up`. A bay with packages needs `nix` and `github` (or
   `github-token`). A config error names the app and key
   (`app paperclip: env.PATH: reserved for hangar`).
 - **App data that should survive a new VM**, and **a new VM without
   downloading every package again**: nothing to do; the bay's `home` and
-  `cache` are kept on the host (README, "A bay's home" and "Package
-  cache").
+  `cache` are kept on the host
+  ([A bay's home](configuration.md#a-bays-home),
+  [Package cache](configuration.md#package-cache)).
 - **Share another host folder with the VM**: add a dedicated host
   directory under `mounts` (`"writable": true` if the VM should write),
-  then `hangar destroy NAME && hangar up NAME`. The README's "Mounting
-  folders" has the rules a mount must pass.
+  then `hangar destroy NAME && hangar up NAME`.
+  [Mounting folders](configuration.md#mounting-folders) has the rules a
+  mount must pass.
 - **Apply changed config to a running app**: `up` never restarts; when it
   warns `<name>'s inputs changed`, run `hangar restart <name>`
   (`--no-copy` to keep the VM's current files).

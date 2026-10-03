@@ -58,7 +58,7 @@ const TOWER_STEPS: [(&str, Step); 4] = [
 ];
 
 /// In order, per bay: its own preflight, the VM, the broker's access to it
-/// (`hangar-start`), then what runs on top of them.
+/// (its proxy env), then what runs on top of them.
 const BAY_STEPS: [(&str, BayStep); 8] = [
     ("preflight", bay::preflight),
     ("vm", bay::ensure_vm),
