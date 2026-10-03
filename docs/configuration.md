@@ -95,16 +95,20 @@ services.hangar.bays = [
 | `docker` | routes to Docker Hub (`*.docker.io`, `*.docker.com`, `production.cloudfront.docker.com`) |
 | `python` | routes to `pypi.org`, `files.pythonhosted.org`, `releases.astral.sh` (uv's Python downloads) |
 | `node` | a route to `registry.npmjs.org` |
+| `rust` | routes to `index.crates.io` (cargo's sparse index), `static.crates.io` (crate downloads), `static.rust-lang.org` (rustup toolchains) |
 | `claude-code` | `github:numtide/llm-agents.nix#claude-code`; `api.anthropic.com` ← `CLAUDE_CODE_OAUTH_TOKEN` |
+| `codex` | `github:numtide/llm-agents.nix#codex`; `api.openai.com` ← `OPENAI_API_KEY`; a setup that logs Codex in with the key's placeholder |
 | `paperclip` | `github:numtide/llm-agents.nix#paperclip`; `PAPERCLIP_DEPLOYMENT_MODE=authenticated`, `PAPERCLIP_DEPLOYMENT_EXPOSURE=private`, `PAPERCLIP_BIND=lan`; runs `paperclipai run`; port 3100 (web UI) |
 
-A bay with `packages` (`claude-code` and `paperclip` bring some) needs
-`nix` and `github` (or `github-token`) in some bay: `hangar up` refuses it
+A bay with `packages` (`claude-code`, `codex` and `paperclip` bring some)
+needs `nix` and `github` (or `github-token`) in some bay: `hangar up` refuses it
 otherwise. Routes are shared, so one bay's apps serve every bay. Use
 `github` or `github-token`, not both; for `github-token`, store the token
 with `hangar credential set GITHUB_TOKEN` or name its file in
-`tower.credentialFiles`. How to set up Claude Code and Paperclip is in
-[usage.md](usage.md#claude-code-and-paperclip).
+`tower.credentialFiles`. How to set up Claude Code, Codex and Paperclip
+is in [usage.md](usage.md#claude-code-codex-and-paperclip). `rust` covers
+fetching crates and toolchains, not `cargo search` or `cargo publish`
+(those use `crates.io`; add a route if you need them).
 
 `up` and `status` show one line per app with its hosts:
 
@@ -240,8 +244,9 @@ other hosts (npm, for example), which then need routes too. Private
 `github:` inputs aren't supported: the image sets no nix `access-tokens`,
 so the token stays in the tower.
 
-Claude Code and Paperclip come as [apps](#apps), which bring their hosts
-and settings too; their provider auth goes through agent-vault as well.
+Claude Code, Codex and Paperclip come as [apps](#apps), which bring their
+hosts and settings too; their provider auth goes through agent-vault as
+well.
 
 Unfree packages install too (`NIXPKGS_ALLOW_UNFREE` is set for that step
 only): listing one, such as Claude Code, means you accept its license.
@@ -269,7 +274,7 @@ folder with [`mounts`](#mounting-folders).
   `~/work/claude` at `~/.claude`.
 - Don't log in to tools inside the VM: the login would be stored in this
   folder. Use the vault (see
-  [Claude Code and Paperclip](usage.md#claude-code-and-paperclip)).
+  [Claude Code, Codex and Paperclip](usage.md#claude-code-codex-and-paperclip)).
 - Untested: databases on a host share (Paperclip's embedded Postgres under
   `~/.paperclip`) may not like its file locking. If one misbehaves, point
   the app's data at the VM disk (e.g.
@@ -319,7 +324,7 @@ services.hangar.bays = [{
 
 **Never copy `~/.claude/.credentials.json`** (or any login): log in through
 the vault instead (see
-[Claude Code and Paperclip](usage.md#claude-code-and-paperclip)).
+[Claude Code, Codex and Paperclip](usage.md#claude-code-codex-and-paperclip)).
 Paperclip is configured by its app's variables and its UI, so it needs
 `files` only for a config file of its own.
 
