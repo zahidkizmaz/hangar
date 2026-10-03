@@ -129,7 +129,7 @@ DB): a root of `/sbin/init` (the system's `init`), `/etc`, `/root` and
 `/home/pilot` (for `home = false`). Its `Env` is only
 `PATH=/run/wrappers/bin:/run/current-system/sw/bin`, the `PATH` of root's
 `sh -c` steps, so it never holds hangar's profile, where a bay package
-could ship its own `mv` (a flake check asserts it). Pilot's login shell
+could ship its own `mv` (`nix/image.nix` asserts it). Pilot's login shell
 puts the profile first (`environment.profiles`).
 
 - Boot: `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
@@ -444,5 +444,6 @@ reach them by name.
   (render `hangar.json`, autostart).
 - `nix/cli.nix` builds the binary; `nix/package.nix` wraps it with the
   rendered config; `nix/microsandbox.nix` packages msb.
-- `tests/cli.rs`: integration tests; `tests/module.json` and
-  `nix/tests/darwin-stub.nix`: module checks.
+- `tests/cli.rs`: integration tests; `nix/tests/module.nix`: the module
+  check, which renders `hangar.json` and diffs it against
+  `tests/module.json`.

@@ -49,9 +49,9 @@ keychain.
 
 On Nix, microsandbox comes with the module: no Homebrew needed.
 
-Don't set `inputs.hangar.inputs.nixpkgs.follows`: the modules build the
-CLI with hangar's own nixpkgs, because it needs a newer Rust than stable
-NixOS releases ship.
+The modules build the CLI with your system's nixpkgs (NixOS 26.05 or
+newer). To use hangar's own pinned build instead, set
+`services.hangar.cli = inputs.hangar.packages.${pkgs.system}.default;`.
 
 For a local checkout, use `git+file:///path/to/hangar` (a `path:` input
 copies `.git`, which fails when git's fsmonitor socket exists) and run
@@ -70,8 +70,10 @@ the journal. `HANGAR_LOG=debug` raises its log level.
 ## Local images
 
 - Nix: a bay's `imagePackage = inputs.hangar.packages.${pkgs.system}.bay-image;`
-  builds the image and loads it into microsandbox once per build. On macOS
-  this needs a Linux builder, e.g. nix-darwin's `nix.linux-builder.enable = true;`.
+  builds the image and loads it into microsandbox once per build. The
+  image is Linux only: on macOS use
+  `inputs.hangar.packages.aarch64-linux.bay-image`, which needs a Linux
+  builder, e.g. nix-darwin's `nix.linux-builder.enable = true;`.
 - Without the module, on Linux: load the image under a local tag and
   point hangar at it. A cached tag is used without contacting a registry.
 

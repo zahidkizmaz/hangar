@@ -1,4 +1,5 @@
-# Options and the CLI, shared by the nixos and darwin modules.
+# Options and the CLI with its rendered hangar.json, shared by the nixos
+# and darwin modules; they put it on PATH and add autostart.
 {
   config,
   lib,
@@ -147,8 +148,9 @@ let
         default = null;
         description = ''
           Build the bay image locally instead, e.g.
-          `inputs.hangar.packages.''${system}.bay-image`. On macOS this
-          needs a Linux builder.
+          `inputs.hangar.packages.''${system}.bay-image`. It's Linux only:
+          on macOS use `inputs.hangar.packages.aarch64-linux.bay-image`,
+          which needs a Linux builder.
         '';
       };
 
@@ -399,12 +401,11 @@ in
       '';
     };
 
-    # The flake's modules set this to hangar's own build, so the CLI never
-    # depends on the consumer's (possibly older) Rust toolchain.
     cli = mkOption {
       type = types.package;
-      internal = true;
       default = pkgs.callPackage ./cli.nix { };
+      defaultText = lib.literalExpression "hangar built with your nixpkgs";
+      description = "The `hangar` CLI the module wraps with its settings.";
     };
 
     package = mkOption {
@@ -416,13 +417,5 @@ in
         inherit (cfg) cli msbPackage;
       };
     };
-  };
-
-  config = lib.mkIf cfg.enable {
-    # msb on PATH too, for `msb ls` and friends.
-    environment.systemPackages = [
-      cfg.package
-    ]
-    ++ lib.optional (cfg.msbPackage != null) cfg.msbPackage;
   };
 }

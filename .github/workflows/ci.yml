@@ -21,8 +21,7 @@ jobs:
     # runner's IP rate limit and time out. The token is read-only here.
     env:
       GITHUB_TOKEN: ${{ github.token }}
-    # Each runner checks its own system: the darwin module only evaluates on
-    # macOS, the NixOS module on Linux.
+    # Each runner builds and tests the CLI on its own system.
     strategy:
       fail-fast: false
       matrix:

@@ -34,8 +34,9 @@ nix flake check
 ```
 
 `nix flake check` builds the package and runs its tests (via nextest) and
-the module checks. fmt, clippy and shellcheck run only through prek, with
-the pinned toolchain, so one Rust version gates the code. Add
+the module check (`nix/tests/module.nix`: the rendered `hangar.json`
+against `tests/module.json`). fmt, clippy and shellcheck run only through
+prek, with the pinned toolchain, so one Rust version gates the code. Add
 `--all-systems --no-build` to evaluate Linux on macOS.
 
 CI fails when line coverage drops below the floor in `ci.yml` (measured on
