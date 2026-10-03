@@ -43,7 +43,7 @@ hangar's security model depends on every backend providing all of these:
 
 The bay image (not the backend) is a NixOS system
 (`nix/bay/configuration.nix`): systemd at `/sbin/init`, `nix`,
-`systemctl` and `hangar-start` in `/run/current-system/sw/bin`, and the
+`systemctl` and `docker` in `/run/current-system/sw/bin`, and the
 user `pilot` (uid 1000, gid 1000, home `/home/pilot`). The backend hands
 PID 1 to `VmSpec.init` once its own setup is done, on a `/run` tmpfs of
 its own, so its mounts under `/run` stay visible; it never restores a

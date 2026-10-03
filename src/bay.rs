@@ -55,7 +55,6 @@ pub(crate) const ROOT: &str = "root";
 pub(crate) const GUEST_MOUNT: &str = "/run/hangar";
 /// The image's systemd, which the VM boots into.
 const INIT: &str = "/sbin/init";
-const HANGAR_START: &str = "/run/current-system/sw/bin/hangar-start";
 /// Pilot's data on the VM disk, Docker's included.
 const PILOT_DATA: &str = "/var/lib/pilot";
 /// hangar's own records inside the VM, on its own disk next to `/nix`:
@@ -233,28 +232,29 @@ fn reconcile_vm(
     }
 }
 
-/// Once the VM has booted, the tower's CA goes to `guest/`, then
-/// `hangar-start` sets up CA trust and the daemons' proxy env inside the
-/// VM. The proxy URL can carry a token, so it goes on stdin, never into
-/// `guest/` or argv.
+/// Once the VM has booted, the tower's CA goes to `guest/`, then root
+/// writes the CA bundle and the daemons' proxy env inside the VM. The
+/// proxy URL can carry a token, so it goes on stdin, never into `guest/`
+/// or argv.
 pub(crate) fn start(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    wait_booted(hangar.sandbox.as_ref(), bay, BOOT_TIMEOUT, BOOT_PAUSE)?;
+    let sandbox = hangar.sandbox.as_ref();
+    wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)?;
     let access = broker::access(hangar, bay.name)?;
     let ca = hangar.state.ca();
     fs::write(&ca, &access.ca_pem).context(ca.display())?;
     if access.renewed {
         warn!("{}", renewed_warning(bay.name, &flag(hangar, bay)));
     }
-    info!("running hangar-start in {}", bay.vm);
-    let url = format!("{}\n", access.proxy_url.expose());
-    hangar
-        .sandbox
-        .exec(&bay.vm, Some(ROOT), &[HANGAR_START], Some(url.as_bytes()))
-        .map(drop)
+    // The bundle first: a new proxy env restarts the daemons that read it.
+    replace(sandbox, &bay.vm, &CA_BUNDLE, None)?;
+    let env = proxy_env(access.proxy_url.expose(), &access.ca_pem);
+    replace(sandbox, &bay.vm, &PROXY_ENV, Some(env.as_bytes()))?;
+    info!("waiting for docker in {}", bay.vm);
+    wait_for_docker(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
 }
 
-/// `hangar-start` restarts the daemons when the proxy URL changes; `up`
-/// never restarts the run entries.
+/// The bay restarts its daemons when the proxy URL changes; `up` never
+/// restarts the run entries.
 fn renewed_warning(bay: &str, flag: &str) -> String {
     format!(
         "bay {bay}: its broker token was renewed; run 'hangar restart{flag}' \
@@ -265,29 +265,48 @@ fn renewed_warning(bay: &str, flag: &str) -> String {
 /// systemd's state once it can tell.
 const BOOTED: &str = "/run/current-system/sw/bin/systemctl is-system-running --wait \
      2>/dev/null || :";
-const BOOT_PAUSE: Duration = Duration::from_millis(500);
-const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
+const WAIT_PAUSE: Duration = Duration::from_millis(500);
+const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, PartialEq, Eq)]
-enum Boot {
+enum Probe {
     Done,
-    /// Still booting, with what it last said.
+    /// Not yet, with what it last said.
     Pending(String),
-    /// Shutting down or stuck in maintenance: waiting won't help.
+    /// Waiting won't help.
     Failed(String),
 }
 
-/// Root's exec fails until activation wrote passwd, and systemd says
-/// `offline` until it's up; `degraded` is booted too.
-fn boot_state(output: Result<Vec<u8>>) -> Boot {
-    match output {
-        Err(error) => Boot::Pending(error.to_string()),
-        Ok(output) => match String::from_utf8_lossy(&output).trim() {
-            "running" | "degraded" => Boot::Done,
-            other @ ("maintenance" | "stopping") => {
-                Boot::Failed(format!("systemd is {other:?}"))
+/// Probes every `pause` until done, failed or `timeout` passed; the last
+/// answer.
+fn wait(
+    timeout: Duration,
+    pause: Duration,
+    mut probe: impl FnMut() -> Probe,
+) -> Probe {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe() {
+            Probe::Pending(_) if Instant::now() < deadline => {
+                thread::sleep(pause);
             }
-            other => Boot::Pending(format!("systemd is {other:?}")),
+            last => return last,
+        }
+    }
+}
+
+/// Root's exec fails until activation wrote passwd, and systemd says
+/// `offline` until it's up; `degraded` is booted too. Shutting down or
+/// stuck in maintenance, it never boots.
+fn boot_state(output: Result<Vec<u8>>) -> Probe {
+    match output {
+        Err(error) => Probe::Pending(error.to_string()),
+        Ok(output) => match String::from_utf8_lossy(&output).trim() {
+            "running" | "degraded" => Probe::Done,
+            other @ ("maintenance" | "stopping") => {
+                Probe::Failed(format!("systemd is {other:?}"))
+            }
+            other => Probe::Pending(format!("systemd is {other:?}")),
         },
     }
 }
@@ -300,18 +319,41 @@ fn wait_booted(
     pause: Duration,
 ) -> Result<()> {
     let booted = ["/bin/sh", "-c", BOOTED, "hangar-booted"];
-    let deadline = Instant::now() + timeout;
-    loop {
-        match boot_state(sandbox.exec(&bay.vm, Some(ROOT), &booted, None)) {
-            Boot::Done => return Ok(()),
-            Boot::Failed(state) => {
-                bail!("{} can't finish booting: {state}", bay.vm)
-            }
-            Boot::Pending(state) if Instant::now() >= deadline => {
-                bail!("{} did not finish booting: {state}", bay.vm)
-            }
-            Boot::Pending(_) => thread::sleep(pause),
+    let exec = || sandbox.exec(&bay.vm, Some(ROOT), &booted, None);
+    match wait(timeout, pause, || boot_state(exec())) {
+        Probe::Done => Ok(()),
+        Probe::Failed(state) => {
+            bail!("{} can't finish booting: {state}", bay.vm)
         }
+        Probe::Pending(state) => {
+            bail!("{} did not finish booting: {state}", bay.vm)
+        }
+    }
+}
+
+/// Ready once a restart the proxy env triggered is done and dockerd
+/// answers: its unit is active before its socket is.
+const DOCKER_READY: &str = r#"jobs=$(systemctl list-jobs --no-legend hangar-proxy-env.service)
+[ -z "$jobs" ] || { echo "restarting the daemons: $jobs" >&2; exit 1; }
+DOCKER_HOST=unix:///run/user/1000/docker.sock exec docker info >/dev/null"#;
+
+fn wait_for_docker(
+    sandbox: &dyn Sandbox,
+    bay: &Bay,
+    timeout: Duration,
+    pause: Duration,
+) -> Result<()> {
+    let ready = ["sh", "-c", DOCKER_READY, "hangar-docker"];
+    let probe = || match sandbox.exec(&bay.vm, Some(PILOT), &ready, None) {
+        Ok(_) => Probe::Done,
+        Err(error) => Probe::Pending(error.to_string()),
+    };
+    match wait(timeout, pause, probe) {
+        Probe::Done => Ok(()),
+        Probe::Pending(state) | Probe::Failed(state) => Err(Error::with_hint(
+            format!("dockerd in {} did not start: {state}", bay.vm),
+            "see 'journalctl --user -M pilot@ -u docker' in the bay, as root",
+        )),
     }
 }
 
@@ -327,9 +369,94 @@ pub(crate) fn reconcile_packages(hangar: &Hangar, bay: &Bay) -> Result<()> {
 /// The bay's env, `KEY='value'` lines every login shell sources with
 /// `set -a` (`nix/bay/configuration.nix`), like `PROXY_ENV_FILE`.
 pub(crate) const ENV_FILE: &str = "/etc/hangar/bay.env";
-/// The proxy and CA variables `hangar-start` writes (guest/start.sh).
+/// The daemons' proxy and CA variables, a systemd `EnvironmentFile`.
 pub(crate) const PROXY_ENV_FILE: &str = "/etc/hangar/proxy.env";
 const PLACEHOLDER: &str = "hangar-placeholder";
+
+/// A file root keeps in a bay, written from what `fill` prints.
+struct VmFile {
+    /// The exec's `$0`.
+    name: &'static str,
+    path: &'static str,
+    owner: &'static str,
+    mode: &'static str,
+    fill: &'static str,
+}
+
+const BAY_ENV: VmFile = VmFile {
+    name: "hangar-env",
+    path: ENV_FILE,
+    owner: "root:root",
+    mode: "0644",
+    fill: "cat",
+};
+
+/// Pilot's apps read it too, so pilot's group may.
+const PROXY_ENV: VmFile = VmFile {
+    name: "hangar-proxy-env",
+    path: PROXY_ENV_FILE,
+    owner: "root:pilot",
+    mode: "0640",
+    fill: "cat",
+};
+
+/// The image's CAs and the tower's (`nix/bay/configuration.nix`).
+const CA_BUNDLE: VmFile = VmFile {
+    name: "hangar-ca",
+    path: "/var/lib/hangar/ca-bundle.crt",
+    owner: "root:root",
+    mode: "0644",
+    fill: "cat /etc/hangar/system-ca.crt /run/hangar/ca.pem",
+};
+
+/// Replaced whole, so nothing reads half a file, and only when it changed:
+/// the bay restarts its daemons whenever `PROXY_ENV_FILE` is replaced.
+fn replace_script(fill: &str) -> String {
+    format!(
+        r#"umask 077 && {fill} >"$1.tmp" && chown "$2" "$1.tmp" &&
+chmod "$3" "$1.tmp" &&
+if cmp -s "$1.tmp" "$1"; then rm "$1.tmp"; else mv "$1.tmp" "$1"; fi"#
+    )
+}
+
+fn replace(
+    sandbox: &dyn Sandbox,
+    vm: &str,
+    file: &VmFile,
+    stdin: Option<&[u8]>,
+) -> Result<()> {
+    let script = replace_script(file.fill);
+    let command = [
+        "/bin/sh", "-c", &script, file.name, file.path, file.owner, file.mode,
+    ];
+    sandbox.exec(vm, Some(ROOT), &command, stdin).map(drop)
+}
+
+/// The proxy for every client, and the CA bundle under every name a tool
+/// looks for. The CA's hash makes a new CA a new file too.
+fn proxy_env(url: &str, ca_pem: &[u8]) -> String {
+    let mut env = BTreeMap::new();
+    for name in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+        env.insert(name.to_string(), url.to_string());
+    }
+    for name in ["NO_PROXY", "no_proxy"] {
+        env.insert(name.to_string(), "localhost,127.0.0.1".to_string());
+    }
+    for name in [
+        "SSL_CERT_FILE",
+        "NIX_SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "GIT_SSL_CAINFO",
+    ] {
+        env.insert(name.to_string(), CA_BUNDLE.path.to_string());
+    }
+    format!(
+        "# tower CA {}\n{}",
+        fnv(ca_pem.iter().copied()),
+        render_env(&env)
+    )
+}
 
 /// A placeholder per injected credential; `env` wins for a name, for
 /// tools that want a specific placeholder format.
@@ -343,19 +470,13 @@ fn vm_env(settings: &Settings, bay: &BaySettings) -> BTreeMap<String, String> {
 }
 
 pub(crate) fn write_env(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    // A login shell never sources half a file.
-    let tmp = format!("{ENV_FILE}.tmp");
-    let script = format!("cat >{tmp} && mv {tmp} {ENV_FILE}");
     let rendered = render_env(&vm_env(&hangar.settings, bay.settings));
-    hangar
-        .sandbox
-        .exec(
-            &bay.vm,
-            Some(ROOT),
-            &["/bin/sh", "-c", &script, "hangar-env"],
-            Some(rendered.as_bytes()),
-        )
-        .map(drop)
+    replace(
+        hangar.sandbox.as_ref(),
+        &bay.vm,
+        &BAY_ENV,
+        Some(rendered.as_bytes()),
+    )
 }
 
 fn render_env(env: &BTreeMap<String, String>) -> String {
@@ -668,9 +789,10 @@ fn create_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_TIMEOUT, BOOTED, Boot, RunDecision, boot_state, check_egress,
-        drift_warnings, preflight, reconcile_vm, renewed_warning, run_decision,
-        start, start_runs, vm_env, wait_booted, write_env,
+        BOOTED, DOCKER_READY, Probe, RunDecision, WAIT_TIMEOUT, boot_state,
+        check_egress, drift_warnings, preflight, proxy_env, reconcile_vm,
+        renewed_warning, replace_script, run_decision, start, start_runs,
+        vm_env, wait_booted, wait_for_docker, write_env,
     };
     use crate::broker::fake::FakeBroker;
     use crate::error::Error;
@@ -847,20 +969,20 @@ mod tests {
     #[test]
     fn a_bay_is_booted_once_systemd_runs_even_degraded() {
         let said = |text: &str| boot_state(Ok(text.as_bytes().to_vec()));
-        assert_eq!(said("running\n"), Boot::Done);
+        assert_eq!(said("running\n"), Probe::Done);
         assert_eq!(
             said("stopping\n"),
-            Boot::Failed(r#"systemd is "stopping""#.into())
+            Probe::Failed(r#"systemd is "stopping""#.into())
         );
-        assert_eq!(said("degraded\n"), Boot::Done);
+        assert_eq!(said("degraded\n"), Probe::Done);
         assert_eq!(
             said("offline\n"),
-            Boot::Pending(r#"systemd is "offline""#.into())
+            Probe::Pending(r#"systemd is "offline""#.into())
         );
         let unknown_root = Error::new("failed to resolve guest uid 0");
         assert_eq!(
             boot_state(Err(unknown_root)),
-            Boot::Pending("failed to resolve guest uid 0".into())
+            Probe::Pending("failed to resolve guest uid 0".into())
         );
     }
 
@@ -892,7 +1014,7 @@ mod tests {
         let state = scratch_dir("bay-boot-retry");
         let hangar = hangar_with("{}", &state, sandbox.clone());
         let bay = hangar.bay("default").unwrap();
-        wait_booted(sandbox.as_ref(), &bay, BOOT_TIMEOUT, Duration::ZERO)
+        wait_booted(sandbox.as_ref(), &bay, WAIT_TIMEOUT, Duration::ZERO)
             .unwrap();
         assert_eq!(sandbox.changes().len(), 3);
     }
@@ -908,7 +1030,7 @@ mod tests {
             let error = wait_booted(
                 sandbox.as_ref(),
                 &bay,
-                BOOT_TIMEOUT,
+                WAIT_TIMEOUT,
                 Duration::ZERO,
             )
             .unwrap_err()
@@ -1042,8 +1164,20 @@ mod tests {
         );
     }
 
+    fn replace_call(name: &str, path: &str, owner: &str, mode: &str) -> String {
+        let fill = if name == "hangar-ca" {
+            "cat /etc/hangar/system-ca.crt /run/hangar/ca.pem"
+        } else {
+            "cat"
+        };
+        let script = replace_script(fill);
+        format!(
+            "exec root@{BAY_VM} /bin/sh -c {script} {name} {path} {owner} {mode}"
+        )
+    }
+
     #[test]
-    fn the_bay_starts_with_the_proxy_url_on_stdin() {
+    fn the_bay_gets_its_ca_bundle_then_its_proxy_env_on_stdin() {
         let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
         let state = scratch_dir("bay-start");
         fs::create_dir_all(state.join("guest")).unwrap();
@@ -1053,18 +1187,30 @@ mod tests {
             sandbox.changes(),
             [
                 format!("exec root@{BAY_VM} /bin/sh -c {BOOTED} hangar-booted"),
+                replace_call(
+                    "hangar-ca",
+                    "/var/lib/hangar/ca-bundle.crt",
+                    "root:root",
+                    "0644"
+                ),
+                replace_call(
+                    "hangar-proxy-env",
+                    "/etc/hangar/proxy.env",
+                    "root:pilot",
+                    "0640"
+                ),
                 format!(
-                    "exec root@{BAY_VM} /run/current-system/sw/bin/hangar-start"
+                    "exec pilot@{BAY_VM} sh -c {DOCKER_READY} hangar-docker"
                 ),
             ]
         );
+        let stdins = sandbox.stdins.borrow();
+        assert_eq!(stdins[..2], [Vec::<u8>::new(), Vec::new()]);
         assert_eq!(
-            *sandbox.stdins.borrow(),
-            [
-                Vec::new(),
-                b"http://fake-token:vault@host.fake:14322\n".to_vec()
-            ]
+            String::from_utf8_lossy(&stdins[2]),
+            proxy_env("http://fake-token:vault@host.fake:14322", b"FAKE-CA\n")
         );
+        drop(stdins);
         assert_eq!(fs::read(state.join("guest/ca.pem")).unwrap(), b"FAKE-CA\n");
 
         // A port other than the proxy the VM was created to reach.
@@ -1081,8 +1227,96 @@ mod tests {
             "broker gave port 15000 for bay default, but its proxy port is \
              14322"
         );
-        let changes = sandbox.changes();
-        assert!(!changes.iter().any(|c| c.contains("hangar-start")));
+        assert_eq!(sandbox.changes().len(), 1);
+    }
+
+    #[test]
+    fn the_proxy_env_names_the_proxy_the_bundle_and_the_ca() {
+        let env = proxy_env("http://a'b@host:1", b"CA-1");
+        assert_eq!(
+            env,
+            format!(
+                "# tower CA {}\n\
+                 CURL_CA_BUNDLE='/var/lib/hangar/ca-bundle.crt'\n\
+                 GIT_SSL_CAINFO='/var/lib/hangar/ca-bundle.crt'\n\
+                 HTTPS_PROXY='http://a'\\''b@host:1'\n\
+                 HTTP_PROXY='http://a'\\''b@host:1'\n\
+                 NIX_SSL_CERT_FILE='/var/lib/hangar/ca-bundle.crt'\n\
+                 NODE_EXTRA_CA_CERTS='/var/lib/hangar/ca-bundle.crt'\n\
+                 NO_PROXY='localhost,127.0.0.1'\n\
+                 SSL_CERT_FILE='/var/lib/hangar/ca-bundle.crt'\n\
+                 http_proxy='http://a'\\''b@host:1'\n\
+                 https_proxy='http://a'\\''b@host:1'\n\
+                 no_proxy='localhost,127.0.0.1'\n",
+                crate::state::fnv(*b"CA-1")
+            )
+        );
+        // A new CA alone is a new file, which restarts the daemons.
+        assert_ne!(env, proxy_env("http://a'b@host:1", b"CA-2"));
+    }
+
+    #[test]
+    fn a_file_is_replaced_whole_and_only_when_it_changed() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = scratch_dir("replace");
+        let file = dir.join("proxy.env");
+        let meta = fs::metadata(&dir).unwrap();
+        let owner = format!("{}:{}", meta.uid(), meta.gid());
+        let script = replace_script(r#"printf %s "$4""#);
+        let replace = |content: &str| {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "sh"])
+                .arg(&file)
+                .args([&owner, "0640", content])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let inode = || fs::metadata(&file).unwrap().ino();
+        replace("A=1\n");
+        let first = inode();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "A=1\n");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        replace("A=1\n");
+        assert_eq!(inode(), first);
+        replace("A=2\n");
+        assert_ne!(inode(), first);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "A=2\n");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a tmp file was left behind"
+        );
+    }
+
+    #[test]
+    fn docker_is_waited_for_until_it_answers() {
+        let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
+        sandbox.reply_once("hangar-docker", None);
+        let state = scratch_dir("bay-docker");
+        let hangar = hangar_with("{}", &state, sandbox.clone());
+        let bay = hangar.bay("default").unwrap();
+        wait_for_docker(sandbox.as_ref(), &bay, WAIT_TIMEOUT, Duration::ZERO)
+            .unwrap();
+        assert_eq!(sandbox.changes().len(), 2);
+
+        sandbox.reply_once("hangar-docker", None);
+        let error = wait_for_docker(
+            sandbox.as_ref(),
+            &bay,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("dockerd in hangar-bay-default did not start: "),
+            "{error}"
+        );
+        assert!(error.ends_with("-u docker' in the bay, as root"), "{error}");
     }
 
     fn started(sandbox: &FakeSandbox) -> Vec<String> {
@@ -1140,17 +1374,19 @@ mod tests {
     }
 
     #[test]
-    fn the_env_file_is_replaced_whole_never_half_written() {
+    fn the_env_file_is_replaced_whole_by_root() {
         let state = scratch_dir("bay-env-atomic");
         let sandbox = Rc::new(FakeSandbox::default());
         let hangar = hangar_with("{}", &state, sandbox.clone());
         write_env(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        let calls = sandbox.changes();
-        let script = "cat >/etc/hangar/bay.env.tmp && mv \
-                      /etc/hangar/bay.env.tmp /etc/hangar/bay.env";
         assert_eq!(
-            calls,
-            [format!("exec root@{BAY_VM} /bin/sh -c {script} hangar-env")]
+            sandbox.changes(),
+            [replace_call(
+                "hangar-env",
+                "/etc/hangar/bay.env",
+                "root:root",
+                "0644"
+            )]
         );
     }
 }

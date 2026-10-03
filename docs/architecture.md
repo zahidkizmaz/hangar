@@ -102,8 +102,8 @@ its shell wrapper.
 Apps never run as root. Every bay `exec` names its user (`bay::ROOT` or
 `bay::PILOT`); the tower keeps its image's default.
 
-- root: `hangar-start`, the package reconcile and cache fill, the env
-  file (`write_env`): hangar's own steps.
+- root: the CA bundle and proxy env, the package reconcile and cache
+  fill, the env file (`write_env`): hangar's own steps.
 - `pilot` (uid 1000, home `/home/pilot`, from the image): run entries
   (start, stop, status), setup and its check, `files` copies and
   removals, and `shell`, `logs` and `setup` (which start in the home).
@@ -114,9 +114,8 @@ Root never follows, sources or executes a path pilot can write:
 - `files` and `mounts` targets must be in `~` (`files::vm_path`), so
   pilot only ever owns its own home;
 - root's execs name absolute programs (`/bin/sh`,
-  `/run/current-system/sw/bin/nix` and `…/hangar-start`) and never start
-  a login shell; the package step sources only the root-owned proxy env
-  file;
+  `/run/current-system/sw/bin/nix`) and never start a login shell; the
+  package step sources only the root-owned proxy env file;
 - pilot's folders are declared in the image (systemd-tmpfiles), under
   root-owned parents, and dockerd makes its own data root;
 - `start` first waits until the VM's systemd has booted.
@@ -156,13 +155,30 @@ puts the profile first (`environment.profiles`).
   rootless `docker` user unit (`linger`, so it starts without a login;
   `TimeoutStartSec = 60s`, so a hanging start can't hang `up`). Both read
   `EnvironmentFile=-/etc/hangar/proxy.env`, plain `KEY='value'` lines
-  (systemd rejects `export`). `hangar-start` (`guest/start.sh`) does only
-  what is unknown until `up`: it writes the CA bundle
-  (`/var/lib/hangar/ca-bundle.crt`) and `proxy.env` (root:pilot 0640),
-  restarts both daemons only when either changed (a `restart-pending`
-  marker outlives a failed restart), then waits until `docker info`
-  answers as pilot. A renewed token or a new tower CA is such a change,
-  so it stops pilot's containers.
+  (systemd rejects `export`); the `-` lets them start on the first boot,
+  before the file exists.
+- `up` writes what is unknown until then, as root over stdin (`bay.rs`,
+  `replace`): the CA bundle (`/var/lib/hangar/ca-bundle.crt`, 0644, the
+  image's `/etc/hangar/system-ca.crt` plus `/run/hangar/ca.pem`), then
+  `proxy.env` (root:pilot 0640). Each goes to a `.tmp` file first and
+  replaces the old one with `mv` only when `cmp` finds it changed.
+  `proxy.env` starts with a `# tower CA <hash>` line, so a new CA changes
+  it too.
+- Restarts are declared: the `hangar-proxy-env.path` unit
+  (`PathChanged=/etc/hangar/proxy.env`) starts the oneshot
+  `hangar-proxy-env.service`, which runs `systemctl try-restart
+  nix-daemon` and `systemctl --user -M pilot@.host restart docker`. The
+  path unit fires when the file is created or replaced (inotify on the
+  file's inode, and on its folder until it exists), never on its own
+  start (systemd.path(5)). It watches only `proxy.env`, written last:
+  while the oneshot runs, the path unit doesn't watch, so a second
+  watched file could change unseen. A renewed token or a new tower CA
+  therefore stops pilot's containers; an unchanged `up` restarts
+  nothing.
+- Readiness: `up` then polls as pilot (`wait_for_docker`, every 0.5 s for
+  up to 2 minutes) until `systemctl list-jobs hangar-proxy-env.service`
+  is empty (a restart was queued or is still running) and `docker info`
+  answers; the unit is active before its socket is.
 - Shells: `msb exec` is no PAM login, so `environment.extraInit` sets
   `USER`, `LOGNAME` and `XDG_RUNTIME_DIR`, then sources `proxy.env` and
   `bay.env` with `set -a`. Root's package step sources only `proxy.env`.
@@ -179,14 +195,15 @@ puts the profile first (`environment.profiles`).
   nixbld and write to the store root installs packages from. Turn the
   sandbox on once the bay kernel is shown to support it.
 - A custom `bays[].image` must be built from this module: hangar needs
-  systemd at `/sbin/init`, pilot, and `nix`, `systemctl` and
-  `hangar-start` in the system's `sw/bin`.
+  systemd at `/sbin/init`, pilot, `nix`, `systemctl` and `docker` in the
+  system's `sw/bin`, `/etc/hangar/system-ca.crt` and the
+  `hangar-proxy-env` units.
 
 ## `hangar up`
 
 Every step is idempotent, and `up` never restarts the VMs or run
-entries (`hangar-start` restarts the bay's daemons only when their proxy
-env or CA changed):
+entries (the bay restarts its daemons only when their proxy env or CA
+changed):
 
 1. Resolve the master password: `HANGAR_MASTER_PASSWORD`,
    `HANGAR_MASTER_PASSWORD_FILE`, `tower.masterPasswordFile`, then the keychain.
@@ -220,8 +237,8 @@ env or CA changed):
    in `agent-tokens/<bay>`; without the file it deletes any vault agent
    `hangar-<bay>` and creates it again, never adopting one, and warns to
    restart the bay's run entries) with the CA written to `guest/ca.pem`,
-   checked to name the proxy port, then `hangar-start` with the proxy URL
-   as one stdin line. The image is
+   checked to name the proxy port, then the CA bundle and the proxy env
+   (the proxy URL on stdin) and the wait for docker. The image is
    `bays[].image`, else `<imageRepository>:v<hangar version>`;
    `imageLoader` (from `imagePackage`) loads it first if missing. The
    VM's only egress is the tower's proxy port (`Egress::OnlyHostPort`); it
@@ -432,7 +449,6 @@ reach them by name.
   `random_hex` and `find_secret`, the scan `env` and `files`
   share.
 - `src/json.rs`, `src/error.rs`: helpers.
-- `guest/start.sh`: baked into the image as `hangar-start`.
 - `nix/bay/configuration.nix`: the bay as a NixOS system (pilot, the
   daemons, the tool set).
 - `config/defaults.json`, `config/apps/*.json`: the only copy of the

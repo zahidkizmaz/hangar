@@ -100,7 +100,7 @@ impl AgentVault {
     }
 
     /// A bay's proxy login. It reaches the bay only inside the proxy URL,
-    /// on `hangar-start`'s stdin.
+    /// on stdin into its proxy env.
     fn agent_token(&self, bay: &str) -> PathBuf {
         self.agent_tokens().join(bay)
     }

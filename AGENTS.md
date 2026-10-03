@@ -13,9 +13,9 @@ overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
   tokens live in `stateDir` at mode 0600. Start every child via
   `process::command`.
 - The proxy URL carries the bay's own token (one per bay, in
-  `agent-tokens/<bay>`): it reaches that bay on `hangar-start`'s stdin
-  only, never in argv, `guest/` (the bays' read-only mount: `ca.pem`
-  only) or an `info!`/`debug!` line.
+  `agent-tokens/<bay>`): it reaches that bay on stdin only, into its
+  proxy env, never in argv, `guest/` (the bays' read-only mount:
+  `ca.pem` only) or an `info!`/`debug!` line.
 - No default or suggested master-password file. The keychain password is
   generated per install; file/env are explicit opt-ins.
 - Deny mode is set, and read back from the broker, before routes and
@@ -25,8 +25,9 @@ overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
 - Only hangar-managed credentials, packages, copied files and the vault
   agents hangar created (`hangar-<bay>`, the ones with a token file) are
   ever deleted. `up` never restarts a VM or run entry; only `hangar
-  restart` restarts run entries. `hangar-start` restarts a bay's daemons
-  only when their proxy env or CA changed.
+  restart` restarts run entries. A bay restarts its daemons only when
+  their proxy env (which names the CA) changed: hangar never replaces an
+  unchanged one.
 - Every bay gets placeholders only: a bay's `env` refuses real-looking
   values. Never print or change the broker admin login (hangar logs in
   with it on every `up`).
@@ -55,7 +56,8 @@ overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
   hand-written users, setuid copies or daemon launches. Bays boot its
   systemd (`VmSpec.init`, the sandbox's own `/run`) and `up` waits for
   it; hangar never restores snapshots (they lose the init handoff).
-  `hangar-start` only does what is unknown until `up`.
+  Daemon restarts are systemd units (`hangar-proxy-env.path`), not
+  hangar's execs; `up` writes only what is unknown until then.
 - In a bay, root's execs name absolute programs and never start a login
   shell, and the image's `PATH` (root's `sh -c` steps) never holds
   hangar's package profile. Pilot can't write anything root runs or
@@ -100,9 +102,9 @@ Run the checks in `docs/development.md` ("Checks") before calling work done.
 ## Read when relevant
 
 - `docs/architecture.md`: before changing how VMs, the broker, config,
-  packages or the bay image work (`guest/start.sh`, how a bay boots); has
-  the file map, the naming rules (bay, tower, broker, agent) and what the
-  core verifies of a backend.
+  packages or the bay image work (how a bay boots and starts its
+  daemons); has the file map, the naming rules (bay, tower, broker,
+  agent) and what the core verifies of a backend.
 - `docs/development.md`: before running end-to-end tests or touching CI,
   Renovate or releases.
 - `docs/sandbox-backends.md`: before touching `src/sandbox/` or adding a

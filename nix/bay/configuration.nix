@@ -9,19 +9,7 @@
   ...
 }:
 let
-  hangarStart = pkgs.writeShellApplication {
-    name = "hangar-start";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.diffutils
-      pkgs.gnused
-      pkgs.util-linux
-      config.systemd.package
-      config.virtualisation.docker.rootless.package
-    ];
-    runtimeEnv.CACERT_BUNDLE = config.security.pki.caBundle;
-    text = builtins.readFile ../../guest/start.sh;
-  };
+  systemctl = "${config.systemd.package}/bin/systemctl";
 in
 {
   imports = [ "${modulesPath}/profiles/minimal.nix" ];
@@ -48,9 +36,22 @@ in
         enable = false;
       })
     // {
-      # Written by hangar-start at `up`; `-` lets it start before.
+      # hangar writes proxy.env at `up`; `-` lets the daemons start before.
       nix-daemon.serviceConfig.EnvironmentFile = "-/etc/hangar/proxy.env";
+      hangar-proxy-env.serviceConfig = {
+        Type = "oneshot";
+        ExecStart = [
+          "${systemctl} try-restart nix-daemon.service"
+          "${systemctl} --user --machine=pilot@.host restart docker.service"
+        ];
+      };
     };
+  # hangar replaces proxy.env only when it changed (it names the tower's CA
+  # too): restart the daemons that read it.
+  systemd.paths.hangar-proxy-env = {
+    wantedBy = [ "paths.target" ];
+    pathConfig.PathChanged = "/etc/hangar/proxy.env";
+  };
 
   # Nobody logs in: hangar reaches root through `msb exec`.
   users.mutableUsers = false;
@@ -101,8 +102,8 @@ in
   };
   systemd.user.services.docker.serviceConfig = {
     EnvironmentFile = "-/etc/hangar/proxy.env";
-    # Overrides the module's TimeoutSec = 0 for starts, so hangar-start
-    # can't hang `up`.
+    # Overrides the module's TimeoutSec = 0 for starts, so a restart can't
+    # hang `up`.
     TimeoutStartSec = "60s";
   };
 
@@ -128,9 +129,10 @@ in
   # store symlink it would write into /nix/store.
   environment.etc.profile.mode = "0644";
   environment.etc."ssl/certs/ca-certificates.crt".mode = "0644";
+  # Untouched by agentd: hangar adds the tower's CA to it.
+  environment.etc."hangar/system-ca.crt".source = config.security.pki.caBundle;
 
   systemd.tmpfiles.rules = [
-    "d /etc/hangar 0755 root root -"
     "d /var/lib/hangar 0755 root root -"
     "z /dev/net/tun 0666 root root -"
     "d /var/lib/pilot 0755 pilot pilot -"
@@ -139,8 +141,8 @@ in
   ];
   environment.profiles = lib.mkBefore [ "/nix/var/nix/profiles/hangar" ];
 
-  # `msb exec` is no PAM login. hangar-start writes proxy.env and `up`
-  # bay.env, both KEY='value' lines.
+  # `msb exec` is no PAM login. hangar writes proxy.env and bay.env, both
+  # KEY='value' lines.
   environment.extraInit = lib.mkBefore ''
     : "''${USER:=$(id -un)}" "''${LOGNAME:=$USER}"
     export USER LOGNAME
@@ -164,7 +166,6 @@ in
 
   # On top of NixOS's core packages (coreutils, curl, …), nix and docker.
   environment.systemPackages = with pkgs; [
-    hangarStart
     file
     unzip
     git
