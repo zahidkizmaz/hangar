@@ -153,7 +153,8 @@ puts the profile first (`environment.profiles`).
   on the host.
 - Daemons are systemd units: socket-activated `nix-daemon` and pilot's
   rootless `docker` user unit (`linger`, so it starts without a login;
-  `TimeoutStartSec = 60s`, so a hanging start can't hang `up`). Both read
+  `TimeoutStartSec = 60s` and `TimeoutStopSec = 30s` over the module's
+  `TimeoutSec = 0`, so a hanging start or stop can't hang `up`). Both read
   `EnvironmentFile=-/etc/hangar/proxy.env`, plain `KEY='value'` lines
   (systemd rejects `export`); the `-` lets them start on the first boot,
   before the file exists.
