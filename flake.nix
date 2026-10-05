@@ -4,7 +4,7 @@
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
   outputs =
-    { self, nixpkgs }:
+    { nixpkgs, ... }:
     let
       inherit (nixpkgs) lib;
       forAllSystems = lib.genAttrs [
@@ -21,6 +21,8 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          cli = pkgs.callPackage ./nix/cli.nix { };
+          msb = pkgs.callPackage ./nix/microsandbox.nix { };
           bay = lib.nixosSystem {
             modules = [
               ./nix/bay/configuration.nix
@@ -29,7 +31,17 @@
           };
         in
         {
-          default = pkgs.callPackage ./nix/cli.nix { };
+          # hangar plus the msb it drives; it reads ~/.config/hangar.
+          default = pkgs.symlinkJoin {
+            name = "hangar-${cli.version}";
+            paths = [
+              cli
+              msb
+            ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = "wrapProgram $out/bin/hangar --prefix PATH : ${msb}/bin";
+            meta.mainProgram = "hangar";
+          };
         }
         # A bay is a Linux VM; macOS builds aarch64-linux's (docs/nix.md).
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -63,7 +75,7 @@
       checks = forAllSystems (system: {
         # The package's checkPhase runs the tests (nextest); fmt and clippy
         # run in prek with the pinned toolchain only.
-        rust = self.packages.${system}.default;
+        rust = nixpkgs.legacyPackages.${system}.callPackage ./nix/cli.nix { };
         module = nixpkgs.legacyPackages.${system}.callPackage ./nix/tests/module.nix { };
       });
     };
