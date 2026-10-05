@@ -122,21 +122,26 @@ case "$1 $2" in
     cat >"$fake/vmfs$5"
     chmod "$6" "$fake/vmfs$5" ;;
   hangar-run)
-    # A restart stops the entry first.
-    case $3 in *"kill -TERM"*)
-      echo "$5" >>"$fake/restarts"; rm -f "$fake/run-$5" ;;
-    esac
-    [ -f "$fake/run-$5" ] && exit 0
-    printf '%s' "$6" >"$fake/run-$5"
+    # Pilot's user units: hangar-run <unit> <command> <description> <mode>.
+    # A file per active unit, named after its entry.
+    entry=${5#hangar-run-} && entry=${entry%.service}
+    unit=$fake/run-$entry
+    if [ "$8" = restart ]; then
+      echo "$entry" >>"$fake/restarts"
+    elif [ -f "$unit" ]; then
+      cat "$unit.description"; exit 0
+    fi
+    printf '%s' "$6" >"$unit"
+    printf '%s\n' "$7" >"$unit.description"
     echo started ;;
   hangar-setup-check)
     # Only `test -f PATH` checks, against the files the fake VM has.
     path=$(printf '%s' "${5#test -f }" | sed 's|^~|/home/pilot|')
     if [ -f "$fake/vmfs$path" ]; then echo "done"; else echo needed; fi ;;
   hangar-run-status)
-    fails run-status && { echo "no /proc" >&2; exit 1; }
-    [ -f "$fake/garbled-status" ] && { echo "zombie"; exit 0; }
-    if [ -f "$fake/run-$5" ]; then echo running; else echo stopped; fi ;;
+    fails run-status && { echo "Failed to connect to bus" >&2; exit 1; }
+    entry=${5#hangar-run-} && entry=${entry%.service}
+    if [ -f "$fake/run-$entry" ]; then echo active; else echo inactive; fi ;;
   *) echo "unexpected bay script: $4" >&2; exit 2 ;;
   esac ;;
 "agent-vault auth")
@@ -164,7 +169,7 @@ case "$1 $2" in
     esac
     echo "setup: $3"
   else
-    fails shell && { echo "tail: no such file" >&2; exit 1; }
+    fails shell && { echo "No journal files were opened" >&2; exit 1; }
     echo "shell: $*"
   fi ;;
 "sh -l") echo "interactive shell" ;;

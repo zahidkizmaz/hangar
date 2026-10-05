@@ -66,8 +66,7 @@ its shell wrapper.
     `port\t<name>\t<host>\t<vm>`, and `mount\t<vm>\t<host>\t<ro|rw>` per
     mount with its resolved host, the home mount included; no `mount`
     lines means none), `files` (hash and VM path of each file
-    `files` copied), `run-fingerprints` (what each `run` entry
-    was started with) and `home/`.
+    `files` copied) and `home/`.
 - `home` (`true`): the bay's `bays/<name>/home` (0700) is its home
   (`/home/pilot`), mounted writable, so app data outlives the VM; `destroy`
   keeps it, `destroy --state` deletes it with the rest of `stateDir`.
@@ -105,7 +104,7 @@ Apps never run as root. Every bay `exec` names its user (`bay::ROOT` or
 - root: the CA bundle and proxy env, the package reconcile and cache
   fill, the env file (`write_env`): hangar's own steps.
 - `pilot` (uid 1000, home `/home/pilot`, from the image): run entries
-  (start, stop, status), setup and its check, `files` copies and
+  (units in its own user manager: start, stop, status, journal), setup and its check, `files` copies and
   removals, and `shell`, `logs` and `setup` (which start in the home).
   Docker is pilot's own rootless daemon; nix goes through `nix-daemon`,
   which doesn't trust pilot. No sudo.
@@ -137,8 +136,7 @@ puts the profile first (`environment.profiles`).
   activation, then systemd as PID 1. Both appended files are copies
   (`mode = "0644"`), so the append never writes into `/nix/store`.
   Without `--tmpfs /run`, systemd's own `/run` hides the `/run/hangar`
-  mount; with it, `/run` is per boot and run PID files can't outlive a
-  restart.
+  mount.
 - Readiness: `msb create` and `start` return before systemd is up. Root's
   exec fails ("failed to resolve guest uid 0") until activation writes
   passwd, then `systemctl is-system-running --wait` says `offline`, then
@@ -292,14 +290,19 @@ changed):
     setup NAME'", and step 13 skips the run entry of that name, even when
     `run.NAME` overrides the command. There's no record: the check
     is the truth, so a wiped home asks for setup again.
-13. Start each `run` entry not already running: `setsid sh -lc` (so
-    the proxy env and placeholders apply), output to
-    `/var/log/hangar/<name>.log`, PID in `/run/hangar-run/<name>.pid` (on
-    a per-boot tmpfs). It counts as running only while that PID carries
-    `HANGAR_RUN=<name>`, so a reused PID isn't mistaken for it. Each start
-    records a fingerprint (FNV-1a of the command, the env file and the
-    `files` record) in `run-fingerprints`; a running entry whose
-    inputs differ only gets a warning (`run_decision`).
+13. Start each `run` entry not already running as the transient unit
+    `hangar-run-<name>.service` in pilot's user manager (`systemd-run
+    --user --collect`, run by pilot, with `XDG_RUNTIME_DIR` set since
+    `msb exec` is no login): `/bin/sh -lc` inside it, so the proxy env,
+    placeholders and profile apply, in pilot's home. Its cgroup holds
+    every process it starts, its output goes to the journal, and
+    `--collect` unloads it once it exits, failed or not, so the name is
+    free for the next start; there's no restart on failure. It counts as
+    running while `systemctl --user is-active` says `active` or
+    `activating`. The unit's description holds a fingerprint (FNV-1a of
+    the command, the env file and the `files` record): a running entry
+    whose description differs only gets a warning. Units are per boot,
+    so a restarted VM starts them again.
 14. Print `status`'s short view: health, each bay's run entries and
     ports, the tower and its ports. Every published port is probed the same
     way: an HTTP GET for HTTP ports, a TCP connect otherwise; the proxy,
@@ -307,9 +310,9 @@ changed):
 
 `hangar copy` runs step 10 alone (or one ad-hoc source through the same
 core). `hangar restart [NAME…]` runs step 10 (unless `--no-copy`) and step
-11, then stops each entry's process group (TERM, KILL after 5 seconds) and
-starts it again through the same `launch` as step 13, recording the new
-fingerprint. It doesn't run setup checks: a restart is an explicit action.
+11, then stops each entry's unit (`systemctl --user stop`: TERM to its
+whole cgroup, KILL after 10 seconds) and starts it again through the same
+`launch` as step 13, with the new fingerprint. It doesn't run setup checks: a restart is an explicit action.
 
 `hangar setup NAME [--force]` needs the bay running and `NAME` an
 enabled app with a `setup`. Unless `--force`, an app whose check passes is

@@ -422,7 +422,6 @@ own registry, or `image` to any ref (a digest pins it). The VM's disk is
 made from the image once: after switching images, `hangar up` warns until you
 run `hangar destroy NAME && hangar up NAME`. Any image must be built from
 `nix/bay/configuration.nix`: hangar boots its systemd, which restarts the
-daemons when hangar writes their proxy env, and apps run as its user
-`pilot` (uid 1000, home
-`/home/pilot`). To build and load one locally, see
+daemons when hangar writes their proxy env, and apps run as units in
+the user manager of its user `pilot` (uid 1000, home `/home/pilot`). To build and load one locally, see
 [Local images](nix.md#local-images).

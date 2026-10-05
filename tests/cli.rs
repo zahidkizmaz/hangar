@@ -1602,17 +1602,9 @@ fn unreadable_run_states_are_unknown_and_unhealthy() {
         "{status}"
     );
 
-    fs::remove_file(machine.fake.join("fail-run-status")).unwrap();
-    fs::write(machine.fake.join("garbled-status"), "").unwrap();
-    let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
-    assert!(
-        status.contains(r#"run paperclip: unknown (unexpected "zombie")"#),
-        "{status}"
-    );
-
     machine.fail("shell");
     let error = failed(&run(&machine, &config, &["logs", "paperclip"]));
-    assert!(error.contains("no output for paperclip yet"), "{error}");
+    assert!(error.contains("can't read paperclip's journal"), "{error}");
 }
 
 #[test]
@@ -1755,12 +1747,15 @@ fn bay_env_and_run_entries_reach_the_bay() {
 
     let logs = stdout(ok(&run(&machine, &config, &["logs", "paperclip"])));
     assert!(
-        logs.contains("shell: tail -n 100 /var/log/hangar/paperclip.log"),
+        logs.contains(
+            "shell: journalctl --user -u hangar-run-paperclip.service -o cat \
+             --no-pager -n 100\n"
+        ),
         "{logs}"
     );
     let follow = ["logs", "paperclip", "-f"];
     let logs = stdout(ok(&run(&machine, &config, &follow)));
-    assert!(logs.contains("tail -n 100 -f /var/log/hangar"), "{logs}");
+    assert!(logs.contains("--no-pager -n 100 -f\n"), "{logs}");
     let error = failed(&run(&machine, &config, &["logs", "nope"]));
     assert!(error.contains("not a run entry or app"), "{error}");
     let error = usage_error(&run(&machine, &config, &["logs"]));

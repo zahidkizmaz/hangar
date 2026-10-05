@@ -16,7 +16,7 @@ use crate::hangar::Hangar;
 use crate::mounts::{self, Resolved, Roots};
 use crate::overview::RunState;
 use crate::sandbox::{BoxState, Egress, Mount, MountMode, Sandbox, VmSpec};
-use crate::state::{BayDir, fnv, read_hashes, write_hashes, write_private};
+use crate::state::{BayDir, fnv, write_private};
 use crate::vm_record::VmRecord;
 use crate::{files, packages, process};
 use log::{info, warn};
@@ -491,54 +491,30 @@ fn render_env(env: &BTreeMap<String, String>) -> String {
     })
 }
 
-// A run counts as running only if its PID still carries the marker, so a
-// PID reused after the entry exited isn't mistaken for it.
-const RUNNING: &str = r#"pid_file=/run/hangar-run/$1.pid
-running() {
-  [ -f "$pid_file" ] || return 1
-  tr '\0' '\n' 2>/dev/null <"/proc/$(cat "$pid_file")/environ" |
-    grep -qx "HANGAR_RUN=$1"
-}
-"#;
+/// `msb exec` is no login: nothing points pilot's `systemctl --user` at
+/// its user manager.
+const USER_MANAGER: &str = "export XDG_RUNTIME_DIR=/run/user/1000\n";
 
-const STOP_RUN: &str = r#"if running; then
-  pid=$(cat "$pid_file")
-  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-  i=0
-  while running && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-  running && { kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid"; }
-  rm -f "$pid_file"
-fi
-"#;
+/// Starts the unit `$1` unless it runs, after stopping it for `restart`;
+/// prints `started`, or the running unit's description. `--collect`
+/// unloads it once it exits, failed or not, so its name is free again.
+/// The login shell brings the proxy env, `bay.env` and the profile.
+const START_RUN: &str = r#"case $(systemctl --user is-active "$1") in
+active | activating)
+  [ "$4" = restart ] || exec systemctl --user show -P Description "$1"
+  systemctl --user stop "$1" ;;
+esac
+systemd-run --user --quiet --collect --unit="$1" --description="$3" \
+  --property=TimeoutStopSec=10s /bin/sh -lc "$2" && echo started"#;
 
-const START_RUN: &str = r#"running && exit 0
-HANGAR_RUN=$1 setsid sh -lc "$2" >>"/var/log/hangar/$1.log" 2>&1 </dev/null &
-echo $! >"$pid_file"
-echo started"#;
+/// Prints the unit's state; fails only when systemd can't tell.
+const RUN_STATE: &str = r#"state=$(systemctl --user is-active "$1")
+[ -n "$state" ] && echo "$state""#;
 
-const RUN_STATUS: &str =
-    r"if running; then echo running; else echo stopped; fi";
-
-/// What `up` does about an entry: `up` never restarts anything.
-#[derive(Debug, PartialEq, Eq)]
-enum RunDecision {
-    /// Just started, or nothing recorded yet: record it.
-    Record,
-    Warn,
-    Nothing,
-}
-
-fn run_decision(
-    started: bool,
-    recorded: Option<&str>,
-    current: &str,
-) -> RunDecision {
-    match recorded {
-        _ if started => RunDecision::Record,
-        None => RunDecision::Record,
-        Some(recorded) if recorded != current => RunDecision::Warn,
-        Some(_) => RunDecision::Nothing,
-    }
+/// A `run` entry's transient unit in pilot's user manager: stopping it
+/// stops every process the entry started, and its output is its journal.
+pub(crate) fn run_unit(name: &str) -> String {
+    format!("hangar-run-{name}.service")
 }
 
 /// Runs an app's setup `check` in a login shell (PATH and app env apply);
@@ -588,23 +564,23 @@ pub(crate) fn check_setup(hangar: &Hangar, bay: &Bay) -> Result<()> {
     Ok(())
 }
 
+/// `up` never restarts anything: it starts what isn't running and warns
+/// about a running entry started with other inputs.
 pub(crate) fn start_runs(hangar: &Hangar, bay: &Bay) -> Result<()> {
     let needing_setup = needing_setup(hangar, bay)?;
-    let mut fingerprints = Fingerprints::load(bay);
     for (name, command) in &bay.settings.run {
         if needing_setup.contains(name) {
             continue;
         }
-        let started = launch(hangar, bay, name, command, false)?;
-        let current = Fingerprints::current(hangar, bay, command);
-        match run_decision(started, fingerprints.get(name), &current) {
-            RunDecision::Record => fingerprints.set(name, current)?,
-            RunDecision::Warn => warn!(
+        let wanted = description(hangar, bay, name, command);
+        match launch(hangar, bay, name, command, &wanted, false)?.as_str() {
+            "started" => info!("started {name}: hangar logs {name}"),
+            running if running != wanted => warn!(
                 "{name}'s inputs changed; run 'hangar restart{} {name}' to \
                  apply",
                 flag(hangar, bay)
             ),
-            RunDecision::Nothing => {}
+            _ => {}
         }
     }
     Ok(())
@@ -638,68 +614,56 @@ pub(crate) fn restart(
         files::copy_declared(hangar, bay)?;
     }
     write_env(hangar, bay)?;
-    let mut fingerprints = Fingerprints::load(bay);
     for name in &names {
         let command = &run[name];
         info!("restarting {name}");
-        launch(hangar, bay, name, command, true)?;
-        fingerprints.set(name, Fingerprints::current(hangar, bay, command))?;
+        let wanted = description(hangar, bay, name, command);
+        launch(hangar, bay, name, command, &wanted, true)?;
     }
     Ok(names)
 }
 
-/// The one place an entry's process is (re)started; `restart` stops it
-/// first. True when it was started.
+/// The unit's description records what the entry was started with: a
+/// hash of its command, the env file and the copied config files.
+fn description(
+    hangar: &Hangar,
+    bay: &Bay,
+    name: &str,
+    command: &str,
+) -> String {
+    let env = render_env(&vm_env(&hangar.settings, bay.settings));
+    let inputs = [command, &env, &files::record_text(bay)].join("\0");
+    format!("hangar run {name} {}", fnv(inputs.into_bytes()))
+}
+
+/// The one place an entry is (re)started: what `START_RUN` printed.
 fn launch(
     hangar: &Hangar,
     bay: &Bay,
     name: &str,
     command: &str,
-    stop_first: bool,
-) -> Result<bool> {
-    let stop = if stop_first { STOP_RUN } else { "" };
-    let script = format!("{RUNNING}{stop}{START_RUN}");
+    description: &str,
+    restart: bool,
+) -> Result<String> {
+    let script = format!("{USER_MANAGER}{START_RUN}");
+    let unit = run_unit(name);
+    let mode = if restart { "restart" } else { "start" };
     let output = hangar.sandbox.exec(
         &bay.vm,
         Some(PILOT),
-        &["sh", "-c", &script, "hangar-run", name, command],
+        &[
+            "sh",
+            "-c",
+            &script,
+            "hangar-run",
+            &unit,
+            command,
+            description,
+            mode,
+        ],
         None,
     )?;
-    let started = String::from_utf8_lossy(&output).trim() == "started";
-    if started && !stop_first {
-        info!("started {name}: hangar logs {name}");
-    }
-    Ok(started)
-}
-
-/// What each `run` entry was last started with: a hash of its
-/// command, the env file and the copied config files.
-struct Fingerprints {
-    path: std::path::PathBuf,
-    recorded: BTreeMap<String, String>,
-}
-
-impl Fingerprints {
-    fn load(bay: &Bay) -> Self {
-        let path = bay.dir.run_fingerprints();
-        let recorded = read_hashes(&path);
-        Self { path, recorded }
-    }
-
-    fn get(&self, name: &str) -> Option<&str> {
-        self.recorded.get(name).map(String::as_str)
-    }
-
-    fn current(hangar: &Hangar, bay: &Bay, command: &str) -> String {
-        let env = render_env(&vm_env(&hangar.settings, bay.settings));
-        let inputs = [command, &env, &files::record_text(bay)].join("\0");
-        fnv(inputs.into_bytes())
-    }
-
-    fn set(&mut self, name: &str, fingerprint: String) -> Result<()> {
-        self.recorded.insert(name.to_string(), fingerprint);
-        write_hashes(&self.path, &self.recorded)
-    }
+    Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
 pub(crate) fn run_state(
@@ -707,22 +671,17 @@ pub(crate) fn run_state(
     vm: &str,
     name: &str,
 ) -> Result<RunState> {
-    let script = format!("{RUNNING}{RUN_STATUS}");
+    let script = format!("{USER_MANAGER}{RUN_STATE}");
     let output = sandbox.exec(
         vm,
         Some(PILOT),
-        &["sh", "-c", &script, "hangar-run-status", name],
+        &["sh", "-c", &script, "hangar-run-status", &run_unit(name)],
         None,
     )?;
     Ok(match String::from_utf8_lossy(&output).trim() {
-        "running" => RunState::Running,
-        "stopped" => RunState::Stopped,
-        other => RunState::Unknown(format!("unexpected {other:?}")),
+        "active" | "activating" => RunState::Running,
+        _ => RunState::Stopped,
     })
-}
-
-pub(crate) fn log_file(name: &str) -> String {
-    format!("/var/log/hangar/{name}.log")
 }
 
 /// A Nix-built image is loaded into the sandbox once per image tag.
@@ -793,10 +752,10 @@ fn create_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTED, DOCKER_READY, Probe, RunDecision, WAIT_TIMEOUT, boot_state,
-        check_egress, drift_warnings, preflight, proxy_env, reconcile_vm,
-        renewed_warning, replace_script, run_decision, start, start_runs,
-        vm_env, wait_booted, wait_for_docker, write_env,
+        BOOTED, DOCKER_READY, Probe, WAIT_TIMEOUT, boot_state, check_egress,
+        drift_warnings, preflight, proxy_env, reconcile_vm, renewed_warning,
+        replace_script, start, start_runs, vm_env, wait_booted,
+        wait_for_docker, write_env,
     };
     use crate::broker::fake::FakeBroker;
     use crate::error::Error;
@@ -811,24 +770,6 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::Duration;
-
-    #[test]
-    fn a_run_whose_process_is_gone_is_not_running_and_prints_nothing() {
-        let dir = scratch_dir("run-gone");
-        let pid_file = dir.join("app.pid");
-        fs::write(&pid_file, "999999999").unwrap();
-        let script = format!(
-            "{}pid_file={}\nrunning",
-            super::RUNNING,
-            pid_file.display()
-        );
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", &script, "sh", "app"])
-            .output()
-            .unwrap();
-        assert!(!out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
-    }
 
     const RECREATE: &str =
         ": run 'hangar destroy default && hangar up default' (home is kept)";
@@ -1334,7 +1275,10 @@ mod tests {
             .changes()
             .iter()
             .filter(|call| call.contains(" hangar-run "))
-            .map(|call| call.rsplit(" hangar-run ").next().unwrap().into())
+            .map(|call| {
+                let entry = call.rsplit(" hangar-run ").next().unwrap();
+                entry.split(" hangar run ").next().unwrap().into()
+            })
             .collect()
     }
 
@@ -1350,23 +1294,18 @@ mod tests {
         sandbox.reply("hangar-setup-check", "needed");
         let hangar = hangar_with(config, &state, sandbox.clone());
         start_runs(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        assert_eq!(started(&sandbox), ["db db serve"]);
+        assert_eq!(started(&sandbox), ["hangar-run-db.service db serve"]);
 
         let sandbox = Rc::new(FakeSandbox::default());
         sandbox.reply("hangar-setup-check", "done");
         let hangar = hangar_with(config, &state, sandbox.clone());
         start_runs(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        assert_eq!(started(&sandbox), ["db db serve", "web web serve --dev"]);
-    }
-
-    #[test]
-    fn up_records_new_runs_and_only_warns_about_changed_ones() {
-        assert_eq!(run_decision(true, Some("old"), "new"), RunDecision::Record);
-        assert_eq!(run_decision(false, None, "new"), RunDecision::Record);
-        assert_eq!(run_decision(false, Some("old"), "new"), RunDecision::Warn);
         assert_eq!(
-            run_decision(false, Some("same"), "same"),
-            RunDecision::Nothing
+            started(&sandbox),
+            [
+                "hangar-run-db.service db serve",
+                "hangar-run-web.service web serve --dev"
+            ]
         );
     }
 

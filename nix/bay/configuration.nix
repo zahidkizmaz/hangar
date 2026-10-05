@@ -129,8 +129,6 @@ in
     "d /var/lib/hangar 0755 root root -"
     "z /dev/net/tun 0666 root root -"
     "d /var/lib/pilot 0755 pilot pilot -"
-    "d /var/log/hangar 0755 pilot pilot -"
-    "d /run/hangar-run 0755 pilot pilot -"
   ];
   environment.profiles = lib.mkBefore [ "/nix/var/nix/profiles/hangar" ];
 
