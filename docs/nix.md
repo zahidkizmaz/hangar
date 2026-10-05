@@ -49,6 +49,13 @@ keychain.
 
 On Nix, microsandbox comes with the module: no Homebrew needed.
 
+To keep the config in `~/.config/hangar/hangar.json` instead, skip the
+module and install the package, which brings `msb` along:
+
+```nix
+environment.systemPackages = [ inputs.hangar.packages.${pkgs.system}.default ];
+```
+
 The modules build the CLI with your system's nixpkgs (NixOS 26.05 or
 newer). To use hangar's own pinned build instead, set
 `services.hangar.cli = inputs.hangar.packages.${pkgs.system}.default;`.
