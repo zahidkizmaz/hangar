@@ -493,11 +493,13 @@ fn render_env(env: &BTreeMap<String, String>) -> String {
 
 // A run counts as running only if its PID still carries the marker, so a
 // PID reused after the entry exited isn't mistaken for it.
-const RUNNING: &str = r#"pid_file=/run/hangar-run/$1.pid
+// `name`, because `$1` inside a function is the function's own argument.
+const RUNNING: &str = r#"name=$1
+pid_file=/run/hangar-run/$name.pid
 running() {
   [ -f "$pid_file" ] || return 1
   tr '\0' '\n' 2>/dev/null <"/proc/$(cat "$pid_file")/environ" |
-    grep -qx "HANGAR_RUN=$1"
+    grep -qx "HANGAR_RUN=$name"
 }
 "#;
 
@@ -811,6 +813,30 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_run_whose_process_carries_its_marker_is_running() {
+        let dir = scratch_dir("run-alive");
+        let mut app = std::process::Command::new("sleep")
+            .arg("30")
+            .env("HANGAR_RUN", "app")
+            .spawn()
+            .unwrap();
+        let pid_file = dir.join("app.pid");
+        fs::write(&pid_file, app.id().to_string()).unwrap();
+        let script = format!(
+            "{}pid_file={}\nrunning",
+            super::RUNNING,
+            pid_file.display()
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "sh", "app"])
+            .output()
+            .unwrap();
+        app.kill().unwrap();
+        assert!(out.status.success());
+    }
 
     #[test]
     fn a_run_whose_process_is_gone_is_not_running_and_prints_nothing() {
