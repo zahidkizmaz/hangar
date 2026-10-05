@@ -699,8 +699,8 @@ mod tests {
             "config.bays.default.env.PATH: reserved for hangar"
         );
         assert_eq!(
-            error(&one_bay(r#""env": {"HANGAR_RUN": "x"}"#, "")),
-            "config.bays.default.env.HANGAR_RUN: reserved for hangar"
+            error(&one_bay(r#""env": {"HANGAR_X": "x"}"#, "")),
+            "config.bays.default.env.HANGAR_X: reserved for hangar"
         );
         // An app can't override a credential placeholder, in any bay; a
         // bay's env can.

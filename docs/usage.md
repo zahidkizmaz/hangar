@@ -258,8 +258,9 @@ until it's set up, so the first `hangar up` skips it and warns
 `paperclip needs setup: run 'hangar setup paperclip'`. Run that: it starts
 `paperclipai onboard` in the VM with your terminal (pick authenticated
 mode), then checks it worked. The next `hangar up` starts Paperclip;
-`hangar logs paperclip -f` shows its output (with several bays, add
-`--bay NAME` to `setup` and `logs`). Then open `http://127.0.0.1:3100`. Its
+`hangar logs paperclip -f` follows its output, after the last 100 lines
+of its journal (with several bays, add `--bay NAME` to `setup` and
+`logs`). Then open `http://127.0.0.1:3100`. Its
 data lives in `~/.local/share/hangar/bays/default/home/.paperclip` on your
 machine and survives `hangar destroy` (see
 [A bay's home](configuration.md#a-bays-home) for the database caveat).
@@ -300,8 +301,8 @@ copy` copies only the declared `files`; `hangar copy SRC [DEST]`
 copies one file or directory ad hoc (same checks, not managed, so a declared
 entry for the same path overwrites it on the next `copy`, `up` or
 `restart`). `hangar restart [NAME…]` re-applies `files` (skip with
-`--no-copy`) and the env file, then stops each entry (TERM, then KILL after
-5 seconds) and starts it again.
+`--no-copy`) and the env file, then stops each entry with every process it
+started (TERM, then KILL after 10 seconds) and starts it again.
 
 **Scripts and agents:** add `--json` for one JSON document per command on
 stdout (`hangar status --json | jq .tower`), and use the exit codes

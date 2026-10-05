@@ -61,10 +61,6 @@ impl BayDir {
         self.0.join("files")
     }
 
-    pub(crate) fn run_fingerprints(&self) -> PathBuf {
-        self.0.join("run-fingerprints")
-    }
-
     /// The bay's home, mounted at pilot's home, `/home/pilot` (`home`).
     pub(crate) fn home(&self) -> PathBuf {
         self.0.join("home")

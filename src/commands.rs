@@ -264,14 +264,27 @@ pub(crate) fn logs(
             "add it to run or apps in your config, then run 'hangar up'",
         ));
     }
-    let mut tail = vec!["tail".to_string(), "-n".into(), "100".into()];
+    let unit = bay::run_unit(name);
+    let mut journal = [
+        "journalctl",
+        "--user",
+        "-u",
+        &unit,
+        "-o",
+        "cat",
+        "--no-pager",
+        "-n",
+        "100",
+    ]
+    .map(String::from)
+    .to_vec();
     if follow {
-        tail.push("-f".into());
+        journal.push("-f".into());
     }
-    tail.push(bay::log_file(name));
-    let mut tail = pilot_shell(hangar, &bay, &tail, io::stdin().is_terminal());
-    if !process::status(&mut tail)?.success() {
-        bail!("no output for {name} yet: is it in run and started?");
+    let tty = io::stdin().is_terminal();
+    let mut journal = pilot_shell(hangar, &bay, &journal, tty);
+    if !process::status(&mut journal)?.success() {
+        bail!("can't read {name}'s journal in {}", bay.vm);
     }
     Ok(())
 }
@@ -532,20 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn logs_tail_the_entry_log_in_the_bay() {
+    fn logs_read_the_entry_journal_in_the_bay() {
         let state = scratch_dir("logs");
         let sandbox = Rc::new(FakeSandbox::default());
         let config =
             r#"{"bays": [{"name": "default", "run": {"app": "app serve"}}]}"#;
         let hangar = hangar_with(config, &state, sandbox.clone());
-        // The fake's shell fails, like a log that doesn't exist yet.
+        // The fake's shell fails, like a journal pilot can't read.
         let error = logs(&hangar, None, "app", true).unwrap_err().to_string();
-        assert!(error.contains("no output for app yet"), "{error}");
+        assert_eq!(error, "can't read app's journal in hangar-bay-default");
         assert_eq!(
             sandbox.changes(),
-            [
-                "shell pilot@hangar-bay-default tail -n 100 -f /var/log/hangar/app.log"
-            ]
+            ["shell pilot@hangar-bay-default journalctl --user -u \
+                 hangar-run-app.service -o cat --no-pager -n 100 -f"]
         );
     }
 
