@@ -1,6 +1,7 @@
 # Design: OAuth credentials in the tower
 
-Status: proposal. Main use: remote MCP servers. Nothing here is built yet.
+Status: accepted after review round 1. Implemented in four steps
+(below). Main use: remote MCP servers.
 
 Adding an MCP server to a bay takes three manual steps today: a
 credential in the vault, a route in `tower.routes`, and the server in each
@@ -18,22 +19,27 @@ hangar learns nothing about MCP or about any tool's config format.
 - `hangar credential login NAME URL` logs a credential in once, from the
   host's browser. The tower keeps the tokens and refreshes them, and a
   route injects the credential like any other.
-- No secret, access token, refresh token or client secret is ever in a
-  bay, in argv, in a log, or in a file hangar writes.
+- No access token, refresh token or client secret is ever in a bay, in
+  argv, in a log, or in a file hangar writes.
 - It works for any OAuth 2.0 API with Authorization Code + PKCE, not only
   MCP servers.
 - Adding an MCP server becomes: one route, the server in the user's own
   tool config (the way they always add it), and one `credential login`.
 
-## Non-goals
+## Non-goals (v0.1)
 
 - An `mcpServers` concept, or any MCP parsing in hangar.
 - Writing or merging any tool's config (`~/.claude.json`, `opencode.json`,
   Codex's `config.toml`, Paperclip). That config is the user's, and the
   existing `files`/`mounts` (or the tool's own CLI in `hangar shell`) put it
   in the bay. It holds no secrets, because the tower injects them.
+- A `credential logout` verb: `credential rm` is the logout.
+- Pasting tokens (agent-vault's `POST /v1/credentials/oauth/tokens`).
+- Confidential clients from automatic registration: registration asks
+  for a public client (`none`) or fails with "pass --client-id".
+- A `missing` state in `credential list`.
 - Revoking grants at the provider. The refresh token never leaves the
-  vault, so hangar can't send it to a revocation endpoint (see Logout).
+  vault, so hangar can't send it to a revocation endpoint.
 - Moving logins between machines. Vault state doesn't carry over today
   either (usage.md, "The master password").
 - New crates.
@@ -66,26 +72,27 @@ hangar learns nothing about MCP or about any tool's config format.
   `fd9a5ef`): the tower starts agent-vault with
   `AGENT_VAULT_ADDR=http://127.0.0.1:<adminPort>` (`agent_vault.rs`,
   `START_SERVER`, `host_address`). agent-vault builds its redirect URI from
-  that address: `s.baseURL + "/v1/oauth/callback"` (`handle_oauth.go`).
+  that address: `s.baseURL + "/v1/oauth/callback"` (`handle_oauth.go`). A
+  tower started before PR #9 still has `0.0.0.0` in it.
 
 ### agent-vault 0.40.0 OAuth (source at tag `v0.40.0`)
 
 | What | Where |
 |---|---|
 | `POST /v1/credentials/oauth/connect` `{vault, key, authorization_url, token_url, client_id, client_secret?, scopes?, token_auth_method?}` saves the client and returns `{authorization_url}` with state + PKCE S256 | `internal/server/server.go:834`, `handle_oauth.go` `handleOAuthConnect` |
-| `GET /v1/oauth/callback` exchanges the code (no auth: state is the CSRF check, 10 min TTL) | `server.go:835`, `handleOAuthCallback`, `oauthStateTTL` |
-| `GET /v1/credentials/oauth/status?key=` returns `{connected, connected_at, last_error}` | `server.go:836`, `handleOAuthStatus` |
-| `POST /v1/credentials/oauth/tokens` (paste mode) checks a refresh token by refreshing it at once and rejects it if that fails | `server.go:837`, `handleOAuthTokenUpload` |
-| `GET /v1/credentials` lists `type`, `connected_at`, `last_refreshed_at`, `last_refresh_error`, the URLs and client id. It masks the client secret, access token and refresh token with `••••••••` | `handle_credentials.go`, `credentialEntry`, `enrichOAuthEntry` |
+| A `client_secret` of `••••••••` keeps the stored secret, but only while `token_url` stays the same | `handleOAuthConnect`, `oauthSecretSentinel` |
+| `GET /v1/oauth/callback` exchanges the code (no auth: state is the CSRF check, 10 min TTL) and shows the result in the browser (`/oauth/complete`) | `server.go:835`, `handleOAuthCallback`, `oauthStateTTL`, `redirectOAuthComplete` |
+| `GET /v1/credentials` lists `type`, `connected_at`, `last_refreshed_at`, `last_refresh_error`, the URLs, client id, scopes and auth method. It masks the client secret, access token and refresh token with `••••••••` | `handle_credentials.go`, `credentialEntry`, `enrichOAuthEntry` |
 | Tables `credential_oauth` and `credential_oauth_states`. The OAuth row cascades on credential delete, and foreign keys are on | `internal/store/048_credential_oauth.go`; `sql_store.go:82` `foreign_keys(on)` |
 | Refresh happens within 5 minutes of expiry, once per key (singleflight). It keeps a rotated refresh token, or the old one if none comes back | `internal/brokercore/credential.go` `oauthRefreshBuffer`, `maybeRefreshOAuth`; `sql_store.go` `UpdateCredentialOAuthTokens` |
+| A token response without `expires_in` stores no expiry, so that token is never refreshed early: it's used until the upstream rejects it | `oauth.go` `doTokenRequest`; `maybeRefreshOAuth` (`TokenExpiresAt == nil`) |
 | The token endpoint goes through the SSRF guard (netguard), with no proxy | `server.go:799-803` |
-| "Not connected" and "refresh failed" answer the client with `502`, not `401` | `brokercore.go:204-209` |
+| An OAuth credential with no token yet (`oauth_not_connected`), a failed refresh (`oauth_refresh_failed`) and a missing credential (`credential_not_found`) all answer the bay with `502`. None of them is forwarded upstream, so none can produce the upstream's `401` | `brokercore.go:204-212` |
 | A public client is `client_secret_post` with an empty secret, which sends only `client_id` | `internal/oauth/oauth.go`, `applyClientAuth` |
 | Query parameters already in `authorization_url` are kept (so `resource=` can ride along). The token request sends no `resource` | `internal/oauth/pkce.go` `BuildAuthorizationURL`; `oauth.go` `Exchange` |
 | Re-connecting with the same `token_url` keeps the stored tokens until the new callback succeeds | `sql_store.go`, `SetCredentialOAuth` upsert |
-| A new connect resets `last_refresh_error`. `connected_at` keeps its first value (`COALESCE`), and every token update sets `last_refreshed_at` | `SetCredentialOAuth`, `UpdateCredentialOAuthTokens` |
-| Credential keys must be SCREAMING_SNAKE_CASE (hangar's `valid_key` is stricter) | `handleOAuthConnect`, `config.rs` `valid_key` |
+| Every token update sets `last_refreshed_at`. `connected_at` keeps its first value (`COALESCE`) | `UpdateCredentialOAuthTokens` |
+| Credential keys must match `^[A-Z][A-Z0-9_]*$`; hangar's `valid_key` now does too | `internal/broker/broker.go:108`, `config.rs` `valid_key` |
 
 ### Atlassian (checked on 2026-10-10)
 
@@ -137,181 +144,211 @@ A route references an OAuth credential like any other:
   "auth": { "type": "bearer", "token": "ATLASSIAN" } }
 ```
 
-The login's URLs and client id live in the vault (`credential_oauth`), the
-same place as its tokens. So `hangar.json` doesn't change, and a
-re-login reads them back from `GET /v1/credentials`. A route field such as
-`auth.issuer` was considered and rejected: it would hold one URL that
-only `credential login` reads, and that URL is already in the vault.
+The login's URLs, client id and scopes live in the vault
+(`credential_oauth`), the same place as its tokens. So `hangar.json`
+doesn't change, and a re-login reads them back from `GET
+/v1/credentials`.
 
-### `hangar credential login NAME [URL]`
+**Path-scoped routes guard only while no other route covers the host.**
+A bare `mcp.atlassian.com` route, or a `*.atlassian.com` one, matches
+every path, so the path scope no longer keeps the bay off `/v1/register`
+and `/v1/token`. hangar warns about such a pair when it loads the config.
+Path scoping also makes a server that splits its endpoint across paths (an
+SSE server's `/sse` plus `/messages`) need a glob such as `/v1/*`.
+
+### `hangar credential login`
+
+Three forms:
 
 ```
-hangar credential login NAME URL [--scope S]... [--client-id ID]
-                                  [--client-secret] [--paste]
-hangar credential login NAME --authorization-url U --token-url U
+hangar credential login NAME URL [--scope S]... [--client-id ID [--client-secret]]
+hangar credential login NAME --authorization-url U --token-url U \
                              --client-id ID [--client-secret] [--scope S]...
-hangar credential login NAME            # again, with what the vault has
+hangar credential login NAME [--scope S]...
 ```
 
-1. **Checks**, the same as `credential set` (`check_user_key`,
-   `vault_ready`). If NAME exists as a static credential, it's refused with
-   "run 'hangar credential rm NAME' first". The connect call would turn
-   the row into `oauth` and keep the static value as the access token
-   (`SetCredentialOAuth` upserts `credentials` with `type='oauth'`). For
-   the same reason, `credential set` refuses an OAuth credential.
-2. **Discovery** (skipped when both endpoint flags are given, or on a
-   re-login):
-   1. RFC 9728 §3.1: try `<origin>/.well-known/oauth-protected-resource<path>`,
-      then `<origin>/.well-known/oauth-protected-resource`. If found, its
-      `resource` must equal URL (§3.3), and the issuer is
-      `authorization_servers[0]`. The `resource` is then also added to the
-      authorization URL as `resource=` (RFC 8707).
-   2. Otherwise the issuer is URL's origin (the MCP fallback, and what
+- **`NAME URL`**: discover the provider from URL, then register a client
+  unless `--client-id` names one.
+- **The endpoint flags**: no discovery, for providers without metadata
+  (GitHub, for example), with a client the user registered.
+- **`NAME` alone**: a re-login with the client the vault already holds
+  (URLs, client id and scopes from `GET /v1/credentials`). If that client
+  has a secret, hangar sends agent-vault's keep-marker (`••••••••`), which
+  the vault honors because `token_url` is unchanged. The first two forms
+  replace the stored client.
+
+Steps:
+
+1. **Checks.**
+   - The name is checked like `credential set` checks it
+     (`check_user_key`), and the vault must be running (`vault_ready`).
+   - A static credential of that name is refused with "run 'hangar
+     credential rm NAME' first". The connect call would turn the row into
+     `oauth` and keep the static value as its access token
+     (`SetCredentialOAuth` upserts `credentials` with `type='oauth'`).
+   - For the same reason, `credential set` refuses an OAuth credential.
+2. **Discovery** (`NAME URL` only). Every URL hangar fetches or hands to
+   the vault must be `https` with a host name: IP literals and `localhost`
+   (`*.localhost` too) are refused.
+   1. RFC 9728 §3.1: try `<origin>/.well-known/oauth-protected-resource<path>`.
+      If found, its `resource` must equal URL. Otherwise, if URL has a
+      path, try the root form `<origin>/.well-known/oauth-protected-resource`;
+      its `resource` must equal the origin. A found document gives the
+      issuer (`authorization_servers[0]`) and the `resource` that is added
+      to the authorization URL (RFC 8707).
+   2. Without one, the issuer is URL's origin (the MCP fallback, and what
       Atlassian needs).
    3. RFC 8414 §3: try `<issuer origin>/.well-known/oauth-authorization-server<issuer path>`,
       then OpenID `<issuer>/.well-known/openid-configuration`. `issuer`
-      must equal the expected one (§3.3). Every endpoint must be `https`.
-      If `code_challenge_methods_supported` is present and lacks `S256`,
-      that's an error.
-3. **Client.**
-   - Use `--client-id` if given. A `--client-secret` is read like
-     `credential set` reads a value (hidden prompt or stdin) and goes only
-     into the connect request body.
-   - On a re-login, use the stored client.
-   - Otherwise do RFC 7591 registration at `registration_endpoint`:
-     `{"client_name":"hangar","redirect_uris":[<callback>],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}`,
-     or `client_secret_post` when `none` isn't advertised.
+      must equal the expected one (§3.3). If
+      `code_challenge_methods_supported` is present and lacks `S256`, that's
+      an error.
+3. **Client** (`NAME URL` without `--client-id`). Register with RFC 7591
+   at `registration_endpoint`:
+   `{"client_name":"hangar","redirect_uris":[<callback>],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}`.
    - The callback is `Broker::oauth_redirect_uri()`. For agent-vault that's
      `http://127.0.0.1:<adminPort>/v1/oauth/callback`, a loopback redirect
      (RFC 8252 §7.3).
-   - The registration response comes back on a pipe. Any `client_secret`
-     in it is treated as a secret.
-   - With no `registration_endpoint` and no `--client-id`, the error names
-     the redirect URI to register with the provider.
-4. **Connect.** `Broker::oauth_connect` saves the client and returns the
-   consent URL. hangar opens it with the opener `vault-ui` already tries
-   (`commands.rs`: `open`, then `xdg-open`) and prints it too, for a
-   headless host. The browser comes back to the vault's callback on
-   loopback.
-5. **Wait.** Poll `Broker::credentials()` every second, for up to 10
-   minutes (agent-vault's state TTL), until NAME's `last_refreshed_at` is
-   later than the start. `connected_at` can't be used: it keeps its first
-   value on re-login. A `last_refresh_error` stops the wait with that
-   message. Ctrl-C leaves any old tokens in place.
-6. **Paste mode** (`--paste`) is for providers that refuse a loopback or
-   `http` redirect, or have no browser flow. It does discovery for
-   `token_endpoint`, then reads a refresh token (hidden prompt or stdin)
-   and calls `Broker::oauth_tokens`. agent-vault refreshes it at once and
-   rejects a bad one. The refresh token passes through hangar's memory
-   once, like a `credential set` value, and never reaches a bay.
+   - These fail with "pass --client-id", naming the callback to register:
+     - no `registration_endpoint`;
+     - `token_endpoint_auth_methods_supported` without `none`;
+     - a response that isn't a public client.
+   - Only `client_id` and `token_endpoint_auth_method` are read from the
+     response. `registration_access_token` is never parsed or logged.
+   - A `--client-secret` is read like `credential set` reads a value
+     (hidden prompt or stdin) and goes only into the connect request body.
+4. **Connect** (under the lock). `Broker::oauth_connect` saves the client
+   and returns the consent URL. hangar checks two things before opening it:
+   - the URL starts with `https://`;
+   - its `redirect_uri` equals `oauth_redirect_uri()`. Otherwise the tower
+     runs an agent-vault started before PR #9, and the error says
+     "restart the tower: hangar down && hangar up".
 
-Locking: as for `credential set`, the prompts run first and the lock is
-held only for the broker calls. The wait doesn't hold the lock: it only
-reads.
+   Then hangar prints the URL to the terminal (stderr, only when it is a
+   terminal, never into logs or `--json`). It opens the URL with the same
+   opener `vault-ui` tries (`open`, then `xdg-open`). The browser comes back
+   to the vault's callback on loopback, and the vault shows the result
+   there.
+5. **Wait** (no lock: it only reads).
+   - Before connecting, read NAME's `last_refreshed_at` (`None` for a new
+     credential).
+   - After connecting, poll `Broker::credentials()` every second until the
+     value differs. There is no clock comparison, so clock skew between
+     the host and the tower doesn't matter.
+   - `last_refresh_error` is ignored while waiting: an error from an
+     earlier login must not end this one.
+   - After 10 minutes (the vault's state TTL) the wait fails with "no
+     login yet: the browser page shows the result; check 'hangar
+     credential list'".
+   - Ctrl-C leaves any old tokens in place.
 
 ### `credential list`: state
 
-`credential list` reads `Broker::credentials()` and adds each route's
-credential that the vault lacks:
+`credential list` reads `Broker::credentials()`:
 
 ```
-NAME                     SOURCE  STATE
 ATLASSIAN                user    oauth: connected
 CLAUDE_CODE_OAUTH_TOKEN  user    set
 GITHUB_TOKEN             config  set
-JIRA                     user    oauth: refresh failed (invalid_grant)
-FRESHDESK_API_KEY        -       missing (route freshdesk)
+JIRA                     user    oauth: refresh failed (…)
 ```
 
-- `oauth: connected` means a refreshed-at time and no error.
+- `set`: a static value. Unknown kinds (agent-vault's `dynamic`) count as
+  static.
+- `oauth: connected` means a token arrived and the last refresh didn't
+  fail.
 - `oauth: not connected` means no token yet.
-- `oauth: refresh failed (…)` is `last_refresh_error`. The vault answers
-  the bay `502 oauth_refresh_failed`, and the fix is `credential login
-  NAME`.
-- `missing` means a route references the name but the vault doesn't have
-  it.
+- `oauth: refresh failed (…)` is `last_refresh_error`, cut to one line. The
+  vault answers the bay `502 oauth_refresh_failed`, and the fix is
+  `credential login NAME`.
 
 The vault doesn't list `token_expires_at`, so "expired" shows only after a
-refresh fails. That's enough, because a valid refresh token renews on the
-next request. `--json` adds `type` and `state` per entry. `output::VERSION`
-stays 1 before the first release (AGENTS.md). `status --all` stays as it
-is. It already names each route's credentials, and calling the vault for
-state belongs to `credential list`.
+refresh fails. `--json` adds `type` (`static` or `oauth`) and `state` per
+entry. `output::VERSION` stays 1 before the first release (AGENTS.md).
+`status --all` is unchanged.
 
 ### Logout
 
 `hangar credential rm NAME` is the logout. Deleting the credential
 cascades to its `credential_oauth` row, and every route that injects it
-then fails in the vault. The provider-side grant stays until it expires or
-the user revokes it in the provider's UI. hangar never reads the refresh
-token back: the list masks it, and reading it with `reveal` would be a new
-path that exposes secrets. Whether a `logout` alias is worth adding is an
-open question.
+then fails in the vault (`502 credential_not_found`). The provider-side
+grant stays until it expires or the user revokes it in the provider's UI.
+hangar never reads the refresh token back.
 
 ### Broker trait additions
 
 Provider-side work (discovery, registration) isn't the broker's job and
-stays in the core. Only what touches stored credentials goes behind the
-trait:
+stays in the core (`src/oauth.rs`). Only what touches stored credentials
+goes behind the trait:
 
 ```rust
 pub(crate) struct OAuthClient {
-    pub(crate) authorization_url: Option<String>, // None in paste mode
+    pub(crate) authorization_url: String,
     pub(crate) token_url: String,
     pub(crate) client_id: String,
-    pub(crate) client_secret: Option<Secret>,     // never read back
-    pub(crate) scopes: Vec<String>,
+    pub(crate) secret: ClientSecret,        // None | Keep | New(Secret)
+    pub(crate) scopes: String,              // space-separated
+    pub(crate) token_auth_method: String,   // "client_secret_post" default
 }
 
-pub(crate) enum CredentialState {
-    Static,
-    OAuth { refreshed_at: Option<String>, error: Option<String>,
-            client: OAuthClient },                // secret: None
+pub(crate) struct StoredCredential {
+    pub(crate) key: String,
+    pub(crate) oauth: Option<OAuthLogin>,   // None: static
+}
+
+pub(crate) struct OAuthLogin {
+    pub(crate) connected: bool,
+    pub(crate) refreshed_at: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) client: Option<OAuthClient>, // secret: Keep or None
 }
 
 trait Broker {
-    // replaces credential_keys(); keys stay the names
-    fn credentials(&self) -> Result<Vec<(String, CredentialState)>>;
-    /// Where the provider sends the browser back.
-    fn oauth_redirect_uri(&self) -> String;
-    /// Saves the client; returns the consent URL to open.
+    // replaces credential_keys()
+    fn credentials(&self) -> Result<Vec<StoredCredential>>;
+    // default: bail "this broker can't hold OAuth credentials"
+    fn oauth_redirect_uri(&self) -> Result<String>;
     fn oauth_connect(&self, key: &str, client: &OAuthClient)
         -> Result<String>;
-    /// Paste mode; the broker validates the refresh token.
-    fn oauth_tokens(&self, key: &str, client: &OAuthClient,
-                    refresh_token: &Secret) -> Result<()>;
 }
 ```
 
-The agent-vault side is three `Admin` calls, using the existing
-`http::call` and session (`agent_vault.rs`): the connect, tokens and list
-endpoints above. `token_auth_method` is `client_secret_post` (empty secret
-for a public client) unless the registration said `client_secret_basic`.
-The fake broker (`broker/fake.rs`) records `oauth-connect KEY` and
-`oauth-tokens KEY` and holds states, so command tests need no vault.
+The agent-vault side is two `Admin` calls, using the existing
+`http::call` and session (`agent_vault.rs`): the connect and list
+endpoints above. A registered public client is sent as
+`client_secret_post` with no secret. The fake broker (`broker/fake.rs`)
+records `oauth_connect KEY` and holds states, so command tests need no
+vault.
 
-### HTTPS without a new crate
+### HTTPS: host `curl`
 
 Discovery and registration are HTTPS calls to the provider, made from the
 host. `src/http.rs` is loopback plain HTTP only, and a TLS stack would mean
-many new crates. Options:
+many new crates. So hangar runs `curl`, by absolute path, like the
+keychain tool (`keychain.rs`, `TOOL`).
 
-- **Host `curl` by absolute path (chosen).** It follows the keychain-tool
-  precedent (`keychain.rs`, `TOOL`; `nix/cli.nix` bakes `HANGAR_SECRET_TOOL`).
-  - Path: `/usr/bin/curl` on macOS and other Linux; the Nix package bakes
-    `HANGAR_CURL`.
-  - Flags: `-q` (no `.curlrc`), `--proto =https --proto-redir =https`,
-    `--noproxy '*'`, `--max-time 30`, `--max-filesize 1M`, `-w` for the
-    status code.
+- **Path.** The Nix package bakes `HANGAR_CURL="${curl}/bin/curl"` on every
+  system, macOS included, so the package never depends on the host's
+  curl. Other builds use `/usr/bin/curl`, which macOS ships and most
+  Linux distributions install. curl is needed only for `credential login
+  NAME URL`, and a missing one is an error that names that path.
+- **Test override.** Debug builds read `HANGAR_TEST_CURL`. `nix/cli.nix`'s
+  `postInstall` and the release workflow fail if that name shows up in a
+  release binary, like `HANGAR_TEST_KEYCHAIN_TOOL`.
+- **Flags.**
+  - `-q` first (no `.curlrc`), then `-sS`, `--proto =https`, `--noproxy '*'`,
+    `--max-time 30`, `--max-filesize 1048576`, and `-w` for the status
+    code.
+  - No `-L`: redirects are never followed, so a `3xx` is just a failed
+    lookup.
   - The URL goes in argv (public). The registration body goes on stdin,
     and the response comes back on a pipe.
-  - Behind a small `Https` trait in `src/https.rs`, with a fake for tests.
-- **busybox `wget` in the tower VM** (alpine image, open egress) would use
-  the existing exec path. Rejected: busybox `wget` hides 4xx bodies, so
-  registration errors would be opaque. It would also run user-chosen URLs
-  in the VM that holds every secret.
+- **Alternative considered:** busybox `wget` in the tower VM (alpine image,
+  open egress). Rejected: busybox `wget` hides 4xx bodies, so registration
+  errors would be opaque. It would also run user-chosen URLs in the VM
+  that holds every secret.
 
-Every call is logged as method + host + path, never a body (AGENTS.md).
+Every call is logged as method + URL, never a body or a header (AGENTS.md).
 
 ## MCP servers: usage (the main example)
 
@@ -391,137 +428,177 @@ spike checks them:
   live only in the vault, encrypted. The bay gets placeholders (`vm_env`).
   Injected headers replace the bay's (`ApplyInjection`).
 - **No token on the host's disk or argv.**
-  - The connect and paste requests carry the client secret and refresh
-    token in in-process bodies, like `credential set` (AGENTS.md
-    invariant).
+  - The connect request carries a client secret in an in-process body,
+    like `credential set` (AGENTS.md invariant).
   - curl argv holds only public URLs.
-  - The consent URL (state, PKCE challenge, client id) is public by
-    design. The code verifier stays in the vault.
+  - The consent URL (state, PKCE challenge, client id) is shown on the
+    terminal and passed to the opener. The state is a single-use CSRF
+    value that expires in 10 minutes, and the code verifier stays in the
+    vault.
   - The callback lands on `127.0.0.1` only.
 - **Nothing read back.** hangar never calls `reveal=true` and never
   stores the masked values.
-- **In-bay OAuth is closed off twice.**
+- **In-bay OAuth is closed off three ways.**
   - The tool's own OAuth is off, or doesn't fire because an
     `Authorization` header is set.
-  - Path-scoped routes deny `/register` and `/token` (`403`, deny mode).
-  - The vault answers `502` (not `401`) for a not-connected or failed
-    credential, so it never invites a client login.
+  - Path-scoped routes deny `/register` and `/token` (`403`, deny mode),
+    while no other route covers the host (warned about).
+  - Every vault-side failure is a `502`, never a `401`, so the vault
+    never invites a client login.
+
+  A `401` from upstream still reaches the tool. That happens with a
+  revoked grant, or with a token from a provider that sends no
+  `expires_in` and then expires it.
 - **Routes still come only from config the user wrote.** `credential
   login` never adds a route. The existing source checks still apply: two
   sources can't route one host, and a `tower.routes` entry can't take an
   app route's name (`apps.rs`, `merge_routes`, `check_routes`).
 - **Discovery is checked, not trusted.**
-  - Every endpoint must be `https`, and issuer and `resource` must match
-    (RFC 8414 §3.3, RFC 9728 §3.3).
-  - curl doesn't follow redirects to non-https URLs.
-  - The token endpoint is reached by the vault through netguard, so
-    metadata can't point the vault at a private address.
+  - On the host: https only, host names only (no IP literals, no
+    `localhost`), no redirects, a size cap, and issuer and `resource`
+    must match (RFC 8414 §3.3, RFC 9728 §3.3).
+  - In the vault: the token endpoint goes through netguard.
 - **Registered clients are public.** A client id from registration is not
   a secret (RFC 7591), and a public client (`none`) has no secret to
-  leak. A confidential registration's secret is handled like a credential
-  value.
+  leak.
 - **Rotation and revocation.**
   - The vault keeps a rotated refresh token (`maybeRefreshOAuth`), with
     one refresh per key at a time.
   - `credential rm` deletes everything in the tower.
-  - A revoked grant shows up as `refresh failed` in `credential list`.
+  - A revoked grant shows up as `refresh failed` in `credential list`
+    once a refresh fails.
 - **User credentials only.** OAuth credentials are never recorded in
   `credential-keys`, so `up` never deletes them. Names that
   `credentialFiles` or an app manages are refused.
 
 ## Test plan (fakes only)
 
-- `src/oauth.rs`, pure functions:
-  - well-known URL building for root and path issuers;
-  - metadata parsing: Atlassian's real document as a fixture, an OpenID
-    document, the PRM `resource` and `authorization_servers`;
-  - refusals: issuer mismatch, `http` endpoint, no `S256`;
-  - the registration body (public vs `client_secret_post`) and response
-    parsing, including a returned secret;
-  - the consent URL getting `resource=`.
-- `src/https.rs`: the curl argv (flags present, no body in argv), the
-  status and body split, and a missing curl named in the error, with a
-  fake program the way `keychain.rs` tests do.
-- `agent_vault.rs`: each new `Admin` call against `serve_each`, the
-  existing scripted TCP server. Checks: path, method, a body with no extra
-  fields, and parsing of the masked list.
-- `credential.rs`, with `FakeBroker` and a fake `Https`:
-  - the full login: discovery, then registration, then connect, then the
-    wait sees `last_refreshed_at` move;
-  - re-login reuses the stored client and skips registration;
-  - refusals: static and managed names refused, the no-registration error
-    names the redirect URI;
-  - paste mode calls `oauth_tokens`;
-  - list states, including `missing`.
-- `tests/cli.rs`: `credential login` with the vault down gives the hint,
-  `--help` has examples, `credential list --json` has the new fields.
-- Logs: a test at `trace` that no body or header value appears (the
-  `http.rs` rule).
+No test touches the real network, keychain, msb, a `hangar-*` VM or
+`~/.config`.
 
-## Spike: Atlassian end to end (before any code)
+- `src/oauth.rs`, against a fake `Https`:
+  - well-known URLs for root and path issuers;
+  - parsing: Atlassian's real document as a fixture, an OpenID document,
+    PRM path and root forms;
+  - refusals: issuer mismatch, a `resource` mismatch, `http`, an IP
+    literal, `localhost`, no `S256`;
+  - the registration body and response, including the refusals that ask
+    for `--client-id`;
+  - `resource=` added to the consent URL.
+- `src/https.rs`: the curl argv (`-q` first, no `-L`, no body in argv),
+  the status and body split, and a curl failure. A fake script stands in,
+  the way `keychain.rs` tests its tool.
+- `agent_vault.rs`: the list and connect calls against `serve_each`, the
+  existing scripted TCP server. Checks: path, method, the body (the
+  keep-marker), and the masked list parse.
+- `credential.rs` with `FakeBroker`:
+  - the wait sees `last_refreshed_at` change, ignores an old error, and
+    times out;
+  - re-login reuses the stored client and keeps its secret;
+  - refusals: static and managed names, a non-https consent URL, a wrong
+    `redirect_uri`;
+  - list states.
+- `tests/cli.rs`, with `FakeVault` learning the connect and list
+  endpoints, and a fake curl through `HANGAR_TEST_CURL`:
+  - `login` with the endpoint flags, and `login NAME URL` end to end;
+  - the vault down gives the hint, `--help` has examples, and `credential
+    list --json` has the new fields;
+  - no secret shows up at any log level.
 
-Done by hand with curl, on main (`fd9a5ef`, PR #9 included). Each step
-records yes or no and keeps any surprise:
+## Spike: Atlassian end to end (after merge)
 
-1. **Registration.** Register a client: `POST https://mcp.atlassian.com/v1/register`
-   with redirect `http://127.0.0.1:14321/v1/oauth/callback` and
-   `token_endpoint_auth_method: none`. Does it accept an `http` loopback
-   redirect?
-2. **Connect.** Call `POST /v1/credentials/oauth/connect` with the owner
-   session from `vault/.agent-vault/session.json`, open the URL, consent.
-   Then `GET /v1/credentials/oauth/status?key=ATLASSIAN` should say
-   `connected`.
-   - Is `resource` needed (the exchange sends none)?
-   - Which scopes, if any, must be passed?
-3. **Injection.** Add the route above, run `up`, then from a bay:
+Done by hand on a real machine. Each step records yes or no and keeps any
+surprise. Steps 1 to 4 and 7 to 9 gate the feature. Steps 5 and 6 are
+informational: they shape the usage docs, not the code.
+
+1. **Login.** `hangar credential login ATLASSIAN
+   https://mcp.atlassian.com/v1/mcp`. Check:
+   - registration accepts the `http` loopback redirect;
+   - the consent page loads;
+   - `credential list` shows `oauth: connected`.
+
+   Note whether Atlassian needs `resource` or particular scopes.
+2. **Injection.** Add the route above, run `up`, then from a bay:
    - `curl -X POST https://mcp.atlassian.com/v1/mcp` with an MCP
      `initialize` gives `200`;
-   - `/v1/register` gives `403`.
-4. **Refresh.** Note `expires_in` and wait past it, then call again.
+   - `/v1/register` and `/v1/token` give `403`.
+3. **Refresh.** Note `expires_in` and wait past it, then call again.
    Check that `last_refreshed_at` moved and whether the refresh token
    rotated (`credential list` stays `connected`).
-5. **Claude Code.** Add the server with
+4. **Re-login.** Run `credential login ATLASSIAN` alone: the bay keeps
+   working throughout, and the wait ends on the new token.
+5. **Claude Code** (informational). Add the server with
    `claude mcp add-json --scope user atlassian '{…"Bearer ${ATLASSIAN}"}'`,
-   then check `claude mcp list` and a tool call. Unverified: whether
-   Claude Code's HTTP MCP transport honors `HTTPS_PROXY` and
+   then check `claude mcp list` and a tool call. Also check whether Claude
+   Code's HTTP MCP transport honors `HTTPS_PROXY` and
    `NODE_EXTRA_CA_CERTS`.
-6. **Paperclip.** Do its agents see the user-scope server? If not, does
-   its import or gateway path work through the same route? Check the
-   reported `delete settings.mcpServers`.
-7. **Failure modes.** `credential rm ATLASSIAN` should give the bay `502`
-   (missing). Revoke the app at Atlassian: does the next refresh show
-   `refresh failed`?
+6. **Paperclip** (informational). Do its agents see the user-scope
+   server? If not, does its import or gateway path work through the same
+   route? Check the reported `delete settings.mcpServers`.
+7. **Removal.** `credential rm ATLASSIAN` gives the bay `502
+   credential_not_found`.
+8. **Revocation.** Revoke the app at Atlassian. The bay should get
+   Atlassian's `401` until the next refresh, and then `credential list`
+   should show `refresh failed`.
+9. **Old tower.** On a tower started before PR #9, `credential login`
+   fails with the restart hint and opens nothing.
 
-Exit: all seven pass, or the design changes before step 1 of the
-implementation.
+## Implementation steps
 
-## Implementation steps (each a green commit, docs included)
+Each step is one green commit with its docs, and each has a caller.
 
-1. `feat(credential): show each credential's kind and state`:
-   - `Broker::credentials()` replaces `credential_keys()`;
-   - list states and `missing`;
-   - `credential set` refuses an OAuth credential;
+1. **`feat(credential): show each credential's kind and state`.**
+   - `Broker::credentials()` replaces `credential_keys()`.
+   - `credential list` shows states.
+   - `credential set` refuses an OAuth credential.
+   - `valid_key` follows agent-vault's pattern.
    - cli.md and usage.md.
-2. `feat: add an https client over curl`: `src/https.rs`, `HANGAR_CURL` in
-   `nix/cli.nix`, and architecture.md's file map.
-3. `feat: discover OAuth metadata and register clients`: `src/oauth.rs`,
-   pure, unused until step 5.
-4. `feat(broker): connect and paste OAuth credentials`: the trait methods,
-   the agent-vault `Admin` calls, and the fake.
-5. `feat(credential): add 'credential login'`:
-   - the command, the browser opener taken out of `vault_ui`, and the
-     wait;
-   - usage.md "MCP servers" and "OAuth credentials", and
-     configuration.md's path-scoped route example;
-   - architecture.md "Credentials";
-   - an AGENTS.md invariant: refresh tokens and client secrets never
-     leave the vault, and hangar never reads credentials back.
+2. **`feat(credential): log OAuth credentials in through the vault`.**
+   - `Broker::oauth_redirect_uri` and `oauth_connect`, with
+     default-refusing trait methods.
+   - `credential login NAME --authorization-url U --token-url U
+     --client-id ID [--client-secret] [--scope S]` and `credential login
+     NAME`, with the consent URL checks and the wait.
+   - usage.md and architecture.md.
+3. **`feat(credential): discover providers and register clients`.**
+   - `src/https.rs` (curl, `HANGAR_CURL`, `HANGAR_TEST_CURL` and its
+     release guard) and `src/oauth.rs` (discovery, registration).
+   - `credential login NAME URL`.
+   - usage.md's "MCP servers" section, development.md and the file map.
+4. **`feat(config): warn when a path-scoped route is shadowed`.** The
+   warning about a bare or wildcard route that covers a path-scoped
+   route's host, and configuration.md.
 
-## Open questions
+## Review log
 
-- **A `credential logout` verb.** `rm` already does it. Is an alias worth
-  the extra surface?
-- **Paste mode.** Ship it in step 5, or wait until a provider needs it?
-  Atlassian doesn't, if spike step 1 passes.
-- **curl as a runtime tool.** Acceptable, or is a TLS crate preferred
-  despite AGENTS.md's "fewest dependencies"?
+Round 1 (no blockers, three majors):
+
+- **M1, the wait:** comparing `last_refreshed_at` with the start time
+  depends on the tower's clock, and an old `last_refresh_error` could end a
+  new login. Now hangar reads the value before connecting, waits for any
+  change, and ignores errors while waiting.
+- **M2, the secret wipe:** a re-login without the secret would have
+  cleared a stored client secret. Now `OAuthClient.secret` has a `Keep`
+  case that sends agent-vault's keep-marker.
+- **M3, green steps:** the old plan added unused code in early steps. The
+  steps are now sliced so each has a caller and its docs.
+- **Cuts:** the `logout` alias, paste mode, confidential-client
+  registration and the `missing` state.
+- **Kept:** the OpenID fallback and `--scope`.
+- **Transport:** curl is baked by Nix on every system, with a debug-only
+  test override guarded in release builds, `-q` first, and no redirects.
+  `registration_access_token` is never read.
+- **Minors applied:**
+  - the `502` wording, now naming all three cases;
+  - the `expires_in` caveat;
+  - the root-form `resource` compared with the origin;
+  - the path-scope caveat and its warning;
+  - host-side SSRF checks (https, no IP literals, no `localhost`);
+  - the consent URL on the terminal only, checked to be `https` and to
+    carry the vault's `redirect_uri`;
+  - `valid_key` tightened to agent-vault's pattern;
+  - `token_auth_method` and `scopes` in `OAuthClient`, and unknown kinds
+    counted as static;
+  - default-refusing trait methods;
+  - clearer re-login forms;
+  - the spike's informational steps and extra cases.
