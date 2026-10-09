@@ -328,7 +328,11 @@ an error. `status` shows a stopped entry of an app with a setup as
   `credentials` value (e.g. `github-token`'s `GITHUB_GIT_USER`) whenever
   a route references it; two apps may share one only with the same value,
   and `credentialFiles` can't name it.
-- `hangar credential set/list/rm`: the user's own. Values come from a
+- `hangar credential set/list/rm`: the user's own. `list` reads each
+  one's kind and state from the broker (`Broker::credentials`: static, or
+  OAuth with whether it's connected), and `set` refuses an OAuth one: the
+  vault would store the value as its access token (`SetCredential`
+  keeps the row's type). Values come from a
   hidden prompt (`stty -echo` in a trapped `sh`, value back over a pipe) or
   stdin and go to the admin API in-process. Never recorded, so `up` never
   deletes them; names managed by the config are refused.

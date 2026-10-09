@@ -1667,13 +1667,23 @@ fn user_credentials_go_to_the_vault_only_and_survive_up() {
     let list = ["credential", "list"];
     assert_eq!(
         stdout(ok(&run(&machine, &config, &list))),
-        "CLAUDE_CODE_OAUTH_TOKEN\tuser\nGITHUB_GIT_USER\tconfig\n\
-         GITHUB_TOKEN\tconfig\n"
+        "CLAUDE_CODE_OAUTH_TOKEN\tuser\tset\nGITHUB_GIT_USER\tconfig\tset\n\
+         GITHUB_TOKEN\tconfig\tset\n"
     );
+    let listed = json_out(ok(&run(
+        &machine,
+        &config,
+        &["--json", "credential", "list"],
+    )));
+    assert_eq!(text(at(&listed, &["credentials", "0", "type"])), "static");
+    assert_eq!(text(at(&listed, &["credentials", "0", "state"])), "set");
     // `up` reconciles only the config's credentials.
     ok(&run(&machine, &config, &["up"]));
     let after = stdout(ok(&run(&machine, &config, &list)));
-    assert!(after.contains("CLAUDE_CODE_OAUTH_TOKEN\tuser"), "{after}");
+    assert!(
+        after.contains("CLAUDE_CODE_OAUTH_TOKEN\tuser\tset"),
+        "{after}"
+    );
 
     let managed = ["credential", "set", "GITHUB_TOKEN"];
     let error = failed(&run_with_stdin(&machine, &config, &managed, "x\n"));

@@ -174,6 +174,23 @@ pub(crate) struct BrokerHealth {
     pub(crate) unlisted: Option<Policy>,
 }
 
+/// A credential the broker holds, by name; never its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredCredential {
+    pub(crate) key: String,
+    /// `None` for a static value.
+    pub(crate) oauth: Option<OAuthLogin>,
+}
+
+/// An OAuth credential's state, never its tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OAuthLogin {
+    pub(crate) connected: bool,
+    /// Changes whenever new tokens arrive.
+    pub(crate) refreshed_at: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
 /// The broker's admin login, for `hangar vault-ui`.
 pub(crate) struct UiLogin {
     pub(crate) url: String,
@@ -195,7 +212,7 @@ pub(crate) trait Broker {
     fn deny_unlisted(&self) -> Result<()>;
     /// Replaces the whole route set.
     fn set_routes(&self, routes: &[Route]) -> Result<()>;
-    fn credential_keys(&self) -> Result<Vec<String>>;
+    fn credentials(&self) -> Result<Vec<StoredCredential>>;
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()>;
     fn delete_credentials(&self, keys: &[String]) -> Result<()>;
     /// What bay `bay` needs; mints its token the first time.

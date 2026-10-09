@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read};
 use std::process::Stdio;
 
+use crate::broker::{OAuthLogin, StoredCredential};
 use crate::config::{Settings, Source, managed_credentials, valid_key};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
@@ -24,6 +25,12 @@ printf '%s' "$value""#;
 pub(crate) fn read(hangar: &Hangar, name: &str) -> Result<Secret> {
     check_user_key(&hangar.settings, name)?;
     vault_ready(hangar)?;
+    if stored(hangar, name)?.is_some_and(|stored| stored.oauth.is_some()) {
+        return Err(Error::with_hint(
+            format!("{name} is an OAuth credential"),
+            "connect it in the vault UI ('hangar vault-ui')",
+        ));
+    }
     let value = read_value(name)?;
     if value.expose().is_empty() {
         bail!("{name}: empty value, nothing stored");
@@ -38,32 +45,77 @@ pub(crate) fn store(hangar: &Hangar, name: &str, value: &Secret) -> Result<()> {
     Ok(())
 }
 
+fn stored(hangar: &Hangar, name: &str) -> Result<Option<StoredCredential>> {
+    let credentials = hangar.broker.credentials()?;
+    Ok(credentials.into_iter().find(|stored| stored.key == name))
+}
+
 pub(crate) struct CredentialList {
-    pub(crate) entries: Vec<(String, &'static str)>,
+    pub(crate) entries: Vec<CredentialEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CredentialEntry {
+    pub(crate) name: String,
+    /// `config` or `user`.
+    pub(crate) source: &'static str,
+    pub(crate) oauth: bool,
+    pub(crate) state: String,
+}
+
+impl CredentialEntry {
+    pub(crate) fn kind(&self) -> &'static str {
+        if self.oauth { "oauth" } else { "static" }
+    }
 }
 
 pub(crate) fn list(hangar: &Hangar) -> Result<CredentialList> {
     vault_ready(hangar)?;
-    let keys = hangar.broker.credential_keys()?;
-    Ok(classify(keys, &managed_credentials(&hangar.settings)))
+    let credentials = hangar.broker.credentials()?;
+    Ok(classify(
+        credentials,
+        &managed_credentials(&hangar.settings),
+    ))
 }
 
 fn classify(
-    keys: Vec<String>,
+    credentials: Vec<StoredCredential>,
     managed: &BTreeMap<String, Source>,
 ) -> CredentialList {
-    let entries = keys
+    let entries = credentials
         .into_iter()
-        .map(|key| {
-            let source = if managed.contains_key(&key) {
+        .map(|stored| {
+            let source = if managed.contains_key(&stored.key) {
                 "config"
             } else {
                 "user"
             };
-            (key, source)
+            CredentialEntry {
+                state: state(stored.oauth.as_ref()),
+                oauth: stored.oauth.is_some(),
+                name: stored.key,
+                source,
+            }
         })
         .collect();
     CredentialList { entries }
+}
+
+/// A refresh error is the token endpoint's answer: one line, cut short.
+fn state(oauth: Option<&OAuthLogin>) -> String {
+    let Some(login) = oauth else {
+        return "set".into();
+    };
+    if let Some(error) = &login.error {
+        let line = error.lines().next().unwrap_or_default();
+        let short: String = line.chars().take(80).collect();
+        return format!("oauth: refresh failed ({short})");
+    }
+    if login.connected {
+        "oauth: connected".into()
+    } else {
+        "oauth: not connected".into()
+    }
 }
 
 pub(crate) fn remove(hangar: &Hangar, name: &str) -> Result<()> {
@@ -126,8 +178,12 @@ fn read_hidden(name: &str, input: Stdio) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_user_key, classify, list, read_hidden, remove};
+    use super::{
+        CredentialEntry, check_user_key, classify, list, read, read_hidden,
+        remove, state,
+    };
     use crate::broker::fake::FakeBroker;
+    use crate::broker::{OAuthLogin, StoredCredential};
     use crate::config::Source;
     use crate::sandbox::fake::FakeSandbox;
     use crate::testing::{hangar_with_broker, scratch_dir, settings};
@@ -136,17 +192,62 @@ mod tests {
     use std::process::Stdio;
     use std::rc::Rc;
 
+    fn entry(
+        name: &str,
+        source: &'static str,
+        oauth: bool,
+        state: &str,
+    ) -> CredentialEntry {
+        CredentialEntry {
+            name: name.into(),
+            source,
+            oauth,
+            state: state.into(),
+        }
+    }
+
     #[test]
     fn credentials_the_config_manages_are_marked_config() {
         let managed = BTreeMap::from([(
             "GITHUB_TOKEN".to_string(),
             Source::File("/t".into()),
         )]);
-        let list =
-            classify(vec!["GITHUB_TOKEN".into(), "MINE".into()], &managed);
+        let stored = |key: &str, oauth: Option<OAuthLogin>| StoredCredential {
+            key: key.into(),
+            oauth,
+        };
+        let list = classify(
+            vec![
+                stored("GITHUB_TOKEN", None),
+                stored("MINE", Some(OAuthLogin::default())),
+            ],
+            &managed,
+        );
         assert_eq!(
             list.entries,
-            [("GITHUB_TOKEN".into(), "config"), ("MINE".into(), "user")]
+            [
+                entry("GITHUB_TOKEN", "config", false, "set"),
+                entry("MINE", "user", true, "oauth: not connected"),
+            ]
+        );
+        assert_eq!(list.entries[0].kind(), "static");
+        assert_eq!(list.entries[1].kind(), "oauth");
+    }
+
+    #[test]
+    fn an_oauth_state_says_whether_it_is_connected_or_why_not() {
+        let login = |connected, error: Option<&str>| OAuthLogin {
+            connected,
+            refreshed_at: Some("t".into()),
+            error: error.map(Into::into),
+        };
+        assert_eq!(state(None), "set");
+        assert_eq!(state(Some(&login(true, None))), "oauth: connected");
+        assert_eq!(state(Some(&login(false, None))), "oauth: not connected");
+        let long = format!("invalid_grant {}\nsecond line", "x".repeat(90));
+        assert_eq!(
+            state(Some(&login(true, Some(&long)))),
+            format!("oauth: refresh failed (invalid_grant {})", "x".repeat(66))
         );
     }
 
@@ -167,9 +268,29 @@ mod tests {
         remove(&hangar, "MINE").unwrap();
         assert_eq!(
             list(&hangar).unwrap().entries,
-            [("GITHUB_TOKEN".into(), "config")]
+            [entry("GITHUB_TOKEN", "config", false, "set")]
         );
-        assert_eq!(*calls.borrow(), ["delete MINE", "credential_keys"]);
+        assert_eq!(*calls.borrow(), ["delete MINE", "credentials"]);
+    }
+
+    #[test]
+    fn set_refuses_an_oauth_credential() {
+        let state = scratch_dir("credential-set-oauth");
+        let broker = FakeBroker::default();
+        broker.keys.borrow_mut().insert("JIRA".into());
+        broker
+            .oauth
+            .borrow_mut()
+            .insert("JIRA".into(), OAuthLogin::default());
+        let sandbox = Rc::new(FakeSandbox::default());
+        let hangar =
+            hangar_with_broker("{}", &state, sandbox, Box::new(broker));
+        let error = read(&hangar, "JIRA").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "JIRA is an OAuth credential: connect it in the vault UI \
+             ('hangar vault-ui')"
+        );
     }
 
     #[test]

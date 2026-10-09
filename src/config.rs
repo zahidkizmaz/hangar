@@ -409,11 +409,10 @@ pub(crate) fn route_json(route: &Route) -> Json {
     Json::Object(object)
 }
 
+/// agent-vault's credential key rule, `^[A-Z][A-Z0-9_]*$`.
 pub(crate) fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
-    chars
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+    chars.next().is_some_and(|first| first.is_ascii_uppercase())
         && chars
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
@@ -755,6 +754,16 @@ mod tests {
 
     fn names(settings: &Settings) -> Vec<&str> {
         settings.bays.iter().map(|bay| bay.name.as_str()).collect()
+    }
+
+    #[test]
+    fn keys_follow_agent_vaults_rule() {
+        for key in ["A", "GITHUB_TOKEN", "K8S_", "X_1"] {
+            assert!(valid_key(key), "{key}");
+        }
+        for key in ["", "_LEADING", "1ST", "lower", "MIXED_case", "A-B"] {
+            assert!(!valid_key(key), "{key}");
+        }
     }
 
     #[test]

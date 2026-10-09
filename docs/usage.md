@@ -211,8 +211,10 @@ Name a credential after the environment variable your tool reads (e.g.
 `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`). hangar then sets
 `NAME=hangar-placeholder` in every bay for every credential a route
 injects, and the vault swaps in the real value on the way out.
-`hangar credential list` shows the names and who manages them, never the
-values; `hangar credential rm NAME` deletes one of yours.
+`hangar credential list` shows the names, who manages them and their
+state (`set`, or for an OAuth credential whether it's connected), never
+the values; `hangar credential rm NAME` deletes one of yours. Names are
+`UPPER_SNAKE_CASE` starting with a letter, agent-vault's rule.
 
 ## Claude Code, Codex and Paperclip
 

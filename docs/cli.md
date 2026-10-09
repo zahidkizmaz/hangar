@@ -134,13 +134,20 @@ disappears. Key order isn't significant.
 
 ```json
 { "version": 1, "credentials": [
-  { "name": "GITHUB_TOKEN", "source": "config" },
-  { "name": "CLAUDE_CODE_OAUTH_TOKEN", "source": "user" } ] }
+  { "name": "GITHUB_TOKEN", "source": "config", "type": "static",
+    "state": "set" },
+  { "name": "JIRA", "source": "user", "type": "oauth",
+    "state": "oauth: connected" } ] }
 ```
 
 `config` entries come from `tower.credentialFiles` and the apps' fixed
 `credentials` (e.g. `GITHUB_GIT_USER`); `user` ones from `hangar
-credential set`.
+credential set` or an OAuth login. `type` is `static` or `oauth` (other
+kinds the vault holds count as `static`). `state` is `set` for a static
+value; for an OAuth one it's `oauth: connected`, `oauth: not connected`
+(no token yet) or `oauth: refresh failed (…)` with the first line of the
+token endpoint's answer. The text form prints name, source and state,
+tab-separated.
 
 ### `vault-ui --json`
 

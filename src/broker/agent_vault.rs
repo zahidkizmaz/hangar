@@ -10,7 +10,10 @@ use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 
-use super::{Access, Broker, BrokerHealth, PROXY, Policy, Route, UiLogin};
+use super::{
+    Access, Broker, BrokerHealth, OAuthLogin, PROXY, Policy, Route,
+    StoredCredential, UiLogin,
+};
 use crate::config::{Fields, valid_bay_name};
 use crate::error::{Context, Result, bail};
 use crate::http::{self, Request};
@@ -324,8 +327,8 @@ impl Broker for AgentVault {
         .map(drop)
     }
 
-    fn credential_keys(&self) -> Result<Vec<String>> {
-        self.admin()?.credential_keys()
+    fn credentials(&self) -> Result<Vec<StoredCredential>> {
+        self.admin()?.credentials()
     }
 
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()> {
@@ -473,11 +476,30 @@ impl Admin {
         Ok(settings.unmatched_host_policy)
     }
 
-    fn credential_keys(&self) -> Result<Vec<String>> {
+    /// Names in the vault's order; agent-vault's other kinds (dynamic
+    /// secrets) count as static.
+    fn credentials(&self) -> Result<Vec<StoredCredential>> {
         let path = format!("/v1/credentials?vault={VAULT}");
-        let list: KeysResponse =
+        let list: ListResponse =
             json::from_str(&self.call("GET", &path, None)?)?;
-        Ok(list.keys.unwrap_or_default())
+        let mut entries: BTreeMap<String, Entry> = list
+            .credentials
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect();
+        Ok(list
+            .keys
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| {
+                let oauth = entries
+                    .remove(&key)
+                    .filter(|entry| entry.kind.as_deref() == Some("oauth"))
+                    .map(Entry::login);
+                StoredCredential { key, oauth }
+            })
+            .collect())
     }
 
     fn post(&self, key: &str, value: &Secret) -> Result<()> {
@@ -564,8 +586,30 @@ struct DeleteBody {
 }
 
 #[derive(miniserde::Deserialize)]
-struct KeysResponse {
+struct ListResponse {
     keys: Option<Vec<String>>,
+    credentials: Option<Vec<Entry>>,
+}
+
+/// What the vault lists about a credential; it masks every secret.
+#[derive(miniserde::Deserialize)]
+struct Entry {
+    key: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    connected_at: Option<String>,
+    last_refreshed_at: Option<String>,
+    last_refresh_error: Option<String>,
+}
+
+impl Entry {
+    fn login(self) -> OAuthLogin {
+        OAuthLogin {
+            connected: self.connected_at.is_some(),
+            refreshed_at: self.last_refreshed_at,
+            error: self.last_refresh_error,
+        }
+    }
 }
 
 #[derive(miniserde::Deserialize)]
@@ -576,7 +620,7 @@ struct Session {
 #[cfg(test)]
 mod tests {
     use super::{Admin, AgentVault, render_services};
-    use crate::broker::{Auth, Broker, Route};
+    use crate::broker::{Auth, Broker, OAuthLogin, Route, StoredCredential};
     use crate::json;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{Egress, TOWER_VM};
@@ -920,17 +964,52 @@ mod tests {
     }
 
     #[test]
-    fn credential_keys_are_listed_with_the_session_token() {
+    fn credentials_are_listed_with_the_session_token_and_their_state() {
         let (port, server) =
             serve_each(vec![("200 OK", r#"{"keys":["A","B"]}"#)]);
-        assert_eq!(admin(port).credential_keys().unwrap(), ["A", "B"]);
+        let static_only = |key: &str| StoredCredential {
+            key: key.into(),
+            oauth: None,
+        };
+        assert_eq!(
+            admin(port).credentials().unwrap(),
+            [static_only("A"), static_only("B")]
+        );
         let request = server.join().unwrap().remove(0);
         assert!(request.starts_with("GET /v1/credentials?vault=default "));
         assert!(request.contains("Authorization: Bearer session-token"));
 
+        let listed = r#"{"keys":["OLD","NEW","DYN","S"],"credentials":[
+            {"key":"S","type":"static"},
+            {"key":"DYN","type":"dynamic","value":"leased"},
+            {"key":"NEW","type":"oauth","client_secret":"••••••••"},
+            {"key":"OLD","type":"oauth","connected_at":"t1",
+             "last_refreshed_at":"t2","last_refresh_error":"invalid_grant",
+             "access_token":"••••••••","refresh_token":"••••••••"}]}"#;
+        let (port, _) = serve_each(vec![("200 OK", listed)]);
+        assert_eq!(
+            admin(port).credentials().unwrap(),
+            [
+                StoredCredential {
+                    key: "OLD".into(),
+                    oauth: Some(OAuthLogin {
+                        connected: true,
+                        refreshed_at: Some("t2".into()),
+                        error: Some("invalid_grant".into()),
+                    }),
+                },
+                StoredCredential {
+                    key: "NEW".into(),
+                    oauth: Some(OAuthLogin::default()),
+                },
+                static_only("DYN"),
+                static_only("S"),
+            ]
+        );
+
         let (port, _) =
             serve_each(vec![("500 Internal Server Error", " no store \n")]);
-        let error = admin(port).credential_keys().unwrap_err().to_string();
+        let error = admin(port).credentials().unwrap_err().to_string();
         assert_eq!(
             error,
             "GET /v1/credentials?vault=default: HTTP 500: no store"

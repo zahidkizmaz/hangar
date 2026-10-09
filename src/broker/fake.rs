@@ -2,11 +2,14 @@
 //! call recorded.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use super::{Access, Broker, BrokerHealth, PROXY, Policy, Route, UiLogin};
+use super::{
+    Access, Broker, BrokerHealth, OAuthLogin, PROXY, Policy, Route,
+    StoredCredential, UiLogin,
+};
 use crate::error::{Result, bail};
 use crate::sandbox::PublishedPort;
 use crate::secret::Secret;
@@ -17,6 +20,8 @@ pub(crate) struct FakeBroker {
     /// it after handing the broker to a `Hangar`.
     pub(crate) calls: Rc<RefCell<Vec<String>>>,
     pub(crate) keys: RefCell<BTreeSet<String>>,
+    /// The OAuth state of keys in `keys`; the others are static.
+    pub(crate) oauth: RefCell<BTreeMap<String, OAuthLogin>>,
     pub(crate) unlisted: Cell<Option<Policy>>,
     /// What `ensure_running` returns.
     pub(crate) created: Cell<bool>,
@@ -30,6 +35,7 @@ impl Default for FakeBroker {
         Self {
             calls: Rc::default(),
             keys: RefCell::default(),
+            oauth: RefCell::default(),
             unlisted: Cell::new(Some(Policy::Allow)),
             created: Cell::new(true),
             fail_put: Cell::new(false),
@@ -71,9 +77,18 @@ impl Broker for FakeBroker {
         Ok(())
     }
 
-    fn credential_keys(&self) -> Result<Vec<String>> {
-        self.record("credential_keys".into());
-        Ok(self.keys.borrow().iter().cloned().collect())
+    fn credentials(&self) -> Result<Vec<StoredCredential>> {
+        self.record("credentials".into());
+        let oauth = self.oauth.borrow();
+        Ok(self
+            .keys
+            .borrow()
+            .iter()
+            .map(|key| StoredCredential {
+                key: key.clone(),
+                oauth: oauth.get(key).cloned(),
+            })
+            .collect())
     }
 
     fn put_credential(&self, key: &str, _value: &Secret) -> Result<()> {
