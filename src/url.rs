@@ -1,5 +1,25 @@
 //! The little URL handling OAuth logins need: query parameters.
 
+use std::fmt::Write as _;
+
+/// `url` with `name=value` added to its query.
+pub(crate) fn with_param(url: &str, name: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{name}={}", percent_encode(value))
+}
+
+/// Everything but RFC 3986's unreserved characters, as `%XX`.
+fn percent_encode(text: &str) -> String {
+    text.bytes().fold(String::new(), |mut out, byte| {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+        out
+    })
+}
+
 /// The decoded value of query parameter `name`, the first if repeated.
 pub(crate) fn query_param(url: &str, name: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
@@ -42,7 +62,25 @@ fn percent_decode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::query_param;
+    use super::{query_param, with_param};
+
+    #[test]
+    fn a_param_is_encoded_and_reads_back() {
+        let url = with_param(
+            "https://a.example/authorize",
+            "resource",
+            "https://r.example/v1 mcp~",
+        );
+        assert_eq!(
+            url,
+            "https://a.example/authorize?resource=https%3A%2F%2Fr.example%2Fv1%20mcp~"
+        );
+        assert_eq!(
+            query_param(&url, "resource").as_deref(),
+            Some("https://r.example/v1 mcp~")
+        );
+        assert_eq!(with_param("https://a?x=1", "y", "2"), "https://a?x=1&y=2");
+    }
 
     #[test]
     fn query_parameters_are_found_and_decoded() {

@@ -53,6 +53,10 @@ impl Machine {
         for tool in ["pbcopy", "wl-copy", "xclip", "open", "xdg-open"] {
             machine.script(tool, "exit 1");
         }
+        // No test reaches the network: tests that need a provider script
+        // their own curl.
+        machine
+            .script("curl", "echo 'curl: (7) no network in tests' >&2; exit 7");
         machine
     }
 
@@ -140,6 +144,7 @@ impl Machine {
             .env("HANGAR_FAKE", &self.fake)
             .env("HANGAR_KEYCHAIN_SERVICE", service)
             .env("HANGAR_TEST_KEYCHAIN_TOOL", self.home.join("bin/keychain"))
+            .env("HANGAR_TEST_CURL", self.home.join("bin/curl"))
             .envs(env.iter().copied());
         // Lets `cargo llvm-cov` count the binary's runs.
         if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {

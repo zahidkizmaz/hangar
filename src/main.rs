@@ -12,11 +12,13 @@ mod error;
 mod files;
 mod hangar;
 mod http;
+mod https;
 mod json;
 mod keychain;
 mod lock;
 mod logger;
 mod mounts;
+mod oauth;
 mod output;
 mod overview;
 mod packages;
@@ -238,17 +240,26 @@ enum CredentialCommand {
     List,
     /// Log an OAuth credential in from your browser; the vault keeps and
     /// refreshes its tokens
-    #[command(after_help = "Without the endpoint flags, logs in again with \
-                            the client the vault holds.\n\n\
+    #[command(after_help = "With URL, hangar finds the provider's \
+                            endpoints and registers itself as a client \
+                            (or uses --client-id). With the endpoint flags, \
+                            it uses a client you registered. With neither, \
+                            it logs in again with the client the vault \
+                            holds.\n\n\
                             Examples:\n  \
+                            hangar credential login ATLASSIAN \
+                            https://mcp.atlassian.com/v1/mcp\n  \
                             hangar credential login EXAMPLE_API \\\n    \
                             --authorization-url https://auth.example.com/authorize \\\n    \
                             --token-url https://auth.example.com/token \\\n    \
                             --client-id abc123 --client-secret --scope read\n  \
-                            hangar credential login EXAMPLE_API")]
+                            hangar credential login ATLASSIAN")]
     Login {
         /// UPPER_SNAKE_CASE, the name a route injects
         name: String,
+        /// The API (or its OAuth issuer) to find the provider from
+        #[arg(conflicts_with_all = ["authorization_url", "token_url"])]
+        url: Option<String>,
         /// The provider's authorization endpoint
         #[arg(long, value_name = "URL", requires_all = ["token_url", "client_id"])]
         authorization_url: Option<String>,
@@ -256,7 +267,7 @@ enum CredentialCommand {
         #[arg(long, value_name = "URL", requires_all = ["authorization_url", "client_id"])]
         token_url: Option<String>,
         /// The client you registered with the provider
-        #[arg(long, value_name = "ID", requires_all = ["authorization_url", "token_url"])]
+        #[arg(long, value_name = "ID")]
         client_id: Option<String>,
         /// Read the client's secret (hidden prompt, or stdin)
         #[arg(long, requires = "client_id")]
@@ -367,19 +378,21 @@ fn run(command: Command) -> Result<Outcome> {
             }
             CredentialCommand::Login {
                 name,
+                url,
                 authorization_url,
                 token_url,
                 client_id,
                 client_secret,
                 scopes,
             } => {
-                let endpoints = credential::Endpoints::from_flags(
+                let source = credential::ClientSource::from_flags(
+                    url,
                     authorization_url,
                     token_url,
                     client_id,
-                );
+                )?;
                 let args = credential::LoginArgs {
-                    endpoints,
+                    source,
                     scopes,
                     client_secret,
                 };
@@ -417,7 +430,8 @@ fn login(
     name: &str,
     args: credential::LoginArgs,
 ) -> Result<()> {
-    let login = credential::prepare_login(hangar, name, args)?;
+    let https = https::Curl::new();
+    let login = credential::prepare_login(hangar, &https, name, args)?;
     let consent = {
         let _lock = hold_lock()?;
         credential::connect(hangar, &login)?

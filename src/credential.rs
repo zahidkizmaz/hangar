@@ -13,6 +13,8 @@ use crate::broker::{
 use crate::config::{Settings, Source, managed_credentials, valid_key};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
+use crate::https::Https;
+use crate::oauth;
 use crate::process;
 use crate::secret::{Secret, trim_line_end};
 use crate::url::query_param;
@@ -131,31 +133,56 @@ pub(crate) fn remove(hangar: &Hangar, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A client the user registered with the provider.
-pub(crate) struct Endpoints {
-    pub(crate) authorization_url: String,
-    pub(crate) token_url: String,
-    pub(crate) client_id: String,
+/// Where a login's client comes from.
+pub(crate) enum ClientSource {
+    /// The provider behind a URL; a client is registered unless given.
+    Discover {
+        url: String,
+        client_id: Option<String>,
+    },
+    /// A client the user registered with the provider.
+    Endpoints {
+        authorization_url: String,
+        token_url: String,
+        client_id: String,
+    },
+    /// The client the broker holds.
+    Stored,
 }
 
-impl Endpoints {
-    /// All three flags, or none (clap requires them together).
+impl ClientSource {
+    /// clap keeps the endpoint flags together and apart from a URL; a
+    /// client id alone is all it lets through.
     pub(crate) fn from_flags(
+        url: Option<String>,
         authorization_url: Option<String>,
         token_url: Option<String>,
         client_id: Option<String>,
-    ) -> Option<Self> {
-        Some(Self {
-            authorization_url: authorization_url?,
-            token_url: token_url?,
-            client_id: client_id?,
+    ) -> Result<Self> {
+        Ok(match (url, authorization_url, token_url, client_id) {
+            (Some(url), None, None, client_id) => {
+                Self::Discover { url, client_id }
+            }
+            (
+                None,
+                Some(authorization_url),
+                Some(token_url),
+                Some(client_id),
+            ) => Self::Endpoints {
+                authorization_url,
+                token_url,
+                client_id,
+            },
+            (None, None, None, None) => Self::Stored,
+            _ => bail!(
+                "--client-id needs a URL, or --authorization-url and --token-url"
+            ),
         })
     }
 }
 
 pub(crate) struct LoginArgs {
-    /// `None`: log in again with the client the broker holds.
-    pub(crate) endpoints: Option<Endpoints>,
+    pub(crate) source: ClientSource,
     pub(crate) scopes: Vec<String>,
     /// Read the client's secret like `credential set` reads a value.
     pub(crate) client_secret: bool,
@@ -171,9 +198,12 @@ pub(crate) struct Login {
     before: Option<String>,
 }
 
-/// `credential login`, first part: the checks, the client and its secret.
+/// `credential login`, first part: the checks, the client and its
+/// secret. Discovery and registration talk to the provider, never the
+/// broker.
 pub(crate) fn prepare_login(
     hangar: &Hangar,
+    https: &dyn Https,
     name: &str,
     args: LoginArgs,
 ) -> Result<Login> {
@@ -187,28 +217,58 @@ pub(crate) fn prepare_login(
         ));
     }
     let login = stored.and_then(|stored| stored.oauth).unwrap_or_default();
-    let (mut client, secret) = match args.endpoints {
-        Some(endpoints) => {
-            check_https(&endpoints.authorization_url)?;
-            check_https(&endpoints.token_url)?;
-            let secret = if args.client_secret {
-                ClientSecret::New(read_client_secret(name)?)
-            } else {
-                ClientSecret::None
-            };
-            let client = OAuthClient {
-                authorization_url: endpoints.authorization_url,
-                token_url: endpoints.token_url,
-                client_id: endpoints.client_id,
-                ..OAuthClient::default()
-            };
-            (client, secret)
+    let mut client = match args.source {
+        ClientSource::Stored => {
+            let (mut client, secret) = stored_client(name, &login)?;
+            if !args.scopes.is_empty() {
+                client.scopes = args.scopes.join(" ");
+            }
+            return Ok(Login {
+                name: name.to_string(),
+                client,
+                secret,
+                before: login.refreshed_at,
+            });
         }
-        None => stored_client(name, &login)?,
+        ClientSource::Endpoints {
+            authorization_url,
+            token_url,
+            client_id,
+        } => {
+            oauth::check_url(&authorization_url)?;
+            oauth::check_url(&token_url)?;
+            OAuthClient {
+                authorization_url,
+                token_url,
+                client_id,
+                ..OAuthClient::default()
+            }
+        }
+        ClientSource::Discover { url, client_id } => {
+            let provider = oauth::discover(https, &url)?;
+            log::info!("found the OAuth endpoints for {url}");
+            let client_id = if let Some(id) = client_id {
+                id
+            } else {
+                let callback = hangar.broker.oauth_redirect_uri()?;
+                let id = oauth::register(https, &provider, &callback)?;
+                log::info!("registered hangar as OAuth client {id}");
+                id
+            };
+            OAuthClient {
+                authorization_url: provider.authorization_url,
+                token_url: provider.token_url,
+                client_id,
+                ..OAuthClient::default()
+            }
+        }
     };
-    if !args.scopes.is_empty() {
-        client.scopes = args.scopes.join(" ");
-    }
+    client.scopes = args.scopes.join(" ");
+    let secret = if args.client_secret {
+        ClientSecret::New(read_client_secret(name)?)
+    } else {
+        ClientSecret::None
+    };
     Ok(Login {
         name: name.to_string(),
         client,
@@ -238,13 +298,6 @@ fn stored_client(
         ClientSecret::None
     };
     Ok((client, secret))
-}
-
-fn check_https(url: &str) -> Result<()> {
-    if !url.starts_with("https://") {
-        bail!("{url}: expected an https:// URL");
-    }
-    Ok(())
 }
 
 fn read_client_secret(name: &str) -> Result<Secret> {
@@ -392,14 +445,15 @@ fn read_hidden(name: &str, input: Stdio) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialEntry, Endpoints, LoginArgs, check_consent, check_user_key,
-        classify, connect, finish_login, list, prepare_login, read,
-        read_hidden, remove, state, wait_for_tokens,
+        ClientSource, CredentialEntry, LoginArgs, check_consent,
+        check_user_key, classify, connect, finish_login, list, prepare_login,
+        read, read_hidden, remove, state, wait_for_tokens,
     };
     use crate::broker::fake::{FAKE_CALLBACK, FakeBroker};
     use crate::broker::{OAuthClient, OAuthLogin, StoredCredential};
     use crate::config::Source;
     use crate::hangar::Hangar;
+    use crate::https::fake::FakeHttps;
     use crate::sandbox::fake::FakeSandbox;
     use crate::testing::{hangar_with_broker, scratch_dir, settings};
     use std::cell::RefCell;
@@ -499,11 +553,11 @@ mod tests {
 
     fn flags(scopes: &[&str]) -> LoginArgs {
         LoginArgs {
-            endpoints: Endpoints::from_flags(
-                Some("https://a.example/authorize".into()),
-                Some("https://a.example/token".into()),
-                Some("c1".into()),
-            ),
+            source: ClientSource::Endpoints {
+                authorization_url: "https://a.example.com/authorize".into(),
+                token_url: "https://a.example.com/token".into(),
+                client_id: "c1".into(),
+            },
             scopes: scopes.iter().map(ToString::to_string).collect(),
             client_secret: false,
         }
@@ -515,8 +569,8 @@ mod tests {
             refreshed_at: Some(refreshed.into()),
             error: Some("invalid_grant".into()),
             client: Some(OAuthClient {
-                authorization_url: "https://a.example/authorize".into(),
-                token_url: "https://a.example/token".into(),
+                authorization_url: "https://a.example.com/authorize".into(),
+                token_url: "https://a.example.com/token".into(),
                 client_id: "stored".into(),
                 scopes: "read".into(),
                 token_auth_method: "client_secret_basic".into(),
@@ -540,8 +594,13 @@ mod tests {
         let (calls, connected) =
             (broker.calls.clone(), broker.connected.clone());
         let hangar = oauth_hangar("login", broker);
-        let login =
-            prepare_login(&hangar, "JIRA", flags(&["read", "write"])).unwrap();
+        let login = prepare_login(
+            &hangar,
+            &FakeHttps::default(),
+            "JIRA",
+            flags(&["read", "write"]),
+        )
+        .unwrap();
         let consent = connect(&hangar, &login).unwrap();
         let opened = RefCell::new(Vec::new());
         let open = |url: &str| opened.borrow_mut().push(url.to_string());
@@ -552,8 +611,8 @@ mod tests {
         assert_eq!(
             client,
             OAuthClient {
-                authorization_url: "https://a.example/authorize".into(),
-                token_url: "https://a.example/token".into(),
+                authorization_url: "https://a.example.com/authorize".into(),
+                token_url: "https://a.example.com/token".into(),
                 client_id: "c1".into(),
                 scopes: "read write".into(),
                 token_auth_method: String::new(),
@@ -566,17 +625,98 @@ mod tests {
         );
     }
 
+    const ISSUER: &str = r#"{"issuer":"https://mcp.example.com","authorization_endpoint":"https://mcp.example.com/authorize","token_endpoint":"https://mcp.example.com/token","registration_endpoint":"https://mcp.example.com/register"}"#;
+    const ISSUER_URL: &str =
+        "https://mcp.example.com/.well-known/oauth-authorization-server";
+
+    #[test]
+    fn a_url_finds_the_provider_and_registers_a_client_with_the_callback() {
+        let broker = FakeBroker::default();
+        let connected = broker.connected.clone();
+        let hangar = oauth_hangar("login-discover", broker);
+        let https =
+            FakeHttps::default().answer(ISSUER_URL, 200, ISSUER).answer(
+                "https://mcp.example.com/register",
+                201,
+                r#"{"client_id":"dyn-1"}"#,
+            );
+        let discover = |client_id: Option<&str>| LoginArgs {
+            source: ClientSource::Discover {
+                url: "https://mcp.example.com/mcp".into(),
+                client_id: client_id.map(Into::into),
+            },
+            scopes: vec![],
+            client_secret: false,
+        };
+        let login =
+            prepare_login(&hangar, &https, "MCP", discover(None)).unwrap();
+        connect(&hangar, &login).unwrap();
+        let (client, secret) = connected.borrow().clone().unwrap();
+        assert_eq!(
+            (client.authorization_url.as_str(), client.client_id.as_str()),
+            ("https://mcp.example.com/authorize", "dyn-1")
+        );
+        assert_eq!(
+            (client.token_url.as_str(), secret),
+            ("https://mcp.example.com/token", "none")
+        );
+        let registered = https.requests.borrow().last().cloned().unwrap();
+        assert!(registered.contains(FAKE_CALLBACK), "{registered}");
+
+        let before = https.requests.borrow().len();
+        let login =
+            prepare_login(&hangar, &https, "MCP", discover(Some("mine")))
+                .unwrap();
+        connect(&hangar, &login).unwrap();
+        let (client, _) = connected.borrow().clone().unwrap();
+        assert_eq!(client.client_id, "mine");
+        let posts = https.requests.borrow()[before..]
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .count();
+        assert_eq!(posts, 0, "registered although given a client id");
+    }
+
+    #[test]
+    fn the_flags_pick_where_the_client_comes_from() {
+        let some = |value: &str| Some(value.to_string());
+        let source = |url, authorize, token, id| {
+            ClientSource::from_flags(url, authorize, token, id)
+        };
+        assert!(matches!(
+            source(some("https://u.example.com"), None, None, some("c")),
+            Ok(ClientSource::Discover {
+                client_id: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            source(None, some("https://a"), some("https://t"), some("c")),
+            Ok(ClientSource::Endpoints { .. })
+        ));
+        assert!(matches!(
+            source(None, None, None, None),
+            Ok(ClientSource::Stored)
+        ));
+        let error = source(None, None, None, some("c")).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "--client-id needs a URL, or --authorization-url and --token-url"
+        );
+    }
+
     #[test]
     fn a_re_login_keeps_the_stored_client_and_its_secret() {
         let broker = holding("JIRA", Some(stored_login("t", true)));
         let connected = broker.connected.clone();
         let hangar = oauth_hangar("relogin", broker);
         let args = LoginArgs {
-            endpoints: None,
+            source: ClientSource::Stored,
             scopes: vec![],
             client_secret: false,
         };
-        let login = prepare_login(&hangar, "JIRA", args).unwrap();
+        let login = prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
+            .unwrap();
         let consent = connect(&hangar, &login).unwrap();
         // An old refresh error doesn't end the wait; new tokens do.
         finish_login(&hangar, &login, &consent, &|_| {}).unwrap();
@@ -590,11 +730,12 @@ mod tests {
         let connected = broker.connected.clone();
         let hangar = oauth_hangar("relogin-public", broker);
         let args = LoginArgs {
-            endpoints: None,
+            source: ClientSource::Stored,
             scopes: vec!["admin".into()],
             client_secret: false,
         };
-        let login = prepare_login(&hangar, "JIRA", args).unwrap();
+        let login = prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
+            .unwrap();
         connect(&hangar, &login).unwrap();
         let (client, secret) = connected.borrow().clone().unwrap();
         assert_eq!((client.scopes.as_str(), secret), ("admin", "none"));
@@ -604,7 +745,7 @@ mod tests {
     fn a_login_refuses_static_values_missing_clients_and_plain_http() {
         let refused = |broker: FakeBroker, args: LoginArgs| {
             let hangar = oauth_hangar("login-refused", broker);
-            prepare_login(&hangar, "JIRA", args)
+            prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
                 .err()
                 .unwrap()
                 .to_string()
@@ -614,7 +755,7 @@ mod tests {
             "JIRA holds a static value: run 'hangar credential rm JIRA' first"
         );
         let again = || LoginArgs {
-            endpoints: None,
+            source: ClientSource::Stored,
             scopes: vec![],
             client_secret: false,
         };
@@ -631,25 +772,28 @@ mod tests {
         );
 
         let plain = LoginArgs {
-            endpoints: Endpoints::from_flags(
-                Some("https://a.example/authorize".into()),
-                Some("http://a.example/token".into()),
-                Some("c1".into()),
-            ),
+            source: ClientSource::Endpoints {
+                authorization_url: "https://a.example.com/authorize".into(),
+                token_url: "http://a.example.com/token".into(),
+                client_id: "c1".into(),
+            },
             ..flags(&[])
         };
         assert_eq!(
             refused(FakeBroker::default(), plain),
-            "http://a.example/token: expected an https:// URL"
+            "http://a.example.com/token: expected an https:// URL"
         );
         let hangar = oauth_hangar("login-name", FakeBroker::default());
-        assert!(prepare_login(&hangar, "_JIRA", flags(&[])).is_err());
+        assert!(
+            prepare_login(&hangar, &FakeHttps::default(), "_JIRA", flags(&[]))
+                .is_err()
+        );
     }
 
     #[test]
     fn the_consent_url_must_be_https_and_come_back_to_the_vault() {
         let good = format!(
-            "https://a.example/authorize?redirect_uri={}",
+            "https://a.example.com/authorize?redirect_uri={}",
             FAKE_CALLBACK.replace('/', "%2F").replace(':', "%3A")
         );
         assert!(check_consent(&good, FAKE_CALLBACK).is_ok());
@@ -661,7 +805,7 @@ mod tests {
             error,
             "the vault's consent URL isn't https; not opening it"
         );
-        let old_tower = "https://a.example/authorize?redirect_uri=\
+        let old_tower = "https://a.example.com/authorize?redirect_uri=\
                          http%3A%2F%2F0.0.0.0%3A14321%2Fv1%2Foauth%2Fcallback";
         let error = check_consent(old_tower, FAKE_CALLBACK).unwrap_err();
         assert_eq!(
@@ -678,7 +822,9 @@ mod tests {
         let broker = FakeBroker::default();
         *broker.consent.borrow_mut() = Some(old_tower.into());
         let hangar = oauth_hangar("login-old-tower", broker);
-        let login = prepare_login(&hangar, "JIRA", flags(&[])).unwrap();
+        let login =
+            prepare_login(&hangar, &FakeHttps::default(), "JIRA", flags(&[]))
+                .unwrap();
         let consent = connect(&hangar, &login).unwrap();
         let opened = RefCell::new(0);
         let open = |_: &str| *opened.borrow_mut() += 1;

@@ -337,7 +337,12 @@ an error. `status` shows a stopped entry of an app with a setup as
   stdin and go to the admin API in-process. Never recorded, so `up` never
   deletes them; names managed by the config are refused.
 - `hangar credential login`: an OAuth credential the vault keeps and
-  refreshes. `Broker::oauth_connect` saves the client (a re-login sends
+  refreshes. With a URL, `src/oauth.rs` finds the provider (RFC 9728
+  resource metadata, else RFC 8414 or OpenID metadata at the issuer,
+  checking issuer and resource) and registers hangar as a public client
+  (RFC 7591, `none` only) with `Broker::oauth_redirect_uri`; it fetches
+  through host curl (`src/https.rs`) and only `https` URLs with public
+  host names. `Broker::oauth_connect` saves the client (a re-login sends
   the broker's keep-marker for a stored secret) and returns the consent
   URL. hangar opens it only when it's https and its `redirect_uri` is
   `Broker::oauth_redirect_uri` (a tower from before `AGENT_VAULT_ADDR`
@@ -436,7 +441,9 @@ reach them by name.
   only place that picks the backends (`sandbox.backend`,
   `tower.backend`).
 - `src/credential.rs`: `hangar credential`, OAuth logins included.
-- `src/url.rs`: query parameters of the consent URL.
+- `src/url.rs`: query parameters (the consent URL's, `resource=`).
+- `src/oauth.rs`: provider discovery and client registration;
+  `src/https.rs`: HTTPS through the host's curl (`Https`, `Curl`).
 - `src/overview.rs`: what `status`, the port summary and `vault-ui`
   report (data only).
 - `src/output.rs`: renders command results as text or `--json`, errors

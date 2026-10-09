@@ -61,6 +61,15 @@ variable's name shows up in the binary. So the CLI tests need a debug
 build: `tests/fakes` doesn't compile without `debug_assertions`, and the Nix
 package runs them with `checkType = "debug"`.
 
+No test reaches the network either. `credential login NAME URL` runs
+curl by absolute path (`HANGAR_CURL`, baked in by `nix/cli.nix`, else
+`/usr/bin/curl`); unit tests give `src/oauth.rs` a fake `Https` and
+`src/https.rs` a fake script, and the CLI tests get a scripted `curl`
+through `HANGAR_TEST_CURL`, which only debug builds read and the same
+`postInstall` and release checks keep out of a release binary. By
+default it fails like an offline curl; a test that needs a provider
+scripts its answers.
+
 ## End-to-end tests
 
 They need msb and must never touch real state:
