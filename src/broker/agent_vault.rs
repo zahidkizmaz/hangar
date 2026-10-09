@@ -11,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use super::{
-    Access, Broker, BrokerHealth, OAuthLogin, PROXY, Policy, Route,
-    StoredCredential, UiLogin,
+    Access, Broker, BrokerHealth, ClientSecret, OAuthClient, OAuthLogin, PROXY,
+    Policy, Route, StoredCredential, UiLogin,
 };
 use crate::config::{Fields, valid_bay_name};
 use crate::error::{Context, Result, bail};
@@ -25,7 +25,7 @@ use crate::sandbox::{
 use crate::secret::{Secret, random_hex};
 use crate::state::write_private;
 use log::info;
-use miniserde::json::Array;
+use miniserde::json::{Array, Object};
 
 /// The admin API and the proxy inside the VM.
 const ADMIN_PORT: u16 = 14321;
@@ -339,6 +339,20 @@ impl Broker for AgentVault {
         self.admin()?.delete(keys)
     }
 
+    /// Built by agent-vault from `AGENT_VAULT_ADDR`, the host address.
+    fn oauth_redirect_uri(&self) -> Result<String> {
+        Ok(format!("{}/v1/oauth/callback", self.host_address()))
+    }
+
+    fn oauth_connect(
+        &self,
+        key: &str,
+        client: &OAuthClient,
+        secret: &ClientSecret,
+    ) -> Result<String> {
+        self.admin()?.connect(key, client, secret)
+    }
+
     fn access(&self, bay: &str) -> Result<Access> {
         let (token, renewed) = self.ensure_agent_token(bay)?;
         let ca_pem = self.exec(
@@ -515,6 +529,41 @@ impl Admin {
             .context(format!("credential {key}"))
     }
 
+    /// The client secret travels only in the body. agent-vault keeps its
+    /// stored one for the marker, but only while `token_url` stays.
+    fn connect(
+        &self,
+        key: &str,
+        client: &OAuthClient,
+        secret: &ClientSecret,
+    ) -> Result<String> {
+        let mut body = Object::new();
+        let mut put = |name: &str, value: &str| {
+            if !value.is_empty() {
+                body.insert(name.into(), json::string(value));
+            }
+        };
+        put("vault", VAULT);
+        put("key", key);
+        put("authorization_url", &client.authorization_url);
+        put("token_url", &client.token_url);
+        put("client_id", &client.client_id);
+        put("scopes", &client.scopes);
+        put("token_auth_method", &client.token_auth_method);
+        match secret {
+            ClientSecret::None => {}
+            ClientSecret::Keep => put("client_secret", KEEP_SECRET),
+            ClientSecret::New(value) => put("client_secret", value.expose()),
+        }
+        let body = json::stringify(&Json::Object(body));
+        let path = "/v1/credentials/oauth/connect";
+        let reply = self
+            .call("POST", path, Some(&body))
+            .context(format!("OAuth login {key}"))?;
+        let consent: ConnectResponse = json::from_str(&reply)?;
+        Ok(consent.authorization_url)
+    }
+
     fn delete(&self, keys: &[String]) -> Result<()> {
         let body = json::stringify(&DeleteBody {
             vault: VAULT.into(),
@@ -560,6 +609,9 @@ impl Admin {
     }
 }
 
+/// agent-vault's `oauthSecretSentinel`: keep the stored client secret.
+const KEEP_SECRET: &str = "••••••••";
+
 fn vault_agent(bay: &str) -> String {
     format!("hangar-{bay}")
 }
@@ -600,16 +652,40 @@ struct Entry {
     connected_at: Option<String>,
     last_refreshed_at: Option<String>,
     last_refresh_error: Option<String>,
+    authorization_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<String>,
+    token_auth_method: Option<String>,
+    /// Only ever the mask.
+    client_secret: Option<String>,
 }
 
 impl Entry {
     fn login(self) -> OAuthLogin {
+        let client = match (self.token_url, self.client_id) {
+            (Some(token_url), Some(client_id)) => Some(OAuthClient {
+                authorization_url: self.authorization_url.unwrap_or_default(),
+                token_url,
+                client_id,
+                scopes: self.scopes.unwrap_or_default(),
+                token_auth_method: self.token_auth_method.unwrap_or_default(),
+            }),
+            _ => None,
+        };
         OAuthLogin {
             connected: self.connected_at.is_some(),
             refreshed_at: self.last_refreshed_at,
             error: self.last_refresh_error,
+            client,
+            has_secret: self.client_secret.is_some(),
         }
     }
+}
+
+#[derive(miniserde::Deserialize)]
+struct ConnectResponse {
+    authorization_url: String,
 }
 
 #[derive(miniserde::Deserialize)]
@@ -620,7 +696,10 @@ struct Session {
 #[cfg(test)]
 mod tests {
     use super::{Admin, AgentVault, render_services};
-    use crate::broker::{Auth, Broker, OAuthLogin, Route, StoredCredential};
+    use crate::broker::{
+        Auth, Broker, ClientSecret, OAuthClient, OAuthLogin, Route,
+        StoredCredential,
+    };
     use crate::json;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{Egress, TOWER_VM};
@@ -982,7 +1061,10 @@ mod tests {
         let listed = r#"{"keys":["OLD","NEW","DYN","S"],"credentials":[
             {"key":"S","type":"static"},
             {"key":"DYN","type":"dynamic","value":"leased"},
-            {"key":"NEW","type":"oauth","client_secret":"••••••••"},
+            {"key":"NEW","type":"oauth","client_secret":"••••••••",
+             "authorization_url":"https://a.example/authorize",
+             "token_url":"https://a.example/token","client_id":"c1",
+             "scopes":"read write","token_auth_method":"client_secret_basic"},
             {"key":"OLD","type":"oauth","connected_at":"t1",
              "last_refreshed_at":"t2","last_refresh_error":"invalid_grant",
              "access_token":"••••••••","refresh_token":"••••••••"}]}"#;
@@ -996,11 +1078,23 @@ mod tests {
                         connected: true,
                         refreshed_at: Some("t2".into()),
                         error: Some("invalid_grant".into()),
+                        ..OAuthLogin::default()
                     }),
                 },
                 StoredCredential {
                     key: "NEW".into(),
-                    oauth: Some(OAuthLogin::default()),
+                    oauth: Some(OAuthLogin {
+                        client: Some(OAuthClient {
+                            authorization_url: "https://a.example/authorize"
+                                .into(),
+                            token_url: "https://a.example/token".into(),
+                            client_id: "c1".into(),
+                            scopes: "read write".into(),
+                            token_auth_method: "client_secret_basic".into(),
+                        }),
+                        has_secret: true,
+                        ..OAuthLogin::default()
+                    }),
                 },
                 static_only("DYN"),
                 static_only("S"),
@@ -1013,6 +1107,64 @@ mod tests {
         assert_eq!(
             error,
             "GET /v1/credentials?vault=default: HTTP 500: no store"
+        );
+    }
+
+    #[test]
+    fn an_oauth_login_sends_the_client_and_returns_the_consent_url() {
+        let consent =
+            r#"{"authorization_url":"https://a.example/authorize?state=s"}"#;
+        let (port, server) = serve_each(vec![
+            ("200 OK", consent),
+            ("200 OK", consent),
+            ("200 OK", consent),
+            ("400 Bad Request", r#"{"error":"bad token_url"}"#),
+        ]);
+        let client = OAuthClient {
+            authorization_url: "https://a.example/authorize".into(),
+            token_url: "https://a.example/token".into(),
+            client_id: "c1".into(),
+            scopes: "read".into(),
+            token_auth_method: String::new(),
+        };
+        let admin = admin(port);
+        let connect = |secret| admin.connect("JIRA", &client, &secret);
+        let url = connect(ClientSecret::New(Secret::new("s3cret".into())));
+        assert_eq!(url.unwrap(), "https://a.example/authorize?state=s");
+        connect(ClientSecret::Keep).unwrap();
+        connect(ClientSecret::None).unwrap();
+        let error = connect(ClientSecret::None).unwrap_err().to_string();
+        assert!(error.starts_with("OAuth login JIRA: POST "), "{error}");
+
+        let requests = server.join().unwrap();
+        let body = |request: &String| {
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("POST /v1/credentials/oauth/connect "));
+            assert!(!head.contains("s3cret"));
+            body.to_string()
+        };
+        let fields = r#""authorization_url":"https://a.example/authorize","client_id":"c1""#;
+        let rest = r#""key":"JIRA","scopes":"read","token_url":"https://a.example/token","vault":"default"}"#;
+        assert_eq!(
+            body(&requests[0]),
+            format!(r#"{{{fields},"client_secret":"s3cret",{rest}"#)
+        );
+        assert_eq!(
+            body(&requests[1]),
+            format!(r#"{{{fields},"client_secret":"••••••••",{rest}"#)
+        );
+        assert_eq!(body(&requests[2]), format!("{{{fields},{rest}"));
+    }
+
+    #[test]
+    fn the_oauth_callback_is_the_vault_ui_address() {
+        let state = scratch_dir("agent-vault-callback");
+        let config = r#"{"tower": {"agentVault": {"adminPort": 15000}}}"#;
+        let vault =
+            agent_vault(config, &state, Rc::new(FakeSandbox::default()));
+        assert_eq!(
+            vault.oauth_redirect_uri().unwrap(),
+            "http://127.0.0.1:15000/v1/oauth/callback"
         );
     }
 

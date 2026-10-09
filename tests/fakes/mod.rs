@@ -1,7 +1,7 @@
 //! Test doubles: a fake `msb` (shell script, state in files) and a fake
 //! agent-vault admin API (a loopback HTTP server that records requests).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -195,6 +195,9 @@ impl FakeVault {
             let mut vault = Stored {
                 policy: String::from("allow"),
                 keys: BTreeSet::new(),
+                oauth: BTreeMap::new(),
+                logins: 0,
+                port,
             };
             for stream in listener.incoming().flatten() {
                 serve(stream, &fake, &recorded, &mut vault);
@@ -223,6 +226,70 @@ impl FakeVault {
 struct Stored {
     policy: String,
     keys: BTreeSet<String>,
+    /// An OAuth key's list entry; a login completes the moment it starts.
+    oauth: BTreeMap<String, String>,
+    logins: usize,
+    port: u16,
+}
+
+impl Stored {
+    fn list(&self) -> String {
+        let keys: Vec<String> =
+            self.keys.iter().map(|key| format!(r#""{key}""#)).collect();
+        let entries: Vec<String> = self
+            .keys
+            .iter()
+            .map(|key| {
+                self.oauth.get(key).cloned().unwrap_or_else(|| {
+                    format!(r#"{{"key":"{key}","type":"static"}}"#)
+                })
+            })
+            .collect();
+        format!(
+            r#"{{"keys":[{}],"credentials":[{}]}}"#,
+            keys.join(","),
+            entries.join(",")
+        )
+    }
+
+    fn connect(&mut self, body: &str) -> String {
+        let field = |name| body_field(body, name);
+        let key = field("key");
+        self.logins += 1;
+        let secret = if body.contains(r#""client_secret""#) {
+            r#","client_secret":"••••••••""#
+        } else {
+            ""
+        };
+        let entry = format!(
+            r#"{{"key":"{key}","type":"oauth","connected_at":"t0","last_refreshed_at":"t{}","authorization_url":"{}","token_url":"{}","client_id":"{}","scopes":"{}"{secret}}}"#,
+            self.logins,
+            field("authorization_url"),
+            field("token_url"),
+            field("client_id"),
+            field("scopes"),
+        );
+        self.keys.insert(key.clone());
+        self.oauth.insert(key, entry);
+        format!(
+            r#"{{"authorization_url":"{}?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fv1%2Foauth%2Fcallback&state=s"}}"#,
+            field("authorization_url"),
+            field("client_id"),
+            self.port
+        )
+    }
+}
+
+fn body_field(body: &str, field: &str) -> String {
+    use miniserde::json::Value;
+    let Ok(Value::Object(top)) = miniserde::json::from_str::<Value>(body)
+    else {
+        return String::new();
+    };
+    match top.get(field) {
+        Some(Value::String(value)) => value.clone(),
+        _ => String::new(),
+    }
 }
 
 /// The keys of a credentials body: `credentials` (POST) or `keys` (DELETE).
@@ -292,10 +359,9 @@ fn serve(
             200,
             format!(r#"{{"unmatched_host_policy":"{}"}}"#, vault.policy),
         ),
-        ("GET", "/v1/credentials?vault=default") => {
-            let keys: Vec<String> =
-                vault.keys.iter().map(|key| format!(r#""{key}""#)).collect();
-            (200, format!(r#"{{"keys":[{}]}}"#, keys.join(",")))
+        ("GET", "/v1/credentials?vault=default") => (200, vault.list()),
+        ("POST", "/v1/credentials/oauth/connect") => {
+            (200, vault.connect(&body))
         }
         ("POST", "/v1/credentials") => {
             vault.keys.extend(body_keys(&body, "credentials"));
@@ -304,6 +370,7 @@ fn serve(
         ("DELETE", "/v1/credentials") => {
             for key in body_keys(&body, "keys") {
                 vault.keys.remove(&key);
+                vault.oauth.remove(&key);
             }
             (200, "{}".to_string())
         }

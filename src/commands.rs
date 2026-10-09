@@ -403,19 +403,24 @@ pub(crate) fn vault_ui(hangar: &Hangar) -> Result<VaultLogin> {
         ));
     };
     let copied = copy(login.password.expose().as_bytes());
-    for opener in ["open", "xdg-open"] {
-        let mut open = process::command(opener);
-        open.arg(&login.url);
-        if process::output(&mut open, None).is_ok_and(|o| o.status.success()) {
-            break;
-        }
-    }
+    open_in_browser(&login.url);
     Ok(VaultLogin {
         url: login.url,
         login: login.login,
         copied,
         password_file: login.password_file.display().to_string(),
     })
+}
+
+/// The first opener that works; none is fine, the caller shows the URL.
+pub(crate) fn open_in_browser(url: &str) {
+    for opener in ["open", "xdg-open"] {
+        let mut open = process::command(opener);
+        open.arg(url);
+        if process::output(&mut open, None).is_ok_and(|o| o.status.success()) {
+            break;
+        }
+    }
 }
 
 fn copy(secret: &[u8]) -> bool {

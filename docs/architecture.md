@@ -336,6 +336,15 @@ an error. `status` shows a stopped entry of an app with a setup as
   hidden prompt (`stty -echo` in a trapped `sh`, value back over a pipe) or
   stdin and go to the admin API in-process. Never recorded, so `up` never
   deletes them; names managed by the config are refused.
+- `hangar credential login`: an OAuth credential the vault keeps and
+  refreshes. `Broker::oauth_connect` saves the client (a re-login sends
+  the broker's keep-marker for a stored secret) and returns the consent
+  URL. hangar opens it only when it's https and its `redirect_uri` is
+  `Broker::oauth_redirect_uri` (a tower from before `AGENT_VAULT_ADDR`
+  would send the browser to `0.0.0.0`). It then polls
+  `Broker::credentials` until the credential's refresh time changes, no
+  clock involved. The lock covers only the connect. Brokers without OAuth
+  keep the trait's refusing defaults.
 - `hangar vault-ui`: pipes `owner-password` into `pbcopy`, `wl-copy` or
   `xclip` and opens the UI; it never prints the password.
 
@@ -426,7 +435,8 @@ reach them by name.
   package cache root, sandbox and broker), which builds each `Bay`; the
   only place that picks the backends (`sandbox.backend`,
   `tower.backend`).
-- `src/credential.rs`: `hangar credential`.
+- `src/credential.rs`: `hangar credential`, OAuth logins included.
+- `src/url.rs`: query parameters of the consent URL.
 - `src/overview.rs`: what `status`, the port summary and `vault-ui`
   report (data only).
 - `src/output.rs`: renders command results as text or `--json`, errors

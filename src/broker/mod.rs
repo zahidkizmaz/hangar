@@ -189,6 +189,32 @@ pub(crate) struct OAuthLogin {
     /// Changes whenever new tokens arrive.
     pub(crate) refreshed_at: Option<String>,
     pub(crate) error: Option<String>,
+    /// The client it logs in with, for a re-login.
+    pub(crate) client: Option<OAuthClient>,
+    /// The broker holds a client secret, which it never shows.
+    pub(crate) has_secret: bool,
+}
+
+/// The provider's endpoints and the client registered there: all public.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OAuthClient {
+    pub(crate) authorization_url: String,
+    pub(crate) token_url: String,
+    pub(crate) client_id: String,
+    /// Space-separated.
+    pub(crate) scopes: String,
+    /// How the client authenticates at the token endpoint; empty for the
+    /// broker's default.
+    pub(crate) token_auth_method: String,
+}
+
+/// What `oauth_connect` does with a client secret.
+pub(crate) enum ClientSecret {
+    /// A public client, or clear the stored secret.
+    None,
+    /// The one the broker already holds.
+    Keep,
+    New(Secret),
 }
 
 /// The broker's admin login, for `hangar vault-ui`.
@@ -215,6 +241,20 @@ pub(crate) trait Broker {
     fn credentials(&self) -> Result<Vec<StoredCredential>>;
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()>;
     fn delete_credentials(&self, keys: &[String]) -> Result<()>;
+    /// Where the provider sends the browser back after a login.
+    fn oauth_redirect_uri(&self) -> Result<String> {
+        Err(no_oauth())
+    }
+    /// Saves `client` for `key` and returns the URL where the user
+    /// consents; the broker takes the tokens at its callback.
+    fn oauth_connect(
+        &self,
+        _key: &str,
+        _client: &OAuthClient,
+        _secret: &ClientSecret,
+    ) -> Result<String> {
+        Err(no_oauth())
+    }
     /// What bay `bay` needs; mints its token the first time.
     fn access(&self, bay: &str) -> Result<Access>;
     /// Deletes the tokens it minted for bays not in `bays`; tokens it
@@ -226,6 +266,10 @@ pub(crate) trait Broker {
     fn ports(&self) -> Vec<PublishedPort>;
     /// `None` until there is a login.
     fn ui(&self) -> Result<Option<UiLogin>>;
+}
+
+fn no_oauth() -> Error {
+    Error::new("this broker can't hold OAuth credentials")
 }
 
 const RECREATE: &str = "run 'hangar destroy && hangar up' (home is kept)";

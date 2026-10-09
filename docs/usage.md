@@ -216,6 +216,41 @@ state (`set`, or for an OAuth credential whether it's connected), never
 the values; `hangar credential rm NAME` deletes one of yours. Names are
 `UPPER_SNAKE_CASE` starting with a letter, agent-vault's rule.
 
+### OAuth credentials
+
+Some APIs hand out OAuth tokens instead of a key you can paste: a login in
+your browser, then an access token that expires and a refresh token that
+renews it. The vault can hold such a credential and refresh it itself, so
+neither token ever enters a bay. Log it in once from your machine:
+
+```sh
+hangar credential login EXAMPLE_API \
+  --authorization-url https://auth.example.com/authorize \
+  --token-url https://auth.example.com/token \
+  --client-id abc123 --client-secret --scope read
+```
+
+- The client is one you registered with the provider. Register
+  `http://127.0.0.1:14321/v1/oauth/callback` as its redirect URL (your
+  `tower.agentVault.adminPort`): the provider sends your browser back to
+  the vault there. `--client-secret` reads the secret like `credential
+  set` (hidden prompt, or stdin) and gives it to the vault only.
+- hangar opens the provider's consent page (`open` or `xdg-open`, and
+  prints the URL when you're at a terminal) and waits up to 10 minutes
+  until the vault has the tokens. The page in your browser says whether it
+  worked.
+- A route injects it like any credential, e.g.
+  `{"type": "bearer", "token": "EXAMPLE_API"}` on the API's host; bays
+  get the placeholder.
+- `hangar credential login EXAMPLE_API` alone logs in again with the
+  client the vault holds (and its secret), e.g. after `credential list`
+  shows `oauth: refresh failed`. `hangar credential rm EXAMPLE_API` is
+  the logout: it deletes the tokens from the vault. Revoke the grant at the
+  provider too if you want it gone there.
+- A tower started before hangar knew its host address sends the browser
+  to an address it can't reach; `login` then refuses and says to restart
+  the tower (`hangar down && hangar up`).
+
 ## Claude Code, Codex and Paperclip
 
 All three are built-in [apps](configuration.md#built-in-apps) and bring

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use super::{
-    Access, Broker, BrokerHealth, OAuthLogin, PROXY, Policy, Route,
-    StoredCredential, UiLogin,
+    Access, Broker, BrokerHealth, ClientSecret, OAuthClient, OAuthLogin, PROXY,
+    Policy, Route, StoredCredential, UiLogin,
 };
 use crate::error::{Result, bail};
 use crate::sandbox::PublishedPort;
@@ -28,7 +28,18 @@ pub(crate) struct FakeBroker {
     pub(crate) fail_put: Cell<bool>,
     /// The port `access` names.
     pub(crate) access_port: Cell<u16>,
+    /// The URL `oauth_connect` returns instead of a consent URL that
+    /// names [`FAKE_CALLBACK`].
+    pub(crate) consent: RefCell<Option<String>>,
+    /// Whether the user finishes a login at once: `oauth_connect` stores
+    /// new tokens.
+    pub(crate) logs_in: Cell<bool>,
+    /// What the last `oauth_connect` got.
+    pub(crate) connected: Rc<RefCell<Option<(OAuthClient, &'static str)>>>,
 }
+
+pub(crate) const FAKE_CALLBACK: &str =
+    "http://127.0.0.1:14321/v1/oauth/callback";
 
 impl Default for FakeBroker {
     fn default() -> Self {
@@ -40,6 +51,9 @@ impl Default for FakeBroker {
             created: Cell::new(true),
             fail_put: Cell::new(false),
             access_port: Cell::new(14322),
+            consent: RefCell::default(),
+            logs_in: Cell::new(true),
+            connected: Rc::default(),
         }
     }
 }
@@ -107,6 +121,40 @@ impl Broker for FakeBroker {
             held.remove(key);
         }
         Ok(())
+    }
+
+    fn oauth_redirect_uri(&self) -> Result<String> {
+        Ok(FAKE_CALLBACK.into())
+    }
+
+    fn oauth_connect(
+        &self,
+        key: &str,
+        client: &OAuthClient,
+        secret: &ClientSecret,
+    ) -> Result<String> {
+        self.record(format!("oauth_connect {key}"));
+        let secret = match secret {
+            ClientSecret::None => "none",
+            ClientSecret::Keep => "keep",
+            ClientSecret::New(_) => "new",
+        };
+        *self.connected.borrow_mut() = Some((client.clone(), secret));
+        self.keys.borrow_mut().insert(key.to_string());
+        let mut oauth = self.oauth.borrow_mut();
+        let login = oauth.entry(key.to_string()).or_default();
+        login.client = Some(client.clone());
+        if self.logs_in.get() {
+            let count = login.refreshed_at.as_deref().map_or(0, str::len);
+            login.refreshed_at = Some("t".repeat(count + 1));
+            login.connected = true;
+        }
+        let consent = format!(
+            "https://auth.example/authorize?client_id={}&redirect_uri={}&state=s",
+            client.client_id,
+            FAKE_CALLBACK.replace(':', "%3A").replace('/', "%2F")
+        );
+        Ok(self.consent.borrow().clone().unwrap_or(consent))
     }
 
     fn retain_bays(&self, bays: &[String]) -> Result<()> {

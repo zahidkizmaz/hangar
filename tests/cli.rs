@@ -1702,6 +1702,94 @@ fn user_credentials_go_to_the_vault_only_and_survive_up() {
 }
 
 #[test]
+fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
+    let machine = Machine::new("oauth-login");
+    machine.install_fake_msb();
+    let vault = FakeVault::start(&machine.fake);
+    let config = machine.config(&vault_config(vault.port, "", ""));
+    ok(&run(&machine, &config, &["up"]));
+    machine.script("open", r#"echo "$*" >>"$HANGAR_FAKE/opened""#);
+
+    let secret = "client-secret-value";
+    let login = [
+        "credential",
+        "login",
+        "JIRA",
+        "--authorization-url",
+        "https://auth.example/authorize",
+        "--token-url",
+        "https://auth.example/token",
+        "--client-id",
+        "c1",
+        "--client-secret",
+        "--scope",
+        "read:jira-work",
+        "--scope",
+        "offline_access",
+    ];
+    let output =
+        run_with_stdin(&machine, &config, &login, &format!("{secret}\n"));
+    assert_eq!(
+        stderr(ok(&output)),
+        "==> waiting for the login in your browser\n==> logged in JIRA\n"
+    );
+    let opened = machine.fake_file("opened");
+    let callback = format!(
+        "redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fv1%2Foauth%2Fcallback",
+        vault.port
+    );
+    assert!(
+        opened.starts_with("https://auth.example/authorize?client_id=c1&")
+            && opened.contains(&callback),
+        "{opened}"
+    );
+    let connects = || -> Vec<String> {
+        vault
+            .admin_requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/credentials/oauth/connect")
+            .map(|r| r.body)
+            .collect()
+    };
+    assert_eq!(connects().len(), 1);
+    assert!(connects()[0].contains(&format!(r#""client_secret":"{secret}""#)));
+    assert!(
+        connects()[0].contains(r#""scopes":"read:jira-work offline_access""#)
+    );
+    let list = ["credential", "list"];
+    let listed = stdout(ok(&run(&machine, &config, &list)));
+    assert_eq!(listed, "JIRA\tuser\toauth: connected\n");
+
+    // Again with the client the vault holds, keeping its secret.
+    ok(&run(&machine, &config, &["credential", "login", "JIRA"]));
+    assert_eq!(connects().len(), 2);
+    assert!(connects()[1].contains(r#""client_secret":"••••••••""#));
+    assert!(connects()[1].contains(r#""client_id":"c1""#));
+
+    let set = ["credential", "set", "JIRA"];
+    let error = failed(&run_with_stdin(&machine, &config, &set, "x\n"));
+    assert!(
+        error.contains("run 'hangar credential login JIRA'"),
+        "{error}"
+    );
+    ok(&run(&machine, &config, &["credential", "rm", "JIRA"]));
+    assert_eq!(stdout(ok(&run(&machine, &config, &list))), "");
+
+    let set = ["credential", "set", "PLAIN"];
+    ok(&run_with_stdin(&machine, &config, &set, "value\n"));
+    let mut plain = login;
+    plain[2] = "PLAIN";
+    let error = failed(&run_with_stdin(&machine, &config, &plain, "x\n"));
+    assert!(error.contains("PLAIN holds a static value"), "{error}");
+    let partial = ["credential", "login", "JIRA", "--token-url", "https://t"];
+    let error = usage_error(&run(&machine, &config, &partial));
+    assert!(error.contains("--authorization-url"), "{error}");
+    let again = ["credential", "login", "NEW"];
+    let error = failed(&run(&machine, &config, &again));
+    assert!(error.contains("NEW has no OAuth client"), "{error}");
+}
+
+#[test]
 fn credential_commands_check_names_and_need_a_running_vault() {
     let machine = Machine::new("credential-down");
     machine.install_fake_msb();
@@ -1877,11 +1965,35 @@ fn no_secret_reaches_any_log_level() {
     let output = run_with_stdin(&machine, &config, &set, value);
     printed.push_str(&stderr(ok(&output)));
     printed.push_str(&stdout(&output));
+    let client_secret = "oauth-client-secret-value";
+    let login = [
+        "-vv",
+        "credential",
+        "login",
+        "APP",
+        "--authorization-url",
+        "https://auth.example/authorize",
+        "--token-url",
+        "https://auth.example/token",
+        "--client-id",
+        "c1",
+        "--client-secret",
+    ];
+    let output = run_with_stdin(&machine, &config, &login, client_secret);
+    printed.push_str(&stderr(ok(&output)));
+    printed.push_str(&stdout(&output));
 
     assert!(printed.contains("trace: vault "), "trace was off");
     let owner = read(machine.state.join("owner-password"));
     let agent_token = read(machine.state.join("agent-tokens/default"));
-    for secret in [PASSWORD, GITHUB_TOKEN, value, &owner, &agent_token] {
+    for secret in [
+        PASSWORD,
+        GITHUB_TOKEN,
+        value,
+        client_secret,
+        &owner,
+        &agent_token,
+    ] {
         assert!(!printed.contains(secret.trim()), "secret in the logs");
     }
 }
@@ -2213,6 +2325,7 @@ fn every_command_has_help_with_examples() {
         (&["credential", "set"], "< token.txt"),
         (&["credential", "list"], "credential list --json"),
         (&["credential", "rm"], "hangar credential rm"),
+        (&["credential", "login"], "--client-secret --scope read"),
         (&["destroy"], "hangar destroy --state --yes"),
     ] {
         let mut args = command.to_vec();

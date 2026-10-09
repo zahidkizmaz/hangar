@@ -27,6 +27,7 @@ mod secret;
 mod state;
 #[cfg(test)]
 mod testing;
+mod url;
 mod vm_record;
 
 use std::io::{self, IsTerminal};
@@ -235,7 +236,36 @@ enum CredentialCommand {
     #[command(after_help = "Examples:\n  hangar credential list\n  \
                             hangar credential list --json | jq -r '.[].name'")]
     List,
-    /// Delete a credential you stored
+    /// Log an OAuth credential in from your browser; the vault keeps and
+    /// refreshes its tokens
+    #[command(after_help = "Without the endpoint flags, logs in again with \
+                            the client the vault holds.\n\n\
+                            Examples:\n  \
+                            hangar credential login EXAMPLE_API \\\n    \
+                            --authorization-url https://auth.example.com/authorize \\\n    \
+                            --token-url https://auth.example.com/token \\\n    \
+                            --client-id abc123 --client-secret --scope read\n  \
+                            hangar credential login EXAMPLE_API")]
+    Login {
+        /// UPPER_SNAKE_CASE, the name a route injects
+        name: String,
+        /// The provider's authorization endpoint
+        #[arg(long, value_name = "URL", requires_all = ["token_url", "client_id"])]
+        authorization_url: Option<String>,
+        /// The provider's token endpoint
+        #[arg(long, value_name = "URL", requires_all = ["authorization_url", "client_id"])]
+        token_url: Option<String>,
+        /// The client you registered with the provider
+        #[arg(long, value_name = "ID", requires_all = ["authorization_url", "token_url"])]
+        client_id: Option<String>,
+        /// Read the client's secret (hidden prompt, or stdin)
+        #[arg(long, requires = "client_id")]
+        client_secret: bool,
+        /// A scope to ask for; repeat for several
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scopes: Vec<String>,
+    },
+    /// Delete a credential you stored (for an OAuth one, its login)
     #[command(after_help = "Example:\n  hangar credential rm GITHUB_TOKEN")]
     Rm {
         /// The credential to delete
@@ -335,6 +365,26 @@ fn run(command: Command) -> Result<Outcome> {
             CredentialCommand::List => {
                 Outcome::Credentials(credential::list(&hangar)?)
             }
+            CredentialCommand::Login {
+                name,
+                authorization_url,
+                token_url,
+                client_id,
+                client_secret,
+                scopes,
+            } => {
+                let endpoints = credential::Endpoints::from_flags(
+                    authorization_url,
+                    token_url,
+                    client_id,
+                );
+                let args = credential::LoginArgs {
+                    endpoints,
+                    scopes,
+                    client_secret,
+                };
+                done(login(&hangar, &name, args))?
+            }
             CredentialCommand::Rm { name } => {
                 done(credential::remove(&hangar, &name))?
             }
@@ -346,7 +396,7 @@ fn run(command: Command) -> Result<Outcome> {
 }
 
 impl Command {
-    /// `credential set` locks itself, after its hidden prompt.
+    /// `credential set` and `login` lock themselves, after their prompts.
     fn changes_state(&self) -> bool {
         matches!(
             self,
@@ -358,6 +408,26 @@ impl Command {
                 | Self::Credential(CredentialCommand::Rm { .. })
         )
     }
+}
+
+/// Holds the lock only while the vault changes, not for the prompts or
+/// the browser.
+fn login(
+    hangar: &Hangar,
+    name: &str,
+    args: credential::LoginArgs,
+) -> Result<()> {
+    let login = credential::prepare_login(hangar, name, args)?;
+    let consent = {
+        let _lock = hold_lock()?;
+        credential::connect(hangar, &login)?
+    };
+    credential::finish_login(
+        hangar,
+        &login,
+        &consent,
+        &commands::open_in_browser,
+    )
 }
 
 fn hold_lock() -> Result<lock::Lock> {
