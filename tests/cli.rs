@@ -742,6 +742,27 @@ fn a_credential_file_no_route_uses_is_warned_about() {
 }
 
 #[test]
+fn a_path_scope_another_route_undoes_is_warned_about() {
+    let machine = Machine::new("uncovered-scope");
+    machine.install_fake_msb();
+    let vault = FakeVault::start(&machine.fake);
+    let routes = r#", "routes": [
+        {"name": "mcp", "host": "mcp.example.com/v1/mcp",
+         "auth": {"type": "bearer", "token": "MCP"}},
+        {"name": "mcp-all", "host": "mcp.example.com",
+         "auth": {"type": "passthrough"}}]"#;
+    let config = machine.config(&tower_config(vault.port, routes, "", ""));
+    let status = stderr(&run(&machine, &config, &["status"]));
+    assert!(
+        status.contains(
+            "warning: route mcp is scoped to a path, but route mcp-all lets \
+             bays reach its whole host\n"
+        ),
+        "{status}"
+    );
+}
+
+#[test]
 fn zero_routes_still_deny_and_send_an_empty_set() {
     let machine = Machine::new("no-routes");
     machine.install_fake_msb();

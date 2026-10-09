@@ -53,6 +53,12 @@ impl Hangar {
         for route in settings.routes.values() {
             broker.validate(route).context(&invalid)?;
         }
+        for (scoped, whole) in config::uncovered_path_scopes(&settings) {
+            log::warn!(
+                "route {scoped} is scoped to a path, but route {whole} lets \
+                 bays reach its whole host"
+            );
+        }
         for key in config::unused_credential_files(&settings) {
             log::warn!("credentialFiles {key} is used by no route");
         }

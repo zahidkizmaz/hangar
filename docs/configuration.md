@@ -209,6 +209,14 @@ Wildcards match one label only (`*.docker.io` doesn't match
 `a.b.docker.io`). See agent-vault's docs for every auth type and for
 path-scoped hosts (`api.example.com/v1/*`).
 
+A path-scoped host lets the bays reach only those paths, and the vault
+answers `403` for the rest of that host (an MCP server's route keeps the
+bays off its provider's `/register` and `/token`, see
+[MCP servers](usage.md#mcp-servers)). That holds only while no other
+route covers the whole host: hangar warns when a bare host or a `*.`
+wildcard does (`route NAME is scoped to a path, but route OTHER lets bays
+reach its whole host`).
+
 A route can't take the name of a route an app brings, and two routes can't
 share a host. To use your own auth on a host an app routes (say a private
 npm token), leave that app out and add your own route under another name,

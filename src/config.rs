@@ -347,6 +347,49 @@ pub(crate) fn unused_credential_files(settings: &Settings) -> Vec<String> {
         .collect()
 }
 
+/// Path-scoped routes (`host/path`) that another route covers whole: the
+/// scope then keeps nothing out. Pairs of (scoped, covering) names.
+pub(crate) fn uncovered_path_scopes(
+    settings: &Settings,
+) -> Vec<(String, String)> {
+    let routes = settings.routes.values();
+    let scoped = routes.clone().filter_map(|route| {
+        let (host, _) = route.host.split_once('/')?;
+        Some((route, host))
+    });
+    scoped
+        .flat_map(|(route, host)| {
+            routes
+                .clone()
+                .filter(move |whole| covers(&whole.host, host))
+                .map(|whole| (route.name.clone(), whole.name.clone()))
+        })
+        .collect()
+}
+
+/// Whether route host `whole` (no path) matches every request to `host`:
+/// the same name, or a `*.` wildcard one label up, on any port unless it
+/// names one.
+fn covers(whole: &str, host: &str) -> bool {
+    if whole.contains('/') {
+        return false;
+    }
+    let split = |host: &str| {
+        let (name, port) = host.split_once(':').unwrap_or((host, ""));
+        (name.to_ascii_lowercase(), port.to_string())
+    };
+    let ((whole_name, whole_port), (name, port)) = (split(whole), split(host));
+    if !whole_port.is_empty() && whole_port != port {
+        return false;
+    }
+    let one_label_below = |suffix: &str| {
+        name.strip_suffix(suffix)
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    };
+    whole_name == name
+        || whole_name.strip_prefix('*').is_some_and(one_label_below)
+}
+
 pub(crate) fn state_dir(settings: &Settings, var: Var) -> Result<PathBuf> {
     if let Some(dir) = var("HANGAR_STATE_DIR") {
         return Ok(dir.into());
@@ -1098,6 +1141,51 @@ mod tests {
             unused_credential_files(&resolve_with(&app("GIT_USER"))),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn a_path_scope_another_route_covers_whole_is_found() {
+        let routes = |hosts: &[&str]| {
+            let routes: Vec<String> = hosts
+                .iter()
+                .enumerate()
+                .map(|(index, host)| {
+                    format!(
+                        r#"{{"name": "r{index}", "host": "{host}",
+                             "auth": {{"type": "passthrough"}}}}"#
+                    )
+                })
+                .collect();
+            let config =
+                format!(r#"{{"tower": {{"routes": [{}]}}}}"#, routes.join(","));
+            uncovered_path_scopes(&resolve_with(&config))
+        };
+        let pair = |scoped: &str, whole: &str| (scoped.into(), whole.into());
+        assert_eq!(
+            routes(&["mcp.example.com/v1/mcp", "mcp.example.com"]),
+            [pair("r0", "r1")]
+        );
+        assert_eq!(
+            routes(&[
+                "mcp.example.com/v1/*",
+                "*.example.com",
+                "x.mcp.example.com"
+            ]),
+            [pair("r0", "r1")]
+        );
+        assert_eq!(
+            routes(&["MCP.example.com:8443/v1", "mcp.example.com:8443"]),
+            [pair("r0", "r1")]
+        );
+        for alone in [
+            &["mcp.example.com/v1/mcp", "mcp.example.com/v2/*"][..],
+            &["mcp.example.com/v1", "mcp.example.com:8443"],
+            &["mcp.example.com/v1", "*.mcp.example.com"],
+            &["a.mcp.example.com/v1", "*.example.com"],
+            &["mcp.example.com/v1", "example.com"],
+        ] {
+            assert_eq!(routes(alone), Vec::new(), "{alone:?}");
+        }
     }
 
     #[test]
