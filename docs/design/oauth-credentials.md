@@ -1,7 +1,7 @@
 # Design: OAuth credentials in the tower
 
-Status: accepted after review round 1. Implemented in four steps
-(below). Main use: remote MCP servers.
+Status: implemented (the four steps below), after review round 1. Main
+use: remote MCP servers. The Atlassian spike runs after merge.
 
 Adding an MCP server to a bay takes three manual steps today: a
 credential in the vault, a route in `tower.routes`, and the server in each
@@ -282,14 +282,15 @@ stays in the core (`src/oauth.rs`). Only what touches stored credentials
 goes behind the trait:
 
 ```rust
-pub(crate) struct OAuthClient {
+pub(crate) struct OAuthClient {             // all public
     pub(crate) authorization_url: String,
     pub(crate) token_url: String,
     pub(crate) client_id: String,
-    pub(crate) secret: ClientSecret,        // None | Keep | New(Secret)
     pub(crate) scopes: String,              // space-separated
-    pub(crate) token_auth_method: String,   // "client_secret_post" default
+    pub(crate) token_auth_method: String,   // empty: the broker's default
 }
+
+pub(crate) enum ClientSecret { None, Keep, New(Secret) }
 
 pub(crate) struct StoredCredential {
     pub(crate) key: String,
@@ -300,16 +301,17 @@ pub(crate) struct OAuthLogin {
     pub(crate) connected: bool,
     pub(crate) refreshed_at: Option<String>,
     pub(crate) error: Option<String>,
-    pub(crate) client: Option<OAuthClient>, // secret: Keep or None
+    pub(crate) client: Option<OAuthClient>,
+    pub(crate) has_secret: bool,            // the vault shows only a mask
 }
 
 trait Broker {
     // replaces credential_keys()
     fn credentials(&self) -> Result<Vec<StoredCredential>>;
-    // default: bail "this broker can't hold OAuth credentials"
+    // both default to "this broker can't hold OAuth credentials"
     fn oauth_redirect_uri(&self) -> Result<String>;
-    fn oauth_connect(&self, key: &str, client: &OAuthClient)
-        -> Result<String>;
+    fn oauth_connect(&self, key: &str, client: &OAuthClient,
+                     secret: &ClientSecret) -> Result<String>;
 }
 ```
 
