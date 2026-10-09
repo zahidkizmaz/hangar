@@ -38,12 +38,13 @@ const VAULT: &str = "default";
 // server is started on every boot, in the background, which needs a shell
 // inside the VM. A stale PID file from an unclean stop would block it. The
 // password arrives on stdin and is piped on, never written or put on a
-// command line.
+// command line. AGENT_VAULT_ADDR is the address the host's browser reaches
+// it on; without it, OAuth callbacks would point at 0.0.0.0.
 const START_SERVER: &str = r#"IFS= read -r password
 [ -n "$password" ] || exit 1
 rm -f /data/.agent-vault/agent-vault.pid
-printf "%s\n" "$password" | setsid agent-vault server --host 0.0.0.0 \
-  --port "$1" --password-stdin >/data/server.log 2>&1 &"#;
+printf "%s\n" "$password" | AGENT_VAULT_ADDR="$2" setsid agent-vault server \
+  --host 0.0.0.0 --port "$1" --password-stdin >/data/server.log 2>&1 &"#;
 
 pub(crate) struct AgentVault {
     sandbox: Rc<dyn Sandbox>,
@@ -103,6 +104,22 @@ impl AgentVault {
     /// on stdin into its proxy env.
     fn agent_token(&self, bay: &str) -> PathBuf {
         self.agent_tokens().join(bay)
+    }
+
+    /// The vault UI as the host's browser reaches it.
+    fn host_address(&self) -> String {
+        format!("http://127.0.0.1:{}", self.admin_port)
+    }
+
+    fn start_server_args(&self) -> [String; 6] {
+        [
+            "sh".into(),
+            "-c".into(),
+            START_SERVER.into(),
+            "hangar-vault".into(),
+            ADMIN_PORT.to_string(),
+            self.host_address(),
+        ]
     }
 
     fn healthy(&self) -> bool {
@@ -276,8 +293,8 @@ impl Broker for AgentVault {
         }
         if !self.healthy() {
             let stdin = format!("{}\n", password.expose());
-            let port = ADMIN_PORT.to_string();
-            let start = ["sh", "-c", START_SERVER, "hangar-vault", &port];
+            let start = self.start_server_args();
+            let start: Vec<&str> = start.iter().map(String::as_str).collect();
             self.exec(&start, Some(stdin.as_bytes()))?;
         }
         if !self.wait_healthy(30, Duration::from_secs(1)) {
@@ -404,7 +421,7 @@ impl Broker for AgentVault {
             return Ok(None);
         };
         Ok(Some(UiLogin {
-            url: format!("http://127.0.0.1:{}", self.admin_port),
+            url: self.host_address(),
             login: OWNER_EMAIL.into(),
             password: Secret::new(password),
             password_file: file,
@@ -707,6 +724,20 @@ mod tests {
         let vault =
             agent_vault(&config, &state, Rc::new(FakeSandbox::default()));
         assert!(vault.wait_healthy(3, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn the_server_learns_the_address_the_host_reaches_it_on() {
+        let state = scratch_dir("agent-vault-addr");
+        let config = r#"{"tower": {"agentVault": {"adminPort": 14421}}}"#;
+        let vault =
+            agent_vault(config, &state, Rc::new(FakeSandbox::default()));
+        let args = vault.start_server_args();
+        assert_eq!(
+            args[3..],
+            ["hangar-vault", "14321", "http://127.0.0.1:14421"]
+        );
+        assert!(args[2].contains(r#"AGENT_VAULT_ADDR="$2""#));
     }
 
     #[test]
