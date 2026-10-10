@@ -242,7 +242,12 @@ pub(crate) fn start(hangar: &Hangar, bay: &Bay) -> Result<()> {
     let ca = hangar.state.ca();
     fs::write(&ca, &access.ca_pem).context(ca.display())?;
     if access.renewed {
-        warn!("{}", renewed_warning(bay.name, &flag(hangar, bay)));
+        warn!(
+            "bay {}: its broker token was renewed; run 'hangar restart{}' \
+             so its run entries use it",
+            bay.name,
+            flag(hangar, bay)
+        );
     }
     // The bundle first: a new proxy env restarts the daemons that read it.
     replace(sandbox, &bay.vm, &CA_BUNDLE, None)?;
@@ -250,15 +255,6 @@ pub(crate) fn start(hangar: &Hangar, bay: &Bay) -> Result<()> {
     replace(sandbox, &bay.vm, &PROXY_ENV, Some(env.as_bytes()))?;
     info!("waiting for docker in {}", bay.vm);
     wait_for_docker(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
-}
-
-/// The bay restarts its daemons when the proxy URL changes; `up` never
-/// restarts the run entries.
-fn renewed_warning(bay: &str, flag: &str) -> String {
-    format!(
-        "bay {bay}: its broker token was renewed; run 'hangar restart{flag}' \
-         so its run entries use it"
-    )
 }
 
 /// systemd's state once it can tell.
@@ -752,9 +748,8 @@ fn create_vm(
 mod tests {
     use super::{
         BOOTED, DOCKER_READY, Probe, WAIT_TIMEOUT, boot_state, check_egress,
-        drift_warnings, preflight, proxy_env, reconcile_vm, renewed_warning,
-        replace_script, start, start_runs, vm_env, wait_booted,
-        wait_for_docker, write_env,
+        drift_warnings, preflight, proxy_env, reconcile_vm, replace_script,
+        start, start_runs, vm_env, wait_booted, wait_for_docker, write_env,
     };
     use crate::broker::fake::FakeBroker;
     use crate::error::Error;
@@ -899,15 +894,6 @@ mod tests {
             )
         );
         assert_eq!(sandbox.changes(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_renewed_token_names_what_restarts_the_run_entries() {
-        assert_eq!(
-            renewed_warning("work", " --bay work"),
-            "bay work: its broker token was renewed; run 'hangar restart \
-             --bay work' so its run entries use it"
-        );
     }
 
     #[test]

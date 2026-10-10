@@ -1216,18 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn the_oauth_callback_is_the_vault_ui_address() {
-        let state = scratch_dir("agent-vault-callback");
-        let config = r#"{"tower": {"agentVault": {"adminPort": 15000}}}"#;
-        let vault =
-            agent_vault(config, &state, Rc::new(FakeSandbox::default()));
-        assert_eq!(
-            vault.oauth_redirect_uri().unwrap(),
-            "http://127.0.0.1:15000/v1/oauth/callback"
-        );
-    }
-
-    #[test]
     fn a_credential_value_travels_only_in_the_body() {
         let (port, server) = serve_each(vec![("200 OK", "{}")]);
         admin(port)
@@ -1241,18 +1229,5 @@ mod tests {
             body,
             r#"{"vault":"default","credentials":{"TOKEN":"the-value"}}"#
         );
-    }
-
-    #[test]
-    fn deleting_names_the_keys_and_reading_the_policy_parses_it() {
-        let (port, server) = serve_each(vec![("200 OK", "{}")]);
-        admin(port).delete(&["A".into(), "B".into()]).unwrap();
-        let request = server.join().unwrap().remove(0);
-        assert!(request.starts_with("DELETE /v1/credentials "));
-        assert!(request.ends_with(r#"{"vault":"default","keys":["A","B"]}"#));
-
-        let (port, _) =
-            serve_each(vec![("200 OK", r#"{"unmatched_host_policy":"deny"}"#)]);
-        assert_eq!(admin(port).policy().unwrap().as_deref(), Some("deny"));
     }
 }

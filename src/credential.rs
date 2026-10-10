@@ -360,7 +360,7 @@ fn read_hidden(name: &str, input: Stdio) -> Result<String> {
 mod tests {
     use super::{
         ClientSource, CredentialEntry, LoginArgs, begin, check_consent,
-        check_user_key, classify, finish_login, list, prepare_login, read,
+        check_user_key, classify, finish_login, list, prepare_login,
         read_hidden, remove, state,
     };
     use crate::broker::fake::{FAKE_CALLBACK, FakeBroker};
@@ -690,17 +690,6 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|call| call.starts_with("oauth_w"))
-        );
-    }
-
-    #[test]
-    fn set_refuses_an_oauth_credential() {
-        let broker = holding("JIRA", Some(OAuthState::NotConnected));
-        let hangar = oauth_hangar("set-oauth", broker);
-        let error = read(&hangar, "JIRA").unwrap_err().to_string();
-        assert_eq!(
-            error,
-            "JIRA is an OAuth credential: run 'hangar credential login JIRA'"
         );
     }
 

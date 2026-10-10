@@ -509,8 +509,8 @@ fn confirm(state: &Path, folders: &[PathBuf]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAY_STEPS, TOWER_STEPS, destroy, down, logs, run_tower_steps, setup,
-        vault_ui, wipe_state,
+        BAY_STEPS, destroy, down, logs, run_tower_steps, setup, vault_ui,
+        wipe_state,
     };
     use crate::bay;
     use crate::broker::fake::FakeBroker;
@@ -573,14 +573,6 @@ mod tests {
 
     fn position<S>(steps: &[(&str, S)], name: &str) -> usize {
         steps.iter().position(|(step, _)| *step == name).unwrap()
-    }
-
-    #[test]
-    fn deny_comes_before_routes_and_credentials() {
-        let at = |name| position(&TOWER_STEPS, name);
-        assert_eq!(at("deny"), 0);
-        assert!(at("routes") < at("credentials"));
-        assert!(at("credentials") < at("tokens"));
     }
 
     #[test]

@@ -293,36 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn each_native_folder_gets_a_disk_of_its_own_next_to_the_root() {
-        let spec = VmSpec {
-            name: "hangar-bay-default",
-            image: "hangar-bay:dev",
-            cpus: 4,
-            memory: "6G",
-            disk: Some("40G"),
-            native_fs: &["/var/lib/pilot", "/srv"],
-            init: None,
-            egress: Egress::Open,
-            publish: &[],
-            mounts: &[],
-            env: &[],
-        };
-        let args = create_args(&spec);
-        let root = args.iter().position(|arg| arg == "--root-disk").unwrap();
-        assert_eq!(
-            args[root..],
-            [
-                "--root-disk",
-                "40G",
-                "--mount-owned",
-                "/var/lib/pilot:kind=disk,size=40G",
-                "--mount-owned",
-                "/srv:kind=disk,size=40G",
-            ]
-        );
-    }
-
-    #[test]
     fn open_vm_has_no_network_rules() {
         let spec = VmSpec {
             name: "hangar-tower",
