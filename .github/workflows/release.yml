@@ -31,14 +31,12 @@ jobs:
       - run: rustup target add "$RUST_TARGET"
       - run: cargo build --release --locked --target "$RUST_TARGET"
       - run: cp "target/$RUST_TARGET/release/hangar" "hangar-$TARGET"
-      # Only debug builds may take the CLI tests' fake keychain and curl.
+      # Only debug builds may take the CLI tests' fake keychain.
       - run: |
-          for name in HANGAR_TEST_KEYCHAIN_TOOL HANGAR_TEST_CURL; do
-            if grep -q "$name" "hangar-$TARGET"; then
-              echo "release binary reads $name" >&2
-              exit 1
-            fi
-          done
+          if grep -q HANGAR_TEST_KEYCHAIN_TOOL "hangar-$TARGET"; then
+            echo "release binary reads HANGAR_TEST_KEYCHAIN_TOOL" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hangar-${{ matrix.target }}

@@ -4,7 +4,6 @@
   stdenv,
   rustPlatform,
   libsecret,
-  curl,
 }:
 let
   cargo = lib.importTOML ../Cargo.toml;
@@ -33,24 +32,17 @@ rustPlatform.buildRustPackage {
   # would call the real keychain.
   checkType = "debug";
 
-  # The keychain tool and curl are called by these absolute paths, never
-  # via PATH. curl is baked in on every system, so the package doesn't
-  # depend on the host's.
-  env = {
-    HANGAR_CURL = "${curl}/bin/curl";
-  }
-  // lib.optionalAttrs stdenv.hostPlatform.isLinux {
+  # The keychain tool is called by this absolute path, never via PATH.
+  env = lib.optionalAttrs stdenv.hostPlatform.isLinux {
     HANGAR_SECRET_TOOL = "${libsecret}/bin/secret-tool";
   };
 
-  # No release build may honor the tests' keychain or curl redirect.
+  # No release build may honor the tests' keychain redirect.
   postInstall = ''
-    for name in HANGAR_TEST_KEYCHAIN_TOOL HANGAR_TEST_CURL; do
-      if grep -q "$name" $out/bin/hangar; then
-        echo "release binary reads $name" >&2
-        exit 1
-      fi
-    done
+    if grep -q HANGAR_TEST_KEYCHAIN_TOOL $out/bin/hangar; then
+      echo "release binary reads HANGAR_TEST_KEYCHAIN_TOOL" >&2
+      exit 1
+    fi
   '';
 
   meta = {

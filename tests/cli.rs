@@ -1813,82 +1813,16 @@ fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
     assert!(error.contains("NEW has no OAuth client"), "{error}");
 }
 
-/// A provider answering curl: metadata at the origin (no resource
-/// metadata), and a registration that logs its request body.
-const FAKE_PROVIDER: &str = r#"echo "$*" >>"$HANGAR_FAKE/curl.log"
-url= previous=
-for arg; do
-  [ "$previous" = --url ] && url=$arg
-  previous=$arg
-done
-case $url in
-*/.well-known/oauth-authorization-server)
-  printf '%s\n200' '{"issuer":"https://mcp.example.com","authorization_endpoint":"https://mcp.example.com/authorize","token_endpoint":"https://mcp.example.com/token","registration_endpoint":"https://mcp.example.com/register","token_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"]}' ;;
-*/register)
-  cat >"$HANGAR_FAKE/registration"
-  printf '%s\n201' '{"client_id":"dyn-1","registration_access_token":"rat-value"}' ;;
-*) printf 'Not Found\n404' ;;
-esac"#;
-
 #[test]
-fn a_login_with_a_url_finds_the_provider_and_registers_hangar() {
+fn a_login_with_a_url_fetches_nothing_from_a_private_host() {
     let machine = Machine::new("oauth-discover");
     machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&run(&machine, &config, &["up"]));
-    machine.script("open", r#"echo "$*" >>"$HANGAR_FAKE/opened""#);
-    machine.script("curl", FAKE_PROVIDER);
-
-    let login = [
-        "-vv",
-        "credential",
-        "login",
-        "MCP",
-        "https://mcp.example.com/mcp",
-    ];
-    let output = run(&machine, &config, &login);
-    let printed = stderr(ok(&output));
-    assert!(
-        printed.contains("registered hangar as OAuth client dyn-1"),
-        "{printed}"
-    );
-    assert!(!printed.contains("rat-value"), "{printed}");
-    let curl = machine.fake_file("curl.log");
-    assert!(curl.starts_with("-q "), "{curl}");
-    assert!(!curl.contains("redirect_uris"), "body in argv: {curl}");
-    let callback = format!("http://127.0.0.1:{}/v1/oauth/callback", vault.port);
-    let registration = machine.fake_file("registration");
-    assert!(registration.contains(&callback), "{registration}");
-    assert!(registration.contains(r#""token_endpoint_auth_method":"none""#));
-    let connect = vault
-        .admin_requests()
-        .into_iter()
-        .find(|r| r.path == "/v1/credentials/oauth/connect")
-        .unwrap();
-    assert!(
-        connect.body.contains(r#""client_id":"dyn-1""#),
-        "{}",
-        connect.body
-    );
-    assert!(!connect.body.contains("client_secret"), "{}", connect.body);
-    let opened = machine.fake_file("opened");
-    assert!(
-        opened.starts_with("https://mcp.example.com/authorize?"),
-        "{opened}"
-    );
-    let list = stdout(ok(&run(&machine, &config, &["credential", "list"])));
-    assert_eq!(list, "MCP\tuser\toauth: connected\n");
-
-    // Without curl, or without a public host, nothing is fetched.
-    machine.script("curl", "exit 7");
     let local = ["credential", "login", "MCP", "https://localhost/mcp"];
     let error = failed(&run(&machine, &config, &local));
     assert!(error.contains("expected a public host name"), "{error}");
-    let offline = ["credential", "login", "MCP", "https://mcp.example.com/mcp"];
-    assert!(
-        failed(&run(&machine, &config, &offline)).contains("mcp.example.com")
-    );
     let both = [
         "credential",
         "login",

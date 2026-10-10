@@ -12,7 +12,6 @@ mod error;
 mod files;
 mod hangar;
 mod http;
-mod https;
 mod json;
 mod keychain;
 mod lock;
@@ -430,7 +429,7 @@ fn login(
     name: &str,
     args: credential::LoginArgs,
 ) -> Result<()> {
-    let https = https::Curl::new();
+    let https = http::https();
     let login = credential::prepare_login(hangar, &https, name, args)?;
     let consent = {
         let _lock = hold_lock()?;

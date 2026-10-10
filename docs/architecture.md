@@ -341,10 +341,9 @@ an error. `status` shows a stopped entry of an app with a setup as
   resource metadata, else RFC 8414 or OpenID metadata at the issuer,
   checking issuer and resource) and registers hangar as a public client
   (RFC 7591, `none` only) with `Broker::oauth_redirect_uri`; it fetches
-  through host curl (`src/https.rs`) and only `https` URLs with public
-  host names. `Broker::oauth_connect` saves the client (a re-login sends
-  the broker's keep-marker for a stored secret) and returns the consent
-  URL. hangar opens it only when it's https and its `redirect_uri` is
+  only `https` URLs with public host names. `Broker::oauth_connect` saves
+  the client (a re-login sends the broker's keep-marker for a stored
+  secret) and returns the consent URL. hangar opens it only when it's https and its `redirect_uri` is
   `Broker::oauth_redirect_uri` (a tower from before `AGENT_VAULT_ADDR`
   would send the browser to `0.0.0.0`). It then polls
   `Broker::credentials` until the credential's refresh time changes, no
@@ -442,8 +441,7 @@ reach them by name.
   `tower.backend`).
 - `src/credential.rs`: `hangar credential`, OAuth logins included.
 - `src/url.rs`: query parameters (the consent URL's, `resource=`).
-- `src/oauth.rs`: provider discovery and client registration;
-  `src/https.rs`: HTTPS through the host's curl (`Https`, `Curl`).
+- `src/oauth.rs`: provider discovery and client registration.
 - `src/overview.rs`: what `status`, the port summary and `vault-ui`
   report (data only).
 - `src/output.rs`: renders command results as text or `--json`, errors
@@ -476,7 +474,7 @@ reach them by name.
 - `src/state.rs`: the `stateDir` layout (`StateDir`, one method per file)
   and `write_private` for owner-only files.
 - `src/process.rs`: child processes (strips `HANGAR_MASTER_PASSWORD`).
-- `src/http.rs`: minimal HTTP/1.1 client for the admin API.
+- `src/http.rs`: HTTP through ureq: the admin API and the providers.
 - `src/secret.rs`: `Secret` (redacting `Debug`, no `Display`),
   `random_hex` and `find_secret`, the scan `env` and `files`
   share.

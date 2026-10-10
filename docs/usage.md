@@ -55,10 +55,8 @@ On NixOS or nix-darwin, use the module: it installs hangar and
 microsandbox (see [nix.md](nix.md)).
 
 Otherwise you need [microsandbox](https://microsandbox.dev) (`msb`). On
-Linux you also need access to `/dev/kvm`. hangar itself is a single binary;
-only `hangar credential login NAME URL` needs `curl` at `/usr/bin/curl`
-(macOS ships it, most Linux distributions install it; the Nix package
-brings its own).
+Linux you also need access to `/dev/kvm`. hangar itself is a single binary
+with no runtime dependencies.
 
 ```sh
 brew install superradcompany/tap/microsandbox # or see microsandbox.dev

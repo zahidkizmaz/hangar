@@ -49,9 +49,16 @@ fn line(level: Level, message: &str, color: bool) -> String {
     }
 }
 
+/// Trap: ureq and rustls log too, and their lines may name a request's
+/// headers; only hangar's own reach stderr.
+fn ours(metadata: &Metadata) -> bool {
+    let target = metadata.target();
+    target == "hangar" || target.starts_with("hangar::")
+}
+
 impl Log for Stderr {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= log::max_level()
+        metadata.level() <= log::max_level() && ours(metadata)
     }
 
     fn log(&self, record: &Record) {
@@ -68,8 +75,8 @@ impl Log for Stderr {
 
 #[cfg(test)]
 mod tests {
-    use super::{level, line};
-    use log::{Level, LevelFilter};
+    use super::{level, line, ours};
+    use log::{Level, LevelFilter, Metadata};
 
     #[test]
     fn flags_win_over_the_environment() {
@@ -79,6 +86,15 @@ mod tests {
         assert_eq!(level(true, 2, Some("trace")), LevelFilter::Error);
         assert_eq!(level(false, 1, Some("error")), LevelFilter::Debug);
         assert_eq!(level(false, 3, None), LevelFilter::Trace);
+    }
+
+    #[test]
+    fn only_hangar_logs() {
+        let target = |target| ours(&Metadata::builder().target(target).build());
+        assert!(target("hangar") && target("hangar::http"));
+        assert!(
+            !target("ureq::run") && !target("rustls") && !target("hangarx")
+        );
     }
 
     #[test]

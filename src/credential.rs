@@ -13,7 +13,7 @@ use crate::broker::{
 use crate::config::{Settings, Source, managed_credentials, valid_key};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
-use crate::https::Https;
+use crate::http::Https;
 use crate::oauth;
 use crate::process;
 use crate::secret::{Secret, trim_line_end};
@@ -453,7 +453,7 @@ mod tests {
     use crate::broker::{OAuthClient, OAuthLogin, StoredCredential};
     use crate::config::Source;
     use crate::hangar::Hangar;
-    use crate::https::fake::FakeHttps;
+    use crate::http::fake::FakeHttps;
     use crate::sandbox::fake::FakeSandbox;
     use crate::testing::{hangar_with_broker, scratch_dir, settings};
     use std::cell::RefCell;

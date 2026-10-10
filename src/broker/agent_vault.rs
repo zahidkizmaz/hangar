@@ -604,8 +604,7 @@ impl Admin {
             token: Some(&self.token),
             body: body.map(str::as_bytes),
         };
-        let response = http::call(self.port, &request)?;
-        Ok(String::from_utf8_lossy(&response).into_owned())
+        http::call(self.port, &request)
     }
 }
 
@@ -704,13 +703,10 @@ mod tests {
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{Egress, TOWER_VM};
     use crate::secret::Secret;
-    use crate::testing::{closed_port, scratch_dir, settings};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use crate::testing::{closed_port, scratch_dir, serve_each, settings};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::rc::Rc;
-    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     fn agent_vault(
@@ -719,39 +715,6 @@ mod tests {
         sandbox: Rc<FakeSandbox>,
     ) -> AgentVault {
         AgentVault::new(&settings(config).tower, sandbox, state).unwrap()
-    }
-
-    /// Answers one request per `(status, body)`, in order, and returns
-    /// what it received.
-    fn serve_each(
-        responses: Vec<(&'static str, &'static str)>,
-    ) -> (u16, JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            responses
-                .into_iter()
-                .map(|(status, body)| {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let mut request = String::new();
-                    let mut buffer = [0; 4096];
-                    // Head and body may arrive in separate writes.
-                    while !complete(&request) {
-                        let read = stream.read(&mut buffer).unwrap();
-                        request.push_str(&String::from_utf8_lossy(
-                            &buffer[..read],
-                        ));
-                    }
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).unwrap();
-                    request
-                })
-                .collect()
-        });
-        (port, server)
     }
 
     /// A vault whose admin API is at `port`, logged in.
@@ -778,18 +741,6 @@ mod tests {
             port,
             token: Secret::new("session-token".into()),
         }
-    }
-
-    fn complete(request: &str) -> bool {
-        let Some((head, body)) = request.split_once("\r\n\r\n") else {
-            return false;
-        };
-        let length = head
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .and_then(|length| length.parse::<usize>().ok())
-            .unwrap_or(0);
-        body.len() >= length
     }
 
     #[test]
@@ -1056,7 +1007,7 @@ mod tests {
         );
         let request = server.join().unwrap().remove(0);
         assert!(request.starts_with("GET /v1/credentials?vault=default "));
-        assert!(request.contains("Authorization: Bearer session-token"));
+        assert!(request.contains("authorization: Bearer session-token"));
 
         let listed = r#"{"keys":["OLD","NEW","DYN","S"],"credentials":[
             {"key":"S","type":"static"},

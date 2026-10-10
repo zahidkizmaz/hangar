@@ -3,7 +3,7 @@
 //! Every URL is checked before it's fetched or handed to the broker.
 
 use crate::error::{Context, Error, Result, bail};
-use crate::https::Https;
+use crate::http::Https;
 use crate::json::{self, Json};
 use crate::url::with_param;
 
@@ -300,7 +300,7 @@ fn registration_body(redirect_uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Provider, check_url, discover, register};
-    use crate::https::fake::FakeHttps;
+    use crate::http::fake::FakeHttps;
 
     /// mcp.atlassian.com's answer, as fetched on 2026-10-10.
     const ATLASSIAN: &str = r#"{"issuer":"https://mcp.atlassian.com","authorization_endpoint":"https://mcp.atlassian.com/v1/authorize","token_endpoint":"https://mcp.atlassian.com/v1/token","registration_endpoint":"https://mcp.atlassian.com/v1/register","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post","none"],"revocation_endpoint":"https://mcp.atlassian.com/v1/token","code_challenge_methods_supported":["plain","S256"]}"#;
