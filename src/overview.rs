@@ -163,10 +163,10 @@ fn app_hosts(settings: &Settings, bay: &BaySettings) -> Vec<AppHosts> {
         .collect()
 }
 
-#[derive(Debug, PartialEq, Eq, miniserde::Serialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Cache {
-    pub(crate) bytes: u64,
     pub(crate) host: String,
+    pub(crate) bytes: u64,
 }
 
 pub(crate) struct BayStatus {
@@ -256,13 +256,13 @@ pub(crate) struct UpReport {
 
 /// A route the tower serves, credential names only; `app` is the first
 /// enabled app that brings it, `None` for `tower.routes`.
-#[derive(Debug, PartialEq, Eq, miniserde::Serialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TowerRoute {
-    pub(crate) app: Option<String>,
+    pub(crate) name: String,
+    pub(crate) host: String,
     pub(crate) auth: &'static str,
     pub(crate) credentials: Vec<String>,
-    pub(crate) host: String,
-    pub(crate) name: String,
+    pub(crate) app: Option<String>,
 }
 
 fn tower_routes(settings: &Settings) -> Vec<TowerRoute> {
