@@ -1,23 +1,23 @@
 //! The little URL handling OAuth logins need: query parameters.
 
-use std::fmt::Write as _;
+use percent_encoding::{
+    AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode,
+};
+
+/// Everything but RFC 3986's unreserved characters.
+const RESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// `url` with `name=value` added to its query.
 pub(crate) fn with_param(url: &str, name: &str, value: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}{name}={}", percent_encode(value))
-}
-
-/// Everything but RFC 3986's unreserved characters, as `%XX`.
-fn percent_encode(text: &str) -> String {
-    text.bytes().fold(String::new(), |mut out, byte| {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            let _ = write!(out, "%{byte:02X}");
-        }
-        out
-    })
+    format!(
+        "{url}{separator}{name}={}",
+        utf8_percent_encode(value, RESERVED)
+    )
 }
 
 /// The decoded value of query parameter `name`, the first if repeated.
@@ -27,37 +27,15 @@ pub(crate) fn query_param(url: &str, name: &str) -> Option<String> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| percent_decode(key) == name)
-        .map(|(_, value)| percent_decode(value))
+        .find(|(key, _)| form_decode(key) == name)
+        .map(|(_, value)| form_decode(value))
 }
 
 /// `application/x-www-form-urlencoded`: `+` is a space, `%XX` a byte.
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match (byte, hex) {
-            (b'%', Some(value)) => {
-                decoded.push(value);
-                index += 3;
-            }
-            (b'+', _) => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            _ => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
+fn form_decode(text: &str) -> String {
+    percent_decode_str(&text.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

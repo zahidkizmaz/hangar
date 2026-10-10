@@ -6,6 +6,8 @@ use crate::error::{Context, Error, Result, bail};
 use crate::http::Https;
 use crate::json::{self, Json};
 use crate::url::with_param;
+use http::Uri;
+use http::uri::{Authority, Scheme};
 
 /// An `https://` URL whose host is a public name.
 struct HttpsUrl {
@@ -21,40 +23,43 @@ impl HttpsUrl {
     }
 }
 
-/// `https`, and a host name that can't be an address: no IP literal, no
-/// `localhost`, and a last label that starts with a letter, so `127.1`
-/// and `0x7f000001` are refused too: for what hangar fetches, opens and
+/// `https` and a public host name: for what hangar fetches, opens and
 /// hands to the broker.
 pub(crate) fn check_url(url: &str) -> Result<()> {
     parse(url).map(drop)
 }
 
 fn parse(url: &str) -> Result<HttpsUrl> {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let uri = url.parse::<Uri>().ok();
+    let Some(uri) = uri.filter(|uri| uri.scheme() == Some(&Scheme::HTTPS))
+    else {
         bail!("{url}: expected an https:// URL");
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let host = authority
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-        .map_or(authority, |(host, _)| host)
-        .to_ascii_lowercase();
+    let authority = uri.authority().map_or("", Authority::as_str);
+    let host = uri.host().unwrap_or_default().to_ascii_lowercase();
+    // http::Uri also takes `user@`, a port `:x` and hosts like `a$b.com`.
+    let clean = !authority.contains('@')
+        && (!authority.contains(':') || uri.port_u16().is_some());
+    if !clean || !is_public_host(&host) {
+        bail!("{url}: expected a public host name");
+    }
+    Ok(HttpsUrl {
+        origin: format!("https://{authority}"),
+        path: uri.path().trim_end_matches('/').to_string(),
+    })
+}
+
+/// A dotted name of letters, digits and `-` that isn't `localhost`.
+fn is_public_host(host: &str) -> bool {
     let last = host.rsplit('.').next().unwrap_or_default();
-    let public = host.contains('.')
+    // A last label of digits is an IPv4 address, even in shorthand:
+    // `127.1` and `0x7f000001` both reach 127.0.0.1.
+    host.contains('.')
         && last.starts_with(|c: char| c.is_ascii_alphabetic())
         && !host.ends_with(".localhost")
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c));
-    if !public {
-        bail!("{url}: expected a public host name");
-    }
-    let path = tail.split(['?', '#']).next().unwrap_or_default();
-    Ok(HttpsUrl {
-        origin: format!("https://{authority}"),
-        path: path.trim_end_matches('/').to_string(),
-    })
+            .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c))
 }
 
 /// What a login needs from the provider.
@@ -476,6 +481,8 @@ mod tests {
             "https://0x7f000001/",
             "https://[::1]/",
             "https://intranet/",
+            "https://exa_mple.com/",
+            "https://ex$ample.com/",
             "https://user@example.com/",
             "https://example.com:x/",
             "https://",
