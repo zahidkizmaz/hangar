@@ -2,7 +2,6 @@
 //! out is the tower's proxy.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -484,11 +483,11 @@ pub(crate) fn write_env(hangar: &Hangar, bay: &Bay) -> Result<()> {
 }
 
 fn render_env(env: &BTreeMap<String, String>) -> String {
-    env.iter().fold(String::new(), |mut out, (key, value)| {
-        let value = value.replace('\'', r"'\''");
-        let _ = writeln!(out, "{key}='{value}'");
-        out
-    })
+    env.iter()
+        .map(|(key, value)| {
+            [key, "='", &value.replace('\'', r"'\''"), "'\n"].concat()
+        })
+        .collect()
 }
 
 /// `msb exec` is no login: nothing points pilot's `systemctl --user` at

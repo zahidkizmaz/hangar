@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     Access, Broker, BrokerHealth, Credential, CredentialKind, OAuthClient,
@@ -206,9 +206,15 @@ impl AgentVault {
         let admin = self.admin()?;
         let agent = vault_agent(bay);
         let renewed = admin.delete_agent(&agent)?;
-        let body = format!(
-            r#"{{"name":"{agent}","role":"no-access","vaults":[{{"vault_name":"{VAULT}","vault_role":"proxy"}}]}}"#
-        );
+        let grant = json::object([
+            ("vault_name", json::string(VAULT)),
+            ("vault_role", json::string("proxy")),
+        ]);
+        let body = json::stringify(&json::object([
+            ("name", json::string(&agent)),
+            ("role", json::string("no-access")),
+            ("vaults", Json::Array(Array::from_iter([grant]))),
+        ]));
         let reply = admin.call("POST", "/v1/agents", Some(&body))?;
         let created: NewAgent = json::from_str(&reply)?;
         let token = Secret::new(created.av_agent_token);
@@ -358,9 +364,7 @@ impl Broker for AgentVault {
         login: &PendingLogin,
         timeout: Duration,
     ) -> Result<()> {
-        let polls = timeout.as_secs() / POLL.as_secs();
-        let attempts = u32::try_from(polls).unwrap_or(u32::MAX).max(1);
-        self.admin()?.wait_for_tokens(login, attempts, POLL)
+        self.admin()?.wait_for_tokens(login, timeout, POLL)
     }
 
     fn access(&self, bay: &str) -> Result<Access> {
@@ -531,21 +535,22 @@ impl Admin {
     fn wait_for_tokens(
         &self,
         login: &PendingLogin,
-        attempts: u32,
+        timeout: Duration,
         pause: Duration,
     ) -> Result<()> {
-        for attempt in 0..attempts {
-            if attempt > 0 {
-                thread::sleep(pause);
-            }
+        let deadline = Instant::now() + timeout;
+        loop {
             let refreshed = self
                 .oauth_entry(&login.key)?
                 .and_then(|entry| entry.last_refreshed_at);
             if refreshed.is_some_and(|at| at != login.marker) {
                 return Ok(());
             }
+            if Instant::now() >= deadline {
+                return Err(login_timed_out(&login.key));
+            }
+            thread::sleep(pause);
         }
-        Err(login_timed_out(&login.key))
     }
 
     fn post(&self, key: &str, value: &Secret) -> Result<()> {
@@ -1199,9 +1204,9 @@ mod tests {
         };
         vault.oauth_wait(&login(""), Duration::ZERO).unwrap();
         let admin = admin(port);
-        let pause = Duration::ZERO;
-        admin.wait_for_tokens(&login("t0"), 2, pause).unwrap();
-        let error = admin.wait_for_tokens(&login("t1"), 2, pause);
+        let twice = Duration::from_millis(200);
+        admin.wait_for_tokens(&login("t0"), twice, twice).unwrap();
+        let error = admin.wait_for_tokens(&login("t1"), twice, twice);
         assert_eq!(
             error.unwrap_err().to_string(),
             "no login for JIRA yet: the browser page shows the result; \

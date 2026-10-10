@@ -2,7 +2,7 @@
 //! the config. `up` never deletes them; it only manages `credentialFiles`.
 
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -120,8 +120,7 @@ fn state(kind: &CredentialKind) -> String {
         }
         CredentialKind::OAuth(OAuthState::Failed(error)) => {
             let line = error.lines().next().unwrap_or_default();
-            let short: String = line.chars().take(80).collect();
-            format!("oauth: refresh failed ({short})")
+            format!("oauth: refresh failed ({line:.80})")
         }
     }
 }
@@ -351,9 +350,7 @@ fn read_value(name: &str) -> Result<Secret> {
     let value = if io::stdin().is_terminal() {
         read_hidden(name, Stdio::inherit())?
     } else {
-        let mut value = String::new();
-        io::stdin().read_to_string(&mut value).context(name)?;
-        value
+        io::read_to_string(io::stdin()).context(name)?
     };
     Ok(Secret::new(trim_line_end(&value).to_string()))
 }
@@ -384,6 +381,7 @@ mod tests {
     use crate::http::fake::FakeHttps;
     use crate::sandbox::fake::FakeSandbox;
     use crate::testing::{hangar_with_broker, scratch_dir, settings};
+    use crate::url::with_param;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs::{self, File};
@@ -673,10 +671,8 @@ mod tests {
 
     #[test]
     fn the_consent_url_must_be_https_and_come_back_to_the_broker() {
-        let good = format!(
-            "https://a.example.com/authorize?redirect_uri={}",
-            FAKE_CALLBACK.replace('/', "%2F").replace(':', "%3A")
-        );
+        let authorize = "https://a.example.com/authorize";
+        let good = with_param(authorize, "redirect_uri", FAKE_CALLBACK);
         assert!(check_consent(&good, FAKE_CALLBACK).is_ok());
         let error =
             check_consent(&good.replace("https", "http"), FAKE_CALLBACK)

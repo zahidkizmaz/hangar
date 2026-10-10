@@ -14,6 +14,7 @@ use super::{
 use crate::error::{Result, bail};
 use crate::sandbox::PublishedPort;
 use crate::secret::Secret;
+use crate::url::with_param;
 
 pub(crate) struct FakeBroker {
     /// `deny_unlisted`, `set_routes a,b`, `put KEY`, `delete A,B`,
@@ -142,10 +143,9 @@ impl Broker for FakeBroker {
         oauth
             .entry(key.to_string())
             .or_insert(OAuthState::NotConnected);
-        let url = format!(
-            "https://auth.example/authorize?redirect_uri={}&state=s",
-            FAKE_CALLBACK.replace(':', "%3A").replace('/', "%2F")
-        );
+        let authorize = "https://auth.example/authorize";
+        let url =
+            with_param(authorize, "redirect_uri", FAKE_CALLBACK) + "&state=s";
         Ok(PendingLogin {
             key: key.to_string(),
             url: self.consent.borrow().clone().unwrap_or(url),

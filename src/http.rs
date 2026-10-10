@@ -91,9 +91,9 @@ pub(crate) fn call(
     let response = send(port, method, path, token, body, timeout)?;
     if !(200..300).contains(&response.status) {
         bail!(
-            "{method} {path}: HTTP {}: {}",
+            "{method} {path}: HTTP {}: {:.200}",
             response.status,
-            response.body.trim().chars().take(200).collect::<String>()
+            response.body.trim()
         );
     }
     Ok(response.body)

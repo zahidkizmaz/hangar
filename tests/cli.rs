@@ -3,7 +3,7 @@
 mod fakes;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -538,8 +538,7 @@ fn a_second_hangar_waits_before_touching_anything() {
     assert_eq!(machine.fake_file("keychain.log"), "");
 
     drop(held);
-    let mut rest = String::new();
-    log.read_to_string(&mut rest).unwrap();
+    let rest = io::read_to_string(log).unwrap();
     assert!(up.wait().unwrap().success(), "{rest}");
     assert!(machine.state.exists());
     #[cfg(target_os = "macos")]

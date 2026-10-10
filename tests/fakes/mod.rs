@@ -2,6 +2,7 @@
 //! agent-vault admin API (a loopback HTTP server that records requests).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -128,8 +129,7 @@ impl Machine {
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
-        let path =
-            format!("{}:{}", self.home.join("bin").display(), tools_path());
+        let path = tools_path(self.home.join("bin"));
         let service = format!("hangar-test-{}", std::process::id());
         let mut command = Command::new(env!("CARGO_BIN_EXE_hangar"));
         command
@@ -152,13 +152,11 @@ impl Machine {
 /// The caller's PATH (the fake scripts need coreutils, which the Nix build
 /// sandbox has only there) minus any directory holding a real `msb`, so a
 /// test can never drive real VMs.
-fn tools_path() -> String {
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .filter(|dir| !dir.join("msb").exists())
-        .map(|dir| dir.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":")
+fn tools_path(fakes: PathBuf) -> OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tools =
+        std::env::split_paths(&path).filter(|dir| !dir.join("msb").exists());
+    std::env::join_paths(std::iter::once(fakes).chain(tools)).unwrap()
 }
 
 pub fn stdout(output: &Output) -> String {

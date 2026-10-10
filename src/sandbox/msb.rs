@@ -47,12 +47,7 @@ impl Sandbox for Msb {
     ) -> Result<Vec<u8>> {
         let mut args = exec_args(vm, user, "--no-tty");
         args.extend_from_slice(command);
-        let what = command
-            .iter()
-            .take(2)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let what = command.get(..2).unwrap_or(command).join(" ");
         call(&args, stdin, &format!("exec {vm}: {what}"))
     }
 

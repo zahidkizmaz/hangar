@@ -2,7 +2,7 @@
 //! `main` only parses arguments and dispatches here.
 
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -414,13 +414,11 @@ pub(crate) fn vault_ui(hangar: &Hangar) -> Result<VaultLogin> {
 
 /// The first opener that works; none is fine, the caller shows the URL.
 pub(crate) fn open_in_browser(url: &str) {
-    for opener in ["open", "xdg-open"] {
+    let _opened = ["open", "xdg-open"].iter().any(|opener| {
         let mut open = process::command(opener);
         open.arg(url);
-        if process::output(&mut open, None).is_ok_and(|o| o.status.success()) {
-            break;
-        }
-    }
+        process::output(&mut open, None).is_ok_and(|o| o.status.success())
+    });
 }
 
 fn copy(secret: &[u8]) -> bool {
@@ -503,12 +501,8 @@ fn confirm(state: &Path, folders: &[PathBuf]) -> Result<bool> {
             shown.join(", ")
         );
     }
-    io::stderr().flush().context("terminal")?;
     let mut answer = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .context("terminal")?;
+    io::stdin().read_line(&mut answer).context("terminal")?;
     Ok(answer.trim() == "y")
 }
 
