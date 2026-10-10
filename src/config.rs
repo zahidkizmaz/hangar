@@ -252,7 +252,7 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
     if items.is_empty() {
         return Ok(vec![json::object([("name", json::string("default"))])]);
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut names = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
         let entry = Fields::new(item, &format!("config.bays.{index}"))?;
         let name = entry.string("name")?;
@@ -262,10 +262,9 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
                  digits, joined by single -, at most 32 characters"
             );
         }
-        if names.contains(&name) {
+        if !names.insert(name.clone()) {
             bail!("config.bays: two bays named {name}");
         }
-        names.push(name);
     }
     Ok(items)
 }
@@ -753,13 +752,8 @@ impl<'a> Fields<'a> {
     }
 
     pub(crate) fn only(&self, known: &[&str]) -> Result<()> {
-        let mut unknown: Vec<&String> = self
-            .map
-            .keys()
-            .filter(|key| !known.contains(&key.as_str()))
-            .collect();
-        unknown.sort();
-        if let Some(key) = unknown.first() {
+        let mut keys = self.map.keys();
+        if let Some(key) = keys.find(|key| !known.contains(&key.as_str())) {
             bail!("{}: unknown setting", self.at(key));
         }
         Ok(())
