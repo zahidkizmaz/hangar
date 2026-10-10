@@ -5,10 +5,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use super::{
-    Access, Broker, BrokerHealth, ClientSecret, OAuthClient, OAuthLogin, PROXY,
-    Policy, Route, StoredCredential, UiLogin,
+    Access, Broker, BrokerHealth, Credential, CredentialKind, OAuthClient,
+    OAuthState, PROXY, PendingLogin, Policy, Route, UiLogin, login_timed_out,
 };
 use crate::error::{Result, bail};
 use crate::sandbox::PublishedPort;
@@ -21,21 +22,18 @@ pub(crate) struct FakeBroker {
     pub(crate) calls: Rc<RefCell<Vec<String>>>,
     pub(crate) keys: RefCell<BTreeSet<String>>,
     /// The OAuth state of keys in `keys`; the others are static.
-    pub(crate) oauth: RefCell<BTreeMap<String, OAuthLogin>>,
+    pub(crate) oauth: RefCell<BTreeMap<String, OAuthState>>,
     pub(crate) unlisted: Cell<Option<Policy>>,
     /// What `ensure_running` returns.
     pub(crate) created: Cell<bool>,
     pub(crate) fail_put: Cell<bool>,
     /// The port `access` names.
     pub(crate) access_port: Cell<u16>,
-    /// The URL `oauth_connect` returns instead of a consent URL that
-    /// names [`FAKE_CALLBACK`].
+    /// The URL `oauth_begin` returns instead of a consent URL that names
+    /// [`FAKE_CALLBACK`].
     pub(crate) consent: RefCell<Option<String>>,
-    /// Whether the user finishes a login at once: `oauth_connect` stores
-    /// new tokens.
+    /// Whether `oauth_wait` sees the user log in, or times out.
     pub(crate) logs_in: Cell<bool>,
-    /// What the last `oauth_connect` got.
-    pub(crate) connected: Rc<RefCell<Option<(OAuthClient, &'static str)>>>,
 }
 
 pub(crate) const FAKE_CALLBACK: &str =
@@ -53,7 +51,6 @@ impl Default for FakeBroker {
             access_port: Cell::new(14322),
             consent: RefCell::default(),
             logs_in: Cell::new(true),
-            connected: Rc::default(),
         }
     }
 }
@@ -91,16 +88,19 @@ impl Broker for FakeBroker {
         Ok(())
     }
 
-    fn credentials(&self) -> Result<Vec<StoredCredential>> {
+    fn credentials(&self) -> Result<Vec<Credential>> {
         self.record("credentials".into());
         let oauth = self.oauth.borrow();
         Ok(self
             .keys
             .borrow()
             .iter()
-            .map(|key| StoredCredential {
+            .map(|key| Credential {
                 key: key.clone(),
-                oauth: oauth.get(key).cloned(),
+                kind: oauth
+                    .get(key)
+                    .cloned()
+                    .map_or(CredentialKind::Static, CredentialKind::OAuth),
             })
             .collect())
     }
@@ -127,34 +127,45 @@ impl Broker for FakeBroker {
         Ok(FAKE_CALLBACK.into())
     }
 
-    fn oauth_connect(
+    fn oauth_begin(
         &self,
         key: &str,
-        client: &OAuthClient,
-        secret: &ClientSecret,
-    ) -> Result<String> {
-        self.record(format!("oauth_connect {key}"));
-        let secret = match secret {
-            ClientSecret::None => "none",
-            ClientSecret::Keep => "keep",
-            ClientSecret::New(_) => "new",
-        };
-        *self.connected.borrow_mut() = Some((client.clone(), secret));
-        self.keys.borrow_mut().insert(key.to_string());
+        client: Option<&OAuthClient>,
+    ) -> Result<PendingLogin> {
+        let client = client.map_or("stored", |client| &client.client_id);
+        self.record(format!("oauth_begin {key} {client}"));
         let mut oauth = self.oauth.borrow_mut();
-        let login = oauth.entry(key.to_string()).or_default();
-        login.client = Some(client.clone());
-        if self.logs_in.get() {
-            let count = login.refreshed_at.as_deref().map_or(0, str::len);
-            login.refreshed_at = Some("t".repeat(count + 1));
-            login.connected = true;
+        if client == "stored" && !oauth.contains_key(key) {
+            bail!("{key} has no OAuth client to log in with");
         }
-        let consent = format!(
-            "https://auth.example/authorize?client_id={}&redirect_uri={}&state=s",
-            client.client_id,
+        self.keys.borrow_mut().insert(key.to_string());
+        oauth
+            .entry(key.to_string())
+            .or_insert(OAuthState::NotConnected);
+        let url = format!(
+            "https://auth.example/authorize?redirect_uri={}&state=s",
             FAKE_CALLBACK.replace(':', "%3A").replace('/', "%2F")
         );
-        Ok(self.consent.borrow().clone().unwrap_or(consent))
+        Ok(PendingLogin {
+            key: key.to_string(),
+            url: self.consent.borrow().clone().unwrap_or(url),
+            marker: String::new(),
+        })
+    }
+
+    fn oauth_wait(
+        &self,
+        login: &PendingLogin,
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.record(format!("oauth_wait {}", login.key));
+        if !self.logs_in.get() {
+            return Err(login_timed_out(&login.key));
+        }
+        self.oauth
+            .borrow_mut()
+            .insert(login.key.clone(), OAuthState::Connected);
+        Ok(())
     }
 
     fn retain_bays(&self, bays: &[String]) -> Result<()> {

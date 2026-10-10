@@ -341,14 +341,15 @@ an error. `status` shows a stopped entry of an app with a setup as
   resource metadata, else RFC 8414 or OpenID metadata at the issuer,
   checking issuer and resource) and registers hangar as a public client
   (RFC 7591, `none` only) with `Broker::oauth_redirect_uri`; it fetches
-  only `https` URLs with public host names. `Broker::oauth_connect` saves
-  the client (a re-login sends the broker's keep-marker for a stored
-  secret) and returns the consent URL. hangar opens it only when it's https and its `redirect_uri` is
-  `Broker::oauth_redirect_uri` (a tower from before `AGENT_VAULT_ADDR`
-  would send the browser to `0.0.0.0`). It then polls
-  `Broker::credentials` until the credential's refresh time changes, no
-  clock involved. The lock covers only the connect. Brokers without OAuth
-  keep the trait's refusing defaults.
+  only `https` URLs with public host names. `Broker::oauth_begin` saves
+  the client (none: a re-login with the one the broker holds, secret
+  included) and returns a `PendingLogin`: the consent URL and a marker
+  only the backend reads. hangar opens the URL only when it's https and
+  its `redirect_uri` is `Broker::oauth_redirect_uri` (a tower from before
+  `AGENT_VAULT_ADDR` would send the browser to `0.0.0.0`), then blocks in
+  `Broker::oauth_wait` (agent-vault: until `last_refreshed_at` moves off
+  the marker, no clock involved). The lock covers only the begin.
+  Brokers without OAuth keep the trait's refusing defaults.
 - `hangar vault-ui`: pipes `owner-password` into `pbcopy`, `wl-copy` or
   `xclip` and opens the UI; it never prints the password.
 

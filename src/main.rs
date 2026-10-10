@@ -431,16 +431,11 @@ fn login(
 ) -> Result<()> {
     let https = http::https();
     let login = credential::prepare_login(hangar, &https, name, args)?;
-    let consent = {
+    let pending = {
         let _lock = hold_lock()?;
-        credential::connect(hangar, &login)?
+        credential::begin(hangar, &login)?
     };
-    credential::finish_login(
-        hangar,
-        &login,
-        &consent,
-        &commands::open_in_browser,
-    )
+    credential::finish_login(hangar, &pending, &commands::open_in_browser)
 }
 
 fn hold_lock() -> Result<lock::Lock> {

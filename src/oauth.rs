@@ -23,8 +23,8 @@ impl HttpsUrl {
 
 /// `https`, and a host name that can't be an address: no IP literal, no
 /// `localhost`, and a last label that starts with a letter, so `127.1`
-/// and `0x7f000001` are refused too. The vault's own guard covers the
-/// token endpoint; this one covers what hangar fetches and opens.
+/// and `0x7f000001` are refused too: for what hangar fetches, opens and
+/// hands to the broker.
 pub(crate) fn check_url(url: &str) -> Result<()> {
     parse(url).map(drop)
 }
@@ -492,7 +492,7 @@ mod tests {
     const REGISTER: &str = "https://mcp.atlassian.com/v1/register";
 
     #[test]
-    fn hangar_registers_as_a_public_client_with_the_vault_callback() {
+    fn hangar_registers_as_a_public_client_with_the_broker_callback() {
         let answer = r#"{"client_id":"dyn-1","token_endpoint_auth_method":"none","registration_access_token":"rat-secret","client_id_issued_at":1}"#;
         let https = FakeHttps::default().answer(REGISTER, 201, answer);
         assert_eq!(register(&https, &atlassian(), CALLBACK).unwrap(), "dyn-1");

@@ -4,11 +4,10 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read};
 use std::process::Stdio;
-use std::thread;
 use std::time::Duration;
 
 use crate::broker::{
-    Broker, ClientSecret, OAuthClient, OAuthLogin, StoredCredential,
+    Credential, CredentialKind, OAuthClient, OAuthState, PendingLogin,
 };
 use crate::config::{Settings, Source, managed_credentials, valid_key};
 use crate::error::{Context, Error, Result, bail};
@@ -32,7 +31,7 @@ printf '%s' "$value""#;
 pub(crate) fn read(hangar: &Hangar, name: &str) -> Result<Secret> {
     check_user_key(&hangar.settings, name)?;
     vault_ready(hangar)?;
-    if stored(hangar, name)?.is_some_and(|stored| stored.oauth.is_some()) {
+    if matches!(stored(hangar, name)?, Some(CredentialKind::OAuth(_))) {
         return Err(Error::with_hint(
             format!("{name} is an OAuth credential"),
             format!("run 'hangar credential login {name}'"),
@@ -52,9 +51,10 @@ pub(crate) fn store(hangar: &Hangar, name: &str, value: &Secret) -> Result<()> {
     Ok(())
 }
 
-fn stored(hangar: &Hangar, name: &str) -> Result<Option<StoredCredential>> {
+fn stored(hangar: &Hangar, name: &str) -> Result<Option<CredentialKind>> {
     let credentials = hangar.broker.credentials()?;
-    Ok(credentials.into_iter().find(|stored| stored.key == name))
+    let stored = credentials.into_iter().find(|stored| stored.key == name);
+    Ok(stored.map(|stored| stored.kind))
 }
 
 pub(crate) struct CredentialList {
@@ -86,7 +86,7 @@ pub(crate) fn list(hangar: &Hangar) -> Result<CredentialList> {
 }
 
 fn classify(
-    credentials: Vec<StoredCredential>,
+    credentials: Vec<Credential>,
     managed: &BTreeMap<String, Source>,
 ) -> CredentialList {
     let entries = credentials
@@ -98,8 +98,8 @@ fn classify(
                 "user"
             };
             CredentialEntry {
-                state: state(stored.oauth.as_ref()),
-                oauth: stored.oauth.is_some(),
+                state: state(&stored.kind),
+                oauth: stored.kind != CredentialKind::Static,
                 name: stored.key,
                 source,
             }
@@ -109,19 +109,20 @@ fn classify(
 }
 
 /// A refresh error is the token endpoint's answer: one line, cut short.
-fn state(oauth: Option<&OAuthLogin>) -> String {
-    let Some(login) = oauth else {
-        return "set".into();
-    };
-    if let Some(error) = &login.error {
-        let line = error.lines().next().unwrap_or_default();
-        let short: String = line.chars().take(80).collect();
-        return format!("oauth: refresh failed ({short})");
-    }
-    if login.connected {
-        "oauth: connected".into()
-    } else {
-        "oauth: not connected".into()
+fn state(kind: &CredentialKind) -> String {
+    match kind {
+        CredentialKind::Static => "set".into(),
+        CredentialKind::OAuth(OAuthState::Connected) => {
+            "oauth: connected".into()
+        }
+        CredentialKind::OAuth(OAuthState::NotConnected) => {
+            "oauth: not connected".into()
+        }
+        CredentialKind::OAuth(OAuthState::Failed(error)) => {
+            let line = error.lines().next().unwrap_or_default();
+            let short: String = line.chars().take(80).collect();
+            format!("oauth: refresh failed ({short})")
+        }
     }
 }
 
@@ -188,14 +189,11 @@ pub(crate) struct LoginArgs {
     pub(crate) client_secret: bool,
 }
 
-/// A login whose checks passed, ready to connect.
+/// A login whose checks passed, ready to begin.
 pub(crate) struct Login {
     name: String,
-    client: OAuthClient,
-    secret: ClientSecret,
-    /// When the tokens were last renewed: the login is done once this
-    /// changes, whatever the tower's clock says.
-    before: Option<String>,
+    /// `None`: log in again with the client the broker holds.
+    client: Option<OAuthClient>,
 }
 
 /// `credential login`, first part: the checks, the client and its
@@ -209,26 +207,21 @@ pub(crate) fn prepare_login(
 ) -> Result<Login> {
     check_user_key(&hangar.settings, name)?;
     vault_ready(hangar)?;
-    let stored = stored(hangar, name)?;
-    if stored.as_ref().is_some_and(|stored| stored.oauth.is_none()) {
+    if stored(hangar, name)? == Some(CredentialKind::Static) {
         return Err(Error::with_hint(
             format!("{name} holds a static value"),
             format!("run 'hangar credential rm {name}' first"),
         ));
     }
-    let login = stored.and_then(|stored| stored.oauth).unwrap_or_default();
-    let mut client = match args.source {
-        ClientSource::Stored => {
-            let (mut client, secret) = stored_client(name, &login)?;
-            if !args.scopes.is_empty() {
-                client.scopes = args.scopes.join(" ");
-            }
+    let (authorization_url, token_url, client_id) = match args.source {
+        ClientSource::Stored if args.scopes.is_empty() => {
             return Ok(Login {
                 name: name.to_string(),
-                client,
-                secret,
-                before: login.refreshed_at,
+                client: None,
             });
+        }
+        ClientSource::Stored => {
+            bail!("--scope needs a URL, or --authorization-url and --token-url")
         }
         ClientSource::Endpoints {
             authorization_url,
@@ -237,12 +230,7 @@ pub(crate) fn prepare_login(
         } => {
             oauth::check_url(&authorization_url)?;
             oauth::check_url(&token_url)?;
-            OAuthClient {
-                authorization_url,
-                token_url,
-                client_id,
-                ..OAuthClient::default()
-            }
+            (authorization_url, token_url, client_id)
         }
         ClientSource::Discover { url, client_id } => {
             let provider = oauth::discover(https, &url)?;
@@ -255,49 +243,26 @@ pub(crate) fn prepare_login(
                 log::info!("registered hangar as OAuth client {id}");
                 id
             };
-            OAuthClient {
-                authorization_url: provider.authorization_url,
-                token_url: provider.token_url,
-                client_id,
-                ..OAuthClient::default()
-            }
+            (provider.authorization_url, provider.token_url, client_id)
         }
     };
-    client.scopes = args.scopes.join(" ");
-    let secret = if args.client_secret {
-        ClientSecret::New(read_client_secret(name)?)
+    let client_secret = if args.client_secret {
+        Some(read_client_secret(name)?)
     } else {
-        ClientSecret::None
+        None
+    };
+    let client = OAuthClient {
+        authorization_url,
+        token_url,
+        client_id,
+        client_secret,
+        scopes: args.scopes.join(" "),
+        token_auth_method: String::new(),
     };
     Ok(Login {
         name: name.to_string(),
-        client,
-        secret,
-        before: login.refreshed_at,
+        client: Some(client),
     })
-}
-
-/// A re-login keeps the client secret the broker holds.
-fn stored_client(
-    name: &str,
-    login: &OAuthLogin,
-) -> Result<(OAuthClient, ClientSecret)> {
-    let client = login
-        .client
-        .clone()
-        .filter(|client| !client.authorization_url.is_empty());
-    let Some(client) = client else {
-        return Err(Error::with_hint(
-            format!("{name} has no OAuth client to log in with"),
-            "pass --authorization-url, --token-url and --client-id",
-        ));
-    };
-    let secret = if login.has_secret {
-        ClientSecret::Keep
-    } else {
-        ClientSecret::None
-    };
-    Ok((client, secret))
 }
 
 fn read_client_secret(name: &str) -> Result<Secret> {
@@ -308,41 +273,32 @@ fn read_client_secret(name: &str) -> Result<Secret> {
     Ok(secret)
 }
 
-/// `credential login`, second part, under the lock: the consent URL.
-pub(crate) fn connect(hangar: &Hangar, login: &Login) -> Result<String> {
+/// `credential login`, second part, under the lock.
+pub(crate) fn begin(hangar: &Hangar, login: &Login) -> Result<PendingLogin> {
     hangar
         .broker
-        .oauth_connect(&login.name, &login.client, &login.secret)
+        .oauth_begin(&login.name, login.client.as_ref())
 }
 
-/// How long the vault keeps a login's state.
+/// How long a login may take in the browser.
 const WAIT: Duration = Duration::from_secs(600);
-const POLL: Duration = Duration::from_secs(1);
 
 /// `credential login`, last part: the browser, then the wait. The URL
 /// carries the login's state, so it goes to the terminal only, never
 /// to a log or `--json`.
 pub(crate) fn finish_login(
     hangar: &Hangar,
-    login: &Login,
-    consent: &str,
+    login: &PendingLogin,
     open: &dyn Fn(&str),
 ) -> Result<()> {
-    check_consent(consent, &hangar.broker.oauth_redirect_uri()?)?;
+    check_consent(&login.url, &hangar.broker.oauth_redirect_uri()?)?;
     if io::stderr().is_terminal() {
-        eprintln!("Log {} in at:\n  {consent}", login.name);
+        eprintln!("Log {} in at:\n  {}", login.key, login.url);
     }
-    open(consent);
+    open(&login.url);
     log::info!("waiting for the login in your browser");
-    let attempts = u32::try_from(WAIT.as_secs() / POLL.as_secs()).unwrap_or(1);
-    wait_for_tokens(
-        hangar.broker.as_ref(),
-        &login.name,
-        login.before.as_deref(),
-        attempts,
-        POLL,
-    )?;
-    log::info!("logged in {}", login.name);
+    hangar.broker.oauth_wait(login, WAIT)?;
+    log::info!("logged in {}", login.key);
     Ok(())
 }
 
@@ -350,46 +306,18 @@ pub(crate) fn finish_login(
 /// back to an address the browser can't reach.
 fn check_consent(consent: &str, callback: &str) -> Result<()> {
     if !consent.starts_with("https://") {
-        bail!("the vault's consent URL isn't https; not opening it");
+        bail!("the broker's login URL isn't https; not opening it");
     }
     match query_param(consent, "redirect_uri") {
         Some(redirect) if redirect == callback => Ok(()),
         redirect => Err(Error::with_hint(
             format!(
-                "the vault sends logins back to {}, not {callback}",
+                "the broker sends logins back to {}, not {callback}",
                 redirect.as_deref().unwrap_or("nowhere")
             ),
             "restart the tower: hangar down && hangar up",
         )),
     }
-}
-
-/// Errors are ignored: one from an earlier login must not end this one.
-fn wait_for_tokens(
-    broker: &dyn Broker,
-    name: &str,
-    before: Option<&str>,
-    attempts: u32,
-    pause: Duration,
-) -> Result<()> {
-    for attempt in 0..attempts {
-        if attempt > 0 {
-            thread::sleep(pause);
-        }
-        let renewed = broker
-            .credentials()?
-            .into_iter()
-            .find(|stored| stored.key == name)
-            .and_then(|stored| stored.oauth)
-            .and_then(|login| login.refreshed_at);
-        if renewed.is_some() && renewed.as_deref() != before {
-            return Ok(());
-        }
-    }
-    Err(Error::with_hint(
-        format!("no login for {name} yet"),
-        "the browser page shows the result; check 'hangar credential list'",
-    ))
 }
 
 fn check_user_key(settings: &Settings, name: &str) -> Result<()> {
@@ -445,12 +373,12 @@ fn read_hidden(name: &str, input: Stdio) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientSource, CredentialEntry, LoginArgs, check_consent,
-        check_user_key, classify, connect, finish_login, list, prepare_login,
-        read, read_hidden, remove, state, wait_for_tokens,
+        ClientSource, CredentialEntry, LoginArgs, begin, check_consent,
+        check_user_key, classify, finish_login, list, prepare_login, read,
+        read_hidden, remove, state,
     };
     use crate::broker::fake::{FAKE_CALLBACK, FakeBroker};
-    use crate::broker::{OAuthClient, OAuthLogin, StoredCredential};
+    use crate::broker::{Credential, CredentialKind, OAuthState};
     use crate::config::Source;
     use crate::hangar::Hangar;
     use crate::http::fake::FakeHttps;
@@ -461,7 +389,6 @@ mod tests {
     use std::fs::{self, File};
     use std::process::Stdio;
     use std::rc::Rc;
-    use std::time::Duration;
 
     fn entry(
         name: &str,
@@ -483,14 +410,15 @@ mod tests {
             "GITHUB_TOKEN".to_string(),
             Source::File("/t".into()),
         )]);
-        let stored = |key: &str, oauth: Option<OAuthLogin>| StoredCredential {
+        let stored = |key: &str, kind| Credential {
             key: key.into(),
-            oauth,
+            kind,
         };
+        let not_connected = CredentialKind::OAuth(OAuthState::NotConnected);
         let list = classify(
             vec![
-                stored("GITHUB_TOKEN", None),
-                stored("MINE", Some(OAuthLogin::default())),
+                stored("GITHUB_TOKEN", CredentialKind::Static),
+                stored("MINE", not_connected),
             ],
             &managed,
         );
@@ -507,18 +435,13 @@ mod tests {
 
     #[test]
     fn an_oauth_state_says_whether_it_is_connected_or_why_not() {
-        let login = |connected, error: Option<&str>| OAuthLogin {
-            connected,
-            refreshed_at: Some("t".into()),
-            error: error.map(Into::into),
-            ..OAuthLogin::default()
-        };
-        assert_eq!(state(None), "set");
-        assert_eq!(state(Some(&login(true, None))), "oauth: connected");
-        assert_eq!(state(Some(&login(false, None))), "oauth: not connected");
+        let oauth = |login| state(&CredentialKind::OAuth(login));
+        assert_eq!(state(&CredentialKind::Static), "set");
+        assert_eq!(oauth(OAuthState::Connected), "oauth: connected");
+        assert_eq!(oauth(OAuthState::NotConnected), "oauth: not connected");
         let long = format!("invalid_grant {}\nsecond line", "x".repeat(90));
         assert_eq!(
-            state(Some(&login(true, Some(&long)))),
+            oauth(OAuthState::Failed(long)),
             format!("oauth: refresh failed (invalid_grant {})", "x".repeat(66))
         );
     }
@@ -563,36 +486,37 @@ mod tests {
         }
     }
 
-    fn stored_login(refreshed: &str, has_secret: bool) -> OAuthLogin {
-        OAuthLogin {
-            connected: true,
-            refreshed_at: Some(refreshed.into()),
-            error: Some("invalid_grant".into()),
-            client: Some(OAuthClient {
-                authorization_url: "https://a.example.com/authorize".into(),
-                token_url: "https://a.example.com/token".into(),
-                client_id: "stored".into(),
-                scopes: "read".into(),
-                token_auth_method: "client_secret_basic".into(),
-            }),
-            has_secret,
+    fn again(scopes: &[&str]) -> LoginArgs {
+        LoginArgs {
+            source: ClientSource::Stored,
+            ..flags(scopes)
         }
     }
 
-    fn holding(name: &str, login: Option<OAuthLogin>) -> FakeBroker {
+    fn holding(name: &str, oauth: Option<OAuthState>) -> FakeBroker {
         let broker = FakeBroker::default();
         broker.keys.borrow_mut().insert(name.into());
-        if let Some(login) = login {
-            broker.oauth.borrow_mut().insert(name.into(), login);
+        if let Some(oauth) = oauth {
+            broker.oauth.borrow_mut().insert(name.into(), oauth);
         }
         broker
     }
 
+    /// The whole login against `hangar`'s broker, nothing opened.
+    fn log_in(hangar: &Hangar, name: &str, args: LoginArgs) -> String {
+        let login = prepare_login(hangar, &FakeHttps::default(), name, args)
+            .and_then(|login| begin(hangar, &login))
+            .and_then(|pending| finish_login(hangar, &pending, &|_| {}));
+        login
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn a_login_connects_opens_the_consent_url_and_waits_for_tokens() {
+    fn a_login_begins_opens_the_consent_url_and_waits_for_tokens() {
         let broker = FakeBroker::default();
-        let (calls, connected) =
-            (broker.calls.clone(), broker.connected.clone());
+        let calls = broker.calls.clone();
         let hangar = oauth_hangar("login", broker);
         let login = prepare_login(
             &hangar,
@@ -601,27 +525,24 @@ mod tests {
             flags(&["read", "write"]),
         )
         .unwrap();
-        let consent = connect(&hangar, &login).unwrap();
+        let client = login.client.as_ref().unwrap();
+        assert_eq!(
+            (client.authorization_url.as_str(), client.token_url.as_str()),
+            (
+                "https://a.example.com/authorize",
+                "https://a.example.com/token"
+            )
+        );
+        assert_eq!(client.scopes, "read write");
+        let pending = begin(&hangar, &login).unwrap();
         let opened = RefCell::new(Vec::new());
         let open = |url: &str| opened.borrow_mut().push(url.to_string());
-        finish_login(&hangar, &login, &consent, &open).unwrap();
+        finish_login(&hangar, &pending, &open).unwrap();
 
-        assert_eq!(*opened.borrow(), [consent]);
-        let (client, secret) = connected.borrow().clone().unwrap();
-        assert_eq!(
-            client,
-            OAuthClient {
-                authorization_url: "https://a.example.com/authorize".into(),
-                token_url: "https://a.example.com/token".into(),
-                client_id: "c1".into(),
-                scopes: "read write".into(),
-                token_auth_method: String::new(),
-            }
-        );
-        assert_eq!(secret, "none");
+        assert_eq!(*opened.borrow(), [pending.url]);
         assert_eq!(
             *calls.borrow(),
-            ["credentials", "oauth_connect JIRA", "credentials"]
+            ["credentials", "oauth_begin JIRA c1", "oauth_wait JIRA"]
         );
     }
 
@@ -631,9 +552,7 @@ mod tests {
 
     #[test]
     fn a_url_finds_the_provider_and_registers_a_client_with_the_callback() {
-        let broker = FakeBroker::default();
-        let connected = broker.connected.clone();
-        let hangar = oauth_hangar("login-discover", broker);
+        let hangar = oauth_hangar("login-discover", FakeBroker::default());
         let https =
             FakeHttps::default().answer(ISSUER_URL, 200, ISSUER).answer(
                 "https://mcp.example.com/register",
@@ -650,16 +569,13 @@ mod tests {
         };
         let login =
             prepare_login(&hangar, &https, "MCP", discover(None)).unwrap();
-        connect(&hangar, &login).unwrap();
-        let (client, secret) = connected.borrow().clone().unwrap();
+        let client = login.client.unwrap();
         assert_eq!(
             (client.authorization_url.as_str(), client.client_id.as_str()),
             ("https://mcp.example.com/authorize", "dyn-1")
         );
-        assert_eq!(
-            (client.token_url.as_str(), secret),
-            ("https://mcp.example.com/token", "none")
-        );
+        assert_eq!(client.token_url, "https://mcp.example.com/token");
+        assert!(client.client_secret.is_none());
         let registered = https.requests.borrow().last().cloned().unwrap();
         assert!(registered.contains(FAKE_CALLBACK), "{registered}");
 
@@ -667,9 +583,7 @@ mod tests {
         let login =
             prepare_login(&hangar, &https, "MCP", discover(Some("mine")))
                 .unwrap();
-        connect(&hangar, &login).unwrap();
-        let (client, _) = connected.borrow().clone().unwrap();
-        assert_eq!(client.client_id, "mine");
+        assert_eq!(login.client.unwrap().client_id, "mine");
         let posts = https.requests.borrow()[before..]
             .iter()
             .filter(|request| request.starts_with("POST"))
@@ -706,71 +620,31 @@ mod tests {
     }
 
     #[test]
-    fn a_re_login_keeps_the_stored_client_and_its_secret() {
-        let broker = holding("JIRA", Some(stored_login("t", true)));
-        let connected = broker.connected.clone();
+    fn a_re_login_leaves_the_client_to_the_broker() {
+        let broker = holding("JIRA", Some(OAuthState::Failed("x".into())));
+        let calls = broker.calls.clone();
         let hangar = oauth_hangar("relogin", broker);
-        let args = LoginArgs {
-            source: ClientSource::Stored,
-            scopes: vec![],
-            client_secret: false,
-        };
-        let login = prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
-            .unwrap();
-        let consent = connect(&hangar, &login).unwrap();
-        // An old refresh error doesn't end the wait; new tokens do.
-        finish_login(&hangar, &login, &consent, &|_| {}).unwrap();
-        let (client, secret) = connected.borrow().clone().unwrap();
-        assert_eq!(client.client_id, "stored");
-        assert_eq!(client.scopes, "read");
-        assert_eq!(client.token_auth_method, "client_secret_basic");
-        assert_eq!(secret, "keep");
-
-        let broker = holding("JIRA", Some(stored_login("t", false)));
-        let connected = broker.connected.clone();
-        let hangar = oauth_hangar("relogin-public", broker);
-        let args = LoginArgs {
-            source: ClientSource::Stored,
-            scopes: vec!["admin".into()],
-            client_secret: false,
-        };
-        let login = prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
-            .unwrap();
-        connect(&hangar, &login).unwrap();
-        let (client, secret) = connected.borrow().clone().unwrap();
-        assert_eq!((client.scopes.as_str(), secret), ("admin", "none"));
+        assert_eq!(log_in(&hangar, "JIRA", again(&[])), "");
+        assert!(calls.borrow().contains(&"oauth_begin JIRA stored".into()));
+        assert_eq!(
+            log_in(&hangar, "JIRA", again(&["admin"])),
+            "--scope needs a URL, or --authorization-url and --token-url"
+        );
     }
 
     #[test]
-    fn a_login_refuses_static_values_missing_clients_and_plain_http() {
+    fn a_login_refuses_static_values_and_plain_http() {
         let refused = |broker: FakeBroker, args: LoginArgs| {
-            let hangar = oauth_hangar("login-refused", broker);
-            prepare_login(&hangar, &FakeHttps::default(), "JIRA", args)
-                .err()
-                .unwrap()
-                .to_string()
+            log_in(&oauth_hangar("login-refused", broker), "JIRA", args)
         };
         assert_eq!(
             refused(holding("JIRA", None), flags(&[])),
             "JIRA holds a static value: run 'hangar credential rm JIRA' first"
         );
-        let again = || LoginArgs {
-            source: ClientSource::Stored,
-            scopes: vec![],
-            client_secret: false,
-        };
-        let expected = "JIRA has no OAuth client to log in with: pass \
-                        --authorization-url, --token-url and --client-id";
-        assert_eq!(refused(FakeBroker::default(), again()), expected);
-        let mut no_authorize = stored_login("t", false);
-        if let Some(client) = &mut no_authorize.client {
-            client.authorization_url.clear();
-        }
         assert_eq!(
-            refused(holding("JIRA", Some(no_authorize)), again()),
-            expected
+            refused(FakeBroker::default(), again(&[])),
+            "JIRA has no OAuth client to log in with"
         );
-
         let plain = LoginArgs {
             source: ClientSource::Endpoints {
                 authorization_url: "https://a.example.com/authorize".into(),
@@ -783,6 +657,13 @@ mod tests {
             refused(FakeBroker::default(), plain),
             "http://a.example.com/token: expected an https:// URL"
         );
+        let broker = FakeBroker::default();
+        broker.logs_in.set(false);
+        assert_eq!(
+            refused(broker, flags(&[])),
+            "no login for JIRA yet: the browser page shows the result; \
+             check 'hangar credential list'"
+        );
         let hangar = oauth_hangar("login-name", FakeBroker::default());
         assert!(
             prepare_login(&hangar, &FakeHttps::default(), "_JIRA", flags(&[]))
@@ -791,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_url_must_be_https_and_come_back_to_the_vault() {
+    fn the_consent_url_must_be_https_and_come_back_to_the_broker() {
         let good = format!(
             "https://a.example.com/authorize?redirect_uri={}",
             FAKE_CALLBACK.replace('/', "%2F").replace(':', "%3A")
@@ -801,17 +682,14 @@ mod tests {
             check_consent(&good.replace("https", "http"), FAKE_CALLBACK)
                 .unwrap_err()
                 .to_string();
-        assert_eq!(
-            error,
-            "the vault's consent URL isn't https; not opening it"
-        );
+        assert_eq!(error, "the broker's login URL isn't https; not opening it");
         let old_tower = "https://a.example.com/authorize?redirect_uri=\
                          http%3A%2F%2F0.0.0.0%3A14321%2Fv1%2Foauth%2Fcallback";
         let error = check_consent(old_tower, FAKE_CALLBACK).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
-                "the vault sends logins back to \
+                "the broker sends logins back to \
                  http://0.0.0.0:14321/v1/oauth/callback, not {FAKE_CALLBACK}: \
                  restart the tower: hangar down && hangar up"
             )
@@ -821,56 +699,28 @@ mod tests {
 
         let broker = FakeBroker::default();
         *broker.consent.borrow_mut() = Some(old_tower.into());
+        let calls = broker.calls.clone();
         let hangar = oauth_hangar("login-old-tower", broker);
         let login =
             prepare_login(&hangar, &FakeHttps::default(), "JIRA", flags(&[]))
                 .unwrap();
-        let consent = connect(&hangar, &login).unwrap();
+        let pending = begin(&hangar, &login).unwrap();
         let opened = RefCell::new(0);
         let open = |_: &str| *opened.borrow_mut() += 1;
-        assert!(finish_login(&hangar, &login, &consent, &open).is_err());
+        assert!(finish_login(&hangar, &pending, &open).is_err());
         assert_eq!(*opened.borrow(), 0, "opened a URL it refused");
-    }
-
-    #[test]
-    fn the_wait_ends_on_new_tokens_or_gives_up() {
-        let broker = holding("JIRA", Some(stored_login("t", false)));
-        let pause = Duration::ZERO;
         assert!(
-            wait_for_tokens(&broker, "JIRA", Some("before"), 1, pause).is_ok()
-        );
-        let error = wait_for_tokens(&broker, "JIRA", Some("t"), 3, pause)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "no login for JIRA yet: the browser page shows the result; \
-             check 'hangar credential list'"
-        );
-        assert!(wait_for_tokens(&broker, "OTHER", None, 2, pause).is_err());
-        assert_eq!(
-            broker
-                .calls
+            !calls
                 .borrow()
                 .iter()
-                .filter(|c| *c == "credentials")
-                .count(),
-            6
+                .any(|call| call.starts_with("oauth_w"))
         );
     }
 
     #[test]
     fn set_refuses_an_oauth_credential() {
-        let state = scratch_dir("credential-set-oauth");
-        let broker = FakeBroker::default();
-        broker.keys.borrow_mut().insert("JIRA".into());
-        broker
-            .oauth
-            .borrow_mut()
-            .insert("JIRA".into(), OAuthLogin::default());
-        let sandbox = Rc::new(FakeSandbox::default());
-        let hangar =
-            hangar_with_broker("{}", &state, sandbox, Box::new(broker));
+        let broker = holding("JIRA", Some(OAuthState::NotConnected));
+        let hangar = oauth_hangar("set-oauth", broker);
         let error = read(&hangar, "JIRA").unwrap_err().to_string();
         assert_eq!(
             error,

@@ -12,6 +12,7 @@ pub(crate) mod fake;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::{Source, managed_credentials};
 use crate::error::{Context, Error, Result, bail};
@@ -176,31 +177,32 @@ pub(crate) struct BrokerHealth {
 
 /// A credential the broker holds, by name; never its value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredCredential {
+pub(crate) struct Credential {
     pub(crate) key: String,
-    /// `None` for a static value.
-    pub(crate) oauth: Option<OAuthLogin>,
+    pub(crate) kind: CredentialKind,
 }
 
-/// An OAuth credential's state, never its tokens.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct OAuthLogin {
-    pub(crate) connected: bool,
-    /// Changes whenever new tokens arrive.
-    pub(crate) refreshed_at: Option<String>,
-    pub(crate) error: Option<String>,
-    /// The client it logs in with, for a re-login.
-    pub(crate) client: Option<OAuthClient>,
-    /// The broker holds a client secret, which it never shows.
-    pub(crate) has_secret: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialKind {
+    Static,
+    OAuth(OAuthState),
 }
 
-/// The provider's endpoints and the client registered there: all public.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OAuthState {
+    Connected,
+    NotConnected,
+    /// The token endpoint's answer to the last refresh.
+    Failed(String),
+}
+
+/// The provider's endpoints and the client registered there.
+#[derive(Debug, Default)]
 pub(crate) struct OAuthClient {
     pub(crate) authorization_url: String,
     pub(crate) token_url: String,
     pub(crate) client_id: String,
+    pub(crate) client_secret: Option<Secret>,
     /// Space-separated.
     pub(crate) scopes: String,
     /// How the client authenticates at the token endpoint; empty for the
@@ -208,13 +210,20 @@ pub(crate) struct OAuthClient {
     pub(crate) token_auth_method: String,
 }
 
-/// What `oauth_connect` does with a client secret.
-pub(crate) enum ClientSecret {
-    /// A public client, or clear the stored secret.
-    None,
-    /// The one the broker already holds.
-    Keep,
-    New(Secret),
+/// A login waiting for the user's consent at `url`.
+pub(crate) struct PendingLogin {
+    pub(crate) key: String,
+    pub(crate) url: String,
+    /// The backend's own: how it tells this login has finished.
+    pub(crate) marker: String,
+}
+
+/// What `oauth_wait` returns when no login came in time.
+pub(crate) fn login_timed_out(key: &str) -> Error {
+    Error::with_hint(
+        format!("no login for {key} yet"),
+        "the browser page shows the result; check 'hangar credential list'",
+    )
 }
 
 /// The broker's admin login, for `hangar vault-ui`.
@@ -238,21 +247,30 @@ pub(crate) trait Broker {
     fn deny_unlisted(&self) -> Result<()>;
     /// Replaces the whole route set.
     fn set_routes(&self, routes: &[Route]) -> Result<()>;
-    fn credentials(&self) -> Result<Vec<StoredCredential>>;
+    fn credentials(&self) -> Result<Vec<Credential>>;
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()>;
     fn delete_credentials(&self, keys: &[String]) -> Result<()>;
     /// Where the provider sends the browser back after a login.
     fn oauth_redirect_uri(&self) -> Result<String> {
         Err(no_oauth())
     }
-    /// Saves `client` for `key` and returns the URL where the user
-    /// consents; the broker takes the tokens at its callback.
-    fn oauth_connect(
+    /// Saves `client` for `key` (`None`: the one it holds, secret
+    /// included) and returns where the user consents; the broker takes
+    /// the tokens at its callback.
+    fn oauth_begin(
         &self,
         _key: &str,
-        _client: &OAuthClient,
-        _secret: &ClientSecret,
-    ) -> Result<String> {
+        _client: Option<&OAuthClient>,
+    ) -> Result<PendingLogin> {
+        Err(no_oauth())
+    }
+    /// Blocks until `login` has its tokens; [`login_timed_out`] after
+    /// `timeout`.
+    fn oauth_wait(
+        &self,
+        _login: &PendingLogin,
+        _timeout: Duration,
+    ) -> Result<()> {
         Err(no_oauth())
     }
     /// What bay `bay` needs; mints its token the first time.
