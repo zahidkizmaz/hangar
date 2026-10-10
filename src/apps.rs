@@ -485,27 +485,9 @@ fn origin<'a>(origins: &'a BTreeMap<String, Origin>, name: &str) -> &'a Origin {
 mod tests {
     use super::BUILTINS;
     use crate::config::{BaySettings, Settings};
-    use crate::testing::resolved as resolve_text;
-
-    fn error(config: &str) -> String {
-        resolve_text(config).unwrap_err().to_string()
-    }
-
-    /// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
-    /// `"apps": ["web"]`), plus top-level `rest`.
-    fn one_bay(bay: &str, rest: &str) -> String {
-        let bay = if bay.is_empty() {
-            String::new()
-        } else {
-            format!(", {bay}")
-        };
-        let rest = if rest.is_empty() {
-            String::new()
-        } else {
-            format!(", {rest}")
-        };
-        format!(r#"{{"bays": [{{"name": "default"{bay}}}]{rest}}}"#)
-    }
+    use crate::testing::{
+        config_error as error, one_bay, resolved as resolve_text,
+    };
 
     fn bay(settings: &Settings) -> &BaySettings {
         &settings.bays[0]

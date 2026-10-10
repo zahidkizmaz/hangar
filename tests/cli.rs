@@ -25,7 +25,16 @@ fn write_default_config(machine: &Machine, json: &str) {
 /// hangar against the fakes: a scratch config and state, and the master
 /// password from the environment (never the keychain).
 fn run(machine: &Machine, config: &Path, args: &[&str]) -> Output {
-    machine.hangar(args, &env(machine, config))
+    run_with_env(machine, config, args, &[])
+}
+
+fn run_with_env(
+    machine: &Machine,
+    config: &Path,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Output {
+    machine.hangar(args, &[&env(machine, config)[..], extra].concat())
 }
 
 fn run_with_stdin(
@@ -1190,7 +1199,6 @@ fn unsafe_mount_sources_stop_up_before_anything_is_created() {
 
 #[test]
 fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
-    use std::os::unix::fs::PermissionsExt as _;
     let machine = Machine::new("bay-home");
     machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
@@ -1209,8 +1217,7 @@ fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
         output.contains(&format!("created {} for a mount", host.display())),
         "{output}"
     );
-    let mode = fs::metadata(&host).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o700);
+    assert_eq!(mode(&host), 0o700);
     let log = machine.msb_log();
     let create = lines_with(&log, "--name hangar-bay-default ");
     let home_mount = format!(
@@ -1327,15 +1334,8 @@ fn the_package_cache_follows_xdg_cache_home() {
     let vault = FakeVault::start(&machine.fake);
     let xdg = machine.home.join("xdg-cache");
     let with_xdg = |config: &Path, args: &[&str]| {
-        machine.hangar(
-            args,
-            &[
-                ("HANGAR_CONFIG", config.to_str().unwrap()),
-                ("HANGAR_STATE_DIR", machine.state.to_str().unwrap()),
-                ("HANGAR_MASTER_PASSWORD", PASSWORD),
-                ("XDG_CACHE_HOME", xdg.to_str().unwrap()),
-            ],
-        )
+        let xdg = ("XDG_CACHE_HOME", xdg.to_str().unwrap());
+        run_with_env(&machine, config, args, &[xdg])
     };
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&with_xdg(&config, &["up"]));
@@ -1864,15 +1864,8 @@ fn log_levels_come_from_flags_or_hangar_log() {
     assert!(trace.contains("trace: vault PATCH "), "{trace}");
 
     let env = |level| {
-        let output = machine.hangar(
-            &["status"],
-            &[
-                ("HANGAR_CONFIG", config.to_str().unwrap()),
-                ("HANGAR_STATE_DIR", machine.state.to_str().unwrap()),
-                ("HANGAR_LOG", level),
-            ],
-        );
-        stderr(ok(&output))
+        let log = [("HANGAR_LOG", level)];
+        stderr(ok(&run_with_env(&machine, &config, &["status"], &log)))
     };
     assert!(env("debug").contains("debug: run: msb "));
     assert!(!env("error").contains("debug:"));

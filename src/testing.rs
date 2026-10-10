@@ -13,6 +13,7 @@ use crate::config::{Settings, defaults, resolve};
 use crate::error::Result;
 use crate::hangar::Hangar;
 use crate::json;
+use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
 use crate::state::StateDir;
 
@@ -41,6 +42,42 @@ pub(crate) fn resolved(config: &str) -> Result<Settings> {
 
 pub(crate) fn settings(config: &str) -> Settings {
     resolved(config).unwrap()
+}
+
+pub(crate) fn config_error(config: &str) -> String {
+    resolved(config).unwrap_err().to_string()
+}
+
+/// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
+/// `"apps": ["web"]`), plus top-level `rest`.
+pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
+    let bay = if bay.is_empty() {
+        String::new()
+    } else {
+        format!(", {bay}")
+    };
+    let rest = if rest.is_empty() {
+        String::new()
+    } else {
+        format!(", {rest}")
+    };
+    format!(r#"{{"bays": [{{"name": "default"{bay}}}]{rest}}}"#)
+}
+
+/// Roots for bay `default` in a scratch home, with `state` (created) and
+/// `cache` under it.
+pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
+    let state = home.join(state);
+    fs::create_dir_all(&state).unwrap();
+    let cache = home.join(cache);
+    Roots::new(
+        home,
+        &state,
+        &cache,
+        &state.join("bays/default/home"),
+        &cache.join("bays/default"),
+    )
+    .unwrap()
 }
 
 /// An environment of just `pairs`, for code that takes a `Var`.

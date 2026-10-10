@@ -405,7 +405,7 @@ mod tests {
         overlaps, recheck, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
-    use crate::testing::scratch_dir;
+    use crate::testing::{roots, scratch_dir};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -427,22 +427,6 @@ mod tests {
 
     fn source(host: &str, writable: bool) -> Result<(), &'static str> {
         check_source(Path::new(host), writable, &bay_roots(STATE, CACHE))
-    }
-
-    /// Roots for bay `default` in a scratch home, with `state` created
-    /// under it and the cache root at `~/.cache/hangar`.
-    fn roots(home: &Path, state: &str) -> Roots {
-        let state = home.join(state);
-        fs::create_dir_all(&state).unwrap();
-        let cache = home.join(".cache/hangar");
-        Roots::new(
-            home,
-            &state,
-            &cache,
-            &state.join("bays/default/home"),
-            &cache.join("bays/default"),
-        )
-        .unwrap()
     }
 
     fn mounts(entries: &[(&str, &str, bool)]) -> BTreeMap<String, MountSpec> {
@@ -530,7 +514,7 @@ mod tests {
     #[test]
     fn resolve_follows_symlinks_and_needs_directories() {
         let home = fs::canonicalize(scratch_dir("mount-resolve")).unwrap();
-        let roots = roots(&home, "state");
+        let roots = roots(&home, "state", ".cache/hangar");
         fs::create_dir_all(home.join("data")).unwrap();
         fs::create_dir_all(home.join(".config")).unwrap();
         fs::write(home.join("file"), "x").unwrap();
@@ -569,7 +553,7 @@ mod tests {
     fn missing_sources_are_checked_then_created_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let home = fs::canonicalize(scratch_dir("mount-create")).unwrap();
-        let roots = roots(&home, ".local/share/hangar");
+        let roots = roots(&home, ".local/share/hangar", ".cache/hangar");
         fs::create_dir_all(home.join("work")).unwrap();
         fs::create_dir_all(home.join(".ssh")).unwrap();
         fs::set_permissions(
@@ -841,7 +825,7 @@ mod tests {
     #[test]
     fn a_symlinked_default_folder_loses_the_exception() {
         let home = fs::canonicalize(scratch_dir("mount-own-link")).unwrap();
-        let roots = roots(&home, ".local/share/hangar");
+        let roots = roots(&home, ".local/share/hangar", ".cache/hangar");
         let own = home.join(".cache/hangar/bays/default");
         fs::create_dir_all(home.join(".config")).unwrap();
         fs::create_dir_all(own.parent().unwrap()).unwrap();

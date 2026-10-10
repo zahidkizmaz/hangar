@@ -777,17 +777,9 @@ mod tests {
     use super::*;
 
     use crate::testing::{
-        resolved as resolve_text, settings as resolve_with, vars,
+        config_error as error, one_bay, resolved as resolve_text,
+        settings as resolve_with, vars,
     };
-
-    fn error(config: &str) -> String {
-        resolve_text(config).unwrap_err().to_string()
-    }
-
-    /// One bay `default` with `bay`'s fields (a JSON fragment).
-    fn one_bay(bay: &str) -> String {
-        format!(r#"{{"bays": [{{"name": "default", {bay}}}]}}"#)
-    }
 
     fn names(settings: &Settings) -> Vec<&str> {
         settings.bays.iter().map(|bay| bay.name.as_str()).collect()
@@ -934,15 +926,15 @@ mod tests {
     #[test]
     fn bad_bay_values_name_the_bay() {
         assert_eq!(
-            error(&one_bay(r#""packages": ["a", 1]"#)),
+            error(&one_bay(r#""packages": ["a", 1]"#, "")),
             "config.bays.default.packages: expected strings"
         );
         assert_eq!(
-            error(&one_bay(r#""cpus": 8.5"#)),
+            error(&one_bay(r#""cpus": 8.5"#, "")),
             "config.bays.default.cpus: expected a whole number"
         );
         assert_eq!(
-            error(&one_bay(r#""cpu": 8"#)),
+            error(&one_bay(r#""cpu": 8"#, "")),
             "config.bays.default.cpu: unknown setting"
         );
     }
@@ -979,10 +971,10 @@ mod tests {
         let bay = |config: &str| resolve_with(config).bays.remove(0);
         let unset = bay("{}");
         assert_eq!((unset.home, unset.cache), (true, true));
-        let off = bay(&one_bay(r#""home": false, "cache": false"#));
+        let off = bay(&one_bay(r#""home": false, "cache": false"#, ""));
         assert_eq!((off.home, off.cache), (false, false));
         for value in ["null", r#""~/h""#, "1"] {
-            let message = error(&one_bay(&format!(r#""cache": {value}"#)));
+            let message = error(&one_bay(&format!(r#""cache": {value}"#), ""));
             assert_eq!(
                 message,
                 "config.bays.default.cache: expected true or false"
@@ -990,6 +982,7 @@ mod tests {
         }
         let mount = one_bay(
             r#""mounts": {"~/data": {"host": "~/d", "writable": null}}"#,
+            "",
         );
         assert!(!bay(&mount).mounts["/home/pilot/data"].writable);
     }
@@ -1053,7 +1046,8 @@ mod tests {
                 "overlap",
             ),
         ] {
-            let message = error(&one_bay(&format!(r#""mounts": {mounts}"#)));
+            let message =
+                error(&one_bay(&format!(r#""mounts": {mounts}"#), ""));
             assert!(message.contains(why), "{mounts}: {message}");
         }
     }
@@ -1067,11 +1061,11 @@ mod tests {
             format!("ghcr.io/zahidkizmaz/hangar-bay:v{version}")
         );
         assert_eq!(
-            image(&one_bay(r#""imageRepository": "ghcr.io/fork/agent""#)),
+            image(&one_bay(r#""imageRepository": "ghcr.io/fork/agent""#, "")),
             format!("ghcr.io/fork/agent:v{version}")
         );
         assert_eq!(
-            image(&one_bay(r#""image": "hangar-bay:dev""#)),
+            image(&one_bay(r#""image": "hangar-bay:dev""#, "")),
             "hangar-bay:dev"
         );
     }
@@ -1255,20 +1249,21 @@ mod tests {
 
     #[test]
     fn bay_env_and_run_are_validated() {
-        let lower = error(&one_bay(r#""env": {"lower": "x"}"#));
+        let lower = error(&one_bay(r#""env": {"lower": "x"}"#, ""));
         assert!(lower.contains("UPPER_SNAKE_CASE"), "{lower}");
         for secret in ["ghp_abc", "sk-ant-123", &"a".repeat(40)] {
             let message =
-                error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#)));
+                error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#), ""));
             assert!(message.contains("looks like a real secret"), "{message}");
             assert!(message.contains("hangar credential set T"), "{message}");
         }
         let ok = resolve_with(&one_bay(
             r#""env": {"T": "placeholder value"}, "run": {"paper-clip2": "x"}"#,
+            "",
         ));
         assert_eq!(ok.bays[0].env["T"], "placeholder value");
         assert_eq!(ok.bays[0].run["paper-clip2"], "x");
-        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#));
+        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#, ""));
         assert_eq!(
             name,
             "config.bays.default.run.Bad Name: names are lowercase, digits and -"

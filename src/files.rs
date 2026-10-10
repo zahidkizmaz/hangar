@@ -397,8 +397,7 @@ mod tests {
         is_credentials_file, plan, plan_copy, vm_path,
     };
     use crate::error::Result;
-    use crate::mounts::Roots;
-    use crate::testing::scratch_dir;
+    use crate::testing::{roots, scratch_dir};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -512,7 +511,8 @@ mod tests {
             ),
         ]);
 
-        let copies = plan(&files, &home, &roots(&home)).unwrap();
+        let copies =
+            plan(&files, &home, &roots(&home, "state", "cache")).unwrap();
         let summary: Vec<(&str, bool)> = copies
             .iter()
             .map(|c| (c.vm.as_str(), c.executable))
@@ -528,24 +528,11 @@ mod tests {
         assert_eq!(copies[0].contents, b"be terse");
     }
 
-    /// `home/state` and `home/cache` as the roots, for bay `default`.
-    fn roots(home: &Path) -> Roots {
-        let state = home.join("state");
-        fs::create_dir_all(&state).unwrap();
-        let cache = home.join("cache");
-        Roots::new(
-            home,
-            &state,
-            &cache,
-            &state.join("bays/default/home"),
-            &cache.join("bays/default"),
-        )
-        .unwrap()
-    }
-
     fn refusal(home: &Path, vm: &str, host: &str) -> String {
         let files = BTreeMap::from([(vm.into(), host.into())]);
-        plan(&files, home, &roots(home)).unwrap_err().to_string()
+        plan(&files, home, &roots(home, "state", "cache"))
+            .unwrap_err()
+            .to_string()
     }
 
     #[test]
