@@ -1808,8 +1808,8 @@ fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
     assert!(error.contains("PLAIN holds a static value"), "{error}");
     let partial = ["credential", "login", "JIRA", "--token-url", "https://t"];
     let alone = ["credential", "login", "JIRA", "--client-id", "c"];
-    let error = failed(&run(&machine, &config, &alone));
-    assert!(error.contains("--client-id needs a URL"), "{error}");
+    let error = usage_error(&run(&machine, &config, &alone));
+    assert!(error.contains("<URL|--authorization-url <URL>>"), "{error}");
     let error = usage_error(&run(&machine, &config, &partial));
     assert!(error.contains("--authorization-url"), "{error}");
     let again = ["credential", "login", "NEW"];

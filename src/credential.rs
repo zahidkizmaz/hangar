@@ -151,33 +151,25 @@ pub(crate) enum ClientSource {
 }
 
 impl ClientSource {
-    /// clap keeps the endpoint flags together and apart from a URL; a
-    /// client id alone is all it lets through.
+    /// clap keeps the endpoint flags together and apart from a URL, and
+    /// refuses a client id or scope without either.
     pub(crate) fn from_flags(
         url: Option<String>,
         authorization_url: Option<String>,
         token_url: Option<String>,
         client_id: Option<String>,
-    ) -> Result<Self> {
-        Ok(match (url, authorization_url, token_url, client_id) {
-            (Some(url), None, None, client_id) => {
-                Self::Discover { url, client_id }
+    ) -> Self {
+        match (url, authorization_url, token_url, client_id) {
+            (Some(url), _, _, client_id) => Self::Discover { url, client_id },
+            (_, Some(authorization_url), Some(token_url), Some(client_id)) => {
+                Self::Endpoints {
+                    authorization_url,
+                    token_url,
+                    client_id,
+                }
             }
-            (
-                None,
-                Some(authorization_url),
-                Some(token_url),
-                Some(client_id),
-            ) => Self::Endpoints {
-                authorization_url,
-                token_url,
-                client_id,
-            },
-            (None, None, None, None) => Self::Stored,
-            _ => bail!(
-                "--client-id needs a URL, or --authorization-url and --token-url"
-            ),
-        })
+            _ => Self::Stored,
+        }
     }
 }
 
@@ -213,14 +205,11 @@ pub(crate) fn prepare_login(
         ));
     }
     let (authorization_url, token_url, client_id) = match args.source {
-        ClientSource::Stored if args.scopes.is_empty() => {
+        ClientSource::Stored => {
             return Ok(Login {
                 name: name.to_string(),
                 client: None,
             });
-        }
-        ClientSource::Stored => {
-            bail!("--scope needs a URL, or --authorization-url and --token-url")
         }
         ClientSource::Endpoints {
             authorization_url,
@@ -484,10 +473,10 @@ mod tests {
         }
     }
 
-    fn again(scopes: &[&str]) -> LoginArgs {
+    fn again() -> LoginArgs {
         LoginArgs {
             source: ClientSource::Stored,
-            ..flags(scopes)
+            ..flags(&[])
         }
     }
 
@@ -597,24 +586,19 @@ mod tests {
         };
         assert!(matches!(
             source(some("https://u.example.com"), None, None, some("c")),
-            Ok(ClientSource::Discover {
+            ClientSource::Discover {
                 client_id: Some(_),
                 ..
-            })
+            }
         ));
         assert!(matches!(
             source(None, some("https://a"), some("https://t"), some("c")),
-            Ok(ClientSource::Endpoints { .. })
+            ClientSource::Endpoints { .. }
         ));
         assert!(matches!(
             source(None, None, None, None),
-            Ok(ClientSource::Stored)
+            ClientSource::Stored
         ));
-        let error = source(None, None, None, some("c")).err().unwrap();
-        assert_eq!(
-            error.to_string(),
-            "--client-id needs a URL, or --authorization-url and --token-url"
-        );
     }
 
     #[test]
@@ -622,12 +606,8 @@ mod tests {
         let broker = holding("JIRA", Some(OAuthState::Failed("x".into())));
         let calls = broker.calls.clone();
         let hangar = oauth_hangar("relogin", broker);
-        assert_eq!(log_in(&hangar, "JIRA", again(&[])), "");
+        assert_eq!(log_in(&hangar, "JIRA", again()), "");
         assert!(calls.borrow().contains(&"oauth_begin JIRA stored".into()));
-        assert_eq!(
-            log_in(&hangar, "JIRA", again(&["admin"])),
-            "--scope needs a URL, or --authorization-url and --token-url"
-        );
     }
 
     #[test]
@@ -640,7 +620,7 @@ mod tests {
             "JIRA holds a static value: run 'hangar credential rm JIRA' first"
         );
         assert_eq!(
-            refused(FakeBroker::default(), again(&[])),
+            refused(FakeBroker::default(), again()),
             "JIRA has no OAuth client to log in with"
         );
         let plain = LoginArgs {

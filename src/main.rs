@@ -34,7 +34,7 @@ mod vm_record;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, ArgGroup, Parser, Subcommand};
 use config::{Paths, env_var};
 use error::Result;
 use hangar::Hangar;
@@ -253,6 +253,8 @@ enum CredentialCommand {
                             --token-url https://auth.example.com/token \\\n    \
                             --client-id abc123 --client-secret --scope read\n  \
                             hangar credential login ATLASSIAN")]
+    #[command(group = ArgGroup::new("provider")
+        .args(["url", "authorization_url"]))]
     Login {
         /// UPPER_SNAKE_CASE, the name a route injects
         name: String,
@@ -266,13 +268,13 @@ enum CredentialCommand {
         #[arg(long, value_name = "URL", requires_all = ["authorization_url", "client_id"])]
         token_url: Option<String>,
         /// The client you registered with the provider
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", requires = "provider")]
         client_id: Option<String>,
         /// Read the client's secret (hidden prompt, or stdin)
         #[arg(long, requires = "client_id")]
         client_secret: bool,
         /// A scope to ask for; repeat for several
-        #[arg(long = "scope", value_name = "SCOPE")]
+        #[arg(long = "scope", value_name = "SCOPE", requires = "provider")]
         scopes: Vec<String>,
     },
     /// Delete a credential you stored (for an OAuth one, its login)
@@ -389,7 +391,7 @@ fn run(command: Command) -> Result<Outcome> {
                     authorization_url,
                     token_url,
                     client_id,
-                )?;
+                );
                 let args = credential::LoginArgs {
                     source,
                     scopes,
