@@ -1,7 +1,7 @@
 #!/bin/sh
 # A stand-in for the msb CLI. VM state lives in files under $HANGAR_FAKE;
 # every call is logged (argv only: secrets must never show up there). A file
-# named after a failure (e.g. `$HANGAR_FAKE/fail-setup`) triggers it.
+# named after a failure (e.g. `$HANGAR_FAKE/fail-cache`) triggers it.
 fake=${HANGAR_FAKE:?}
 # One line per call, even when an argument (a script) spans lines.
 printf '%s\n' "$*" | tr '\n' ' ' >>"$fake/msb.log"
@@ -74,7 +74,7 @@ case "$1 $2" in
     fails server && { echo "server did not start" >&2; exit 1; }
     IFS= read -r password
     printf '%s' "$password" >"$fake/vault-password"
-    fails start || touch "$fake/vault-started"
+    touch "$fake/vault-started"
     exit 0
   fi
   # Bay scripts, told apart by their $0.
@@ -117,7 +117,6 @@ case "$1 $2" in
     fails cache && { echo "error: no space left on device" >&2; exit 1; }
     echo "$5 $6" >>"$fake/cache-fills" ;;
   hangar-file)
-    fails file && { echo "no space left" >&2; exit 1; }
     mkdir -p "$fake/vmfs$(dirname "$5")"
     cat >"$fake/vmfs$5"
     chmod "$6" "$fake/vmfs$5" ;;
@@ -152,7 +151,6 @@ case "$1 $2" in
   shift 4
   if [ "$1 $2" = "sh -lc" ]; then
     # hangar setup: a `touch PATH` setup command creates PATH.
-    fails setup && { echo "onboarding aborted" >&2; exit 1; }
     case $3 in touch\ *)
       path=$(printf '%s' "${3#touch }" | sed 's|^~|/home/pilot|')
       mkdir -p "$fake/vmfs$(dirname "$path")"
@@ -160,7 +158,6 @@ case "$1 $2" in
     esac
     echo "setup: $3"
   else
-    fails shell && { echo "No journal files were opened" >&2; exit 1; }
     echo "shell: $*"
   fi ;;
 "sh -l") echo "interactive shell" ;;

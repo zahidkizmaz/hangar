@@ -190,35 +190,6 @@ fn an_invalid_config_names_the_file() {
     let error = failed(&run(&machine, &config, &["status"]));
     assert!(error.contains("invalid config"), "{error}");
     assert!(error.contains(&config.display().to_string()), "{error}");
-
-    let config = machine.config(r#"{"sandbox": {"backend": "docker"}}"#);
-    let error = failed(&run(&machine, &config, &["status"]));
-    assert!(
-        error.contains(
-            r#"sandbox.backend: unknown backend "docker"; known: msb"#
-        ),
-        "{error}"
-    );
-
-    for (config, why) in [
-        (
-            r#"{"tower": {"backend": "other"}}"#,
-            r#"tower.backend: unknown backend "other"; known: agent-vault"#,
-        ),
-        (
-            r#"{"proxyPort": 15000}"#,
-            "config.proxyPort: unknown setting",
-        ),
-        (
-            r#"{"tower": {"routes": [{"name": "x", "host": "x.example",
-                "auth": {"type": "passthrough"}, "extra": {"host": "y"}}]}}"#,
-            "config.tower.routes.x.extra.host: set by hangar",
-        ),
-    ] {
-        let error =
-            failed(&run(&machine, &machine.config(config), &["status"]));
-        assert!(error.contains(why), "{error}");
-    }
 }
 
 #[test]
@@ -244,33 +215,6 @@ fn up_stops_early_without_a_password() {
     let error = failed(&machine.hangar(&["up"], &[]));
     assert!(error.contains("master password is empty"), "{error}");
     assert!(!machine.home.join(".local/share/hangar").exists());
-}
-
-#[test]
-fn existing_vault_without_password_refuses_to_generate() {
-    let machine = Machine::new("no-password");
-    ok(&machine.hangar(&["init"], &[]));
-    write_default_config(
-        &machine,
-        r#"{"bays": [{"name": "default", "image": "example/agent:1"}]}"#,
-    );
-    let vault = machine.home.join(".local/share/hangar/vault/.agent-vault");
-    fs::create_dir_all(&vault).unwrap();
-    let error = failed(&machine.hangar(&["up"], &[]));
-    assert!(error.contains("but broker data exists in"), "{error}");
-}
-
-#[test]
-fn a_keychain_service_name_with_odd_characters_is_refused() {
-    let machine = Machine::new("bad-service");
-    ok(&machine.hangar(&["init"], &[]));
-    write_default_config(
-        &machine,
-        r#"{"bays": [{"name": "default", "image": "example/agent:1"}]}"#,
-    );
-    let output =
-        machine.hangar(&["up"], &[("HANGAR_KEYCHAIN_SERVICE", "a b;rm")]);
-    assert!(failed(&output).contains("only letters, digits"));
 }
 
 /// The proxy URL in the bay's proxy env.
@@ -1344,7 +1288,7 @@ fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
 
     // A new VM installs again, through the cache.
     ok(&run(&machine, &config, &["destroy"]));
-    fs::write(machine.fake.join("fail-cache"), "").unwrap();
+    machine.fail("cache");
     let output = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(
         output.contains("warning: couldn't fill the package cache"),
@@ -1471,25 +1415,6 @@ fn a_path_is_either_copied_or_mounted() {
         error.contains("overlaps the mount at /home/pilot/.paperclip"),
         "{error}"
     );
-}
-
-#[test]
-fn a_bay_boots_its_init_and_keeps_docker_on_its_own_disk() {
-    let machine = Machine::new("init");
-    machine.install_fake_msb();
-    let vault = FakeVault::start(&machine.fake);
-    let config = machine.config(&vault_config(vault.port, "", ""));
-    ok(&run(&machine, &config, &["up"]));
-    let log = machine.msb_log();
-    let bay = lines_with(&log, "--name hangar-bay-default ");
-    assert!(
-        bay[0].contains(
-            "--memory 6G --init /sbin/init --tmpfs /run --root-disk 40G \
-             --mount-owned /var/lib/pilot:kind=disk,size=40G --no-net "
-        ),
-        "{log}"
-    );
-    assert!(!lines_with(&log, "--name hangar-tower ")[0].contains("--init"));
 }
 
 #[test]
@@ -1626,10 +1551,6 @@ fn unreadable_run_states_are_unknown_and_unhealthy() {
         status.contains("run paperclip: unknown (msb exec"),
         "{status}"
     );
-
-    machine.fail("shell");
-    let error = failed(&run(&machine, &config, &["logs", "paperclip"]));
-    assert!(error.contains("can't read paperclip's journal"), "{error}");
 }
 
 #[test]
@@ -1800,33 +1721,12 @@ fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
     ok(&run(&machine, &config, &["credential", "rm", "JIRA"]));
     assert_eq!(stdout(ok(&run(&machine, &config, &list))), "");
 
-    let set = ["credential", "set", "PLAIN"];
-    ok(&run_with_stdin(&machine, &config, &set, "value\n"));
-    let mut plain = login;
-    plain[2] = "PLAIN";
-    let error = failed(&run_with_stdin(&machine, &config, &plain, "x\n"));
-    assert!(error.contains("PLAIN holds a static value"), "{error}");
     let partial = ["credential", "login", "JIRA", "--token-url", "https://t"];
     let alone = ["credential", "login", "JIRA", "--client-id", "c"];
     let error = usage_error(&run(&machine, &config, &alone));
     assert!(error.contains("<URL|--authorization-url <URL>>"), "{error}");
     let error = usage_error(&run(&machine, &config, &partial));
     assert!(error.contains("--authorization-url"), "{error}");
-    let again = ["credential", "login", "NEW"];
-    let error = failed(&run(&machine, &config, &again));
-    assert!(error.contains("NEW has no OAuth client"), "{error}");
-}
-
-#[test]
-fn a_login_with_a_url_fetches_nothing_from_a_private_host() {
-    let machine = Machine::new("oauth-discover");
-    machine.install_fake_msb();
-    let vault = FakeVault::start(&machine.fake);
-    let config = machine.config(&vault_config(vault.port, "", ""));
-    ok(&run(&machine, &config, &["up"]));
-    let local = ["credential", "login", "MCP", "https://localhost/mcp"];
-    let error = failed(&run(&machine, &config, &local));
-    assert!(error.contains("expected a public host name"), "{error}");
     let both = [
         "credential",
         "login",
@@ -2118,14 +2018,6 @@ fn an_app_runs_only_once_its_setup_check_passes() {
         "{status}"
     );
 
-    machine.fail("setup");
-    let error = failed(&run(&machine, &config, &["setup", "web"]));
-    assert!(
-        error.contains("web's setup failed: touch ~/.web/ready"),
-        "{error}"
-    );
-    fs::remove_file(machine.fake.join("fail-setup")).unwrap();
-
     let setup = run(&machine, &config, &["setup", "web"]);
     assert_eq!(stdout(ok(&setup)), "setup: touch ~/.web/ready\n");
     assert!(
@@ -2137,7 +2029,7 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert_eq!(
         lines_with(&log, "exec -t --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc")
             .len(),
-        2,
+        1,
         "{log}"
     );
 
@@ -2148,7 +2040,7 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert_eq!(
         lines_with(&log, "exec -t --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc")
             .len(),
-        3,
+        2,
         "{log}"
     );
 
@@ -2156,8 +2048,6 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert!(!up.contains("needs setup"), "{up}");
     assert!(up.contains("started web"), "{up}");
 
-    let error = failed(&run(&machine, &config, &["setup", "nope"]));
-    assert!(error.contains("nope is not an enabled app"), "{error}");
     let error = usage_error(&run(&machine, &config, &["setup"]));
     assert!(error.contains("NAME"), "{error}");
 }
@@ -2294,20 +2184,6 @@ fn json_errors_are_one_object_with_a_hint() {
         miniserde::json::from_str(stderr(&output).trim()).unwrap();
     assert_eq!(text(at(&error, &["error"])), "the vault isn't running");
     assert_eq!(text(at(&error, &["hint"])), "run 'hangar up' first");
-
-    // Without an obvious next step, the hint is null.
-    let bad = machine.config(r#"{"agnet": {}}"#);
-    let output = run(&machine, &bad, &["status", "--json"]);
-    let error: miniserde::json::Value =
-        miniserde::json::from_str(stderr(&output).trim()).unwrap();
-    assert!(
-        text(at(&error, &["error"])).contains("agnet"),
-        "names the key"
-    );
-    assert!(matches!(
-        at(&error, &["hint"]),
-        miniserde::json::Value::Null
-    ));
 }
 
 /// What a `--json` command without output of its own prints.

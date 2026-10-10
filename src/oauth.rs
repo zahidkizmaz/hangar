@@ -491,6 +491,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_private_host_is_refused_before_any_request() {
+        let https = FakeHttps::default();
+        let error = discover(&https, "https://localhost/mcp").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "https://localhost/mcp: expected a public host name"
+        );
+        assert_eq!(requests(&https), Vec::<String>::new());
+    }
+
     fn atlassian() -> Provider {
         let https = FakeHttps::default().answer(ATLASSIAN_AS, 200, ATLASSIAN);
         discover(&https, "https://mcp.atlassian.com/v1/mcp").unwrap()
