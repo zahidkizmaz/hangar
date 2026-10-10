@@ -1,7 +1,7 @@
 #!/bin/sh
 # A stand-in for the msb CLI. VM state lives in files under $HANGAR_FAKE;
 # every call is logged (argv only: secrets must never show up there). A file
-# named after a failure (e.g. `$HANGAR_FAKE/fail-register`) triggers it.
+# named after a failure (e.g. `$HANGAR_FAKE/fail-setup`) triggers it.
 fake=${HANGAR_FAKE:?}
 # One line per call, even when an argument (a script) spans lines.
 printf '%s\n' "$*" | tr '\n' ' ' >>"$fake/msb.log"
@@ -144,15 +144,6 @@ case "$1 $2" in
     if [ -f "$fake/run-$entry" ]; then echo active; else echo inactive; fi ;;
   *) echo "unexpected bay script: $4" >&2; exit 2 ;;
   esac ;;
-"agent-vault auth")
-  fails "$3" && { echo "$3 failed" >&2; exit 1; }
-  cat >"$fake/owner-$3"
-  mkdir -p "$HANGAR_STATE_DIR/vault/.agent-vault"
-  echo '{"token":"session-token"}' \
-    >"$HANGAR_STATE_DIR/vault/.agent-vault/session.json" ;;
-"agent-vault agent") echo agent-token-1 ;;
-"agent-vault vault") cat >"$fake/services.json" ;;
-"agent-vault ca") echo FAKE-CA ;;
 "nix profile")
   # nix profile remove --profile <profile> <element>…
   shift 5

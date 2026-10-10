@@ -227,7 +227,7 @@ changed):
    a later part of the start fails, so the next `up` can finish it.
 4. Deny mode; the core then reads the policy back (`Broker::health`) and
    refuses to go on unless unlisted hosts are denied.
-5. Routes (the whole set; agent-vault: `service set -f -` on stdin).
+5. Routes (the whole set; agent-vault: one `PUT` of its services).
 6. Credentials from `tower.credentialFiles` (values on stdin or in a request
    body); delete those in `credential-keys` that left the config. The
    broker only ever gets explicit keys.
@@ -453,7 +453,7 @@ reach them by name.
 - `src/broker/mod.rs`: the `Broker` trait, `Route`/`Auth`, and the core
   side: the pre-flight, `tower-vm`, the deny check, the credential
   reconcile, the bays' tokens and the access check. `src/broker/agent_vault.rs` is the
-  agent-vault backend (its VM, CLI, admin API and state files) and
+  agent-vault backend (its VM, admin API and state files) and
   `src/broker/fake.rs` the in-process test double.
 - `src/bay.rs`: `Bay` and its steps (its pre-flight, create or start,
   image loading, placeholders, `run`).

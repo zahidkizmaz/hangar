@@ -179,7 +179,8 @@ pub struct Request {
 
 /// agent-vault's admin API, as far as hangar uses it. Healthy once the fake
 /// msb has "started" the server (`$HANGAR_FAKE/vault-started`); with
-/// `$HANGAR_FAKE/fail-deny` a deny PATCH succeeds but changes nothing.
+/// `$HANGAR_FAKE/fail-deny` a deny PATCH succeeds but changes nothing, and
+/// `fail-register` or `fail-login` fails the owner's.
 pub struct FakeVault {
     pub port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -210,14 +211,19 @@ impl FakeVault {
         self.requests.lock().unwrap().clone()
     }
 
-    /// Admin calls only: health checks and port probes (`GET /`) are
-    /// noise for assertions.
+    /// Calls with the session token only: health checks, port probes
+    /// (`GET /`), the owner's login and the CA are noise for assertions.
     pub fn admin_requests(&self) -> Vec<Request> {
+        let public = [
+            "/health",
+            "/",
+            "/v1/auth/register",
+            "/v1/auth/login",
+            "/v1/mitm/ca.pem",
+        ];
         self.requests()
             .into_iter()
-            .filter(|request| {
-                !["/health", "/"].contains(&request.path.as_str())
-            })
+            .filter(|request| !public.contains(&request.path.as_str()))
             .collect()
     }
 }
@@ -359,6 +365,24 @@ fn serve(
             200,
             format!(r#"{{"unmatched_host_policy":"{}"}}"#, vault.policy),
         ),
+        ("POST", "/v1/auth/register" | "/v1/auth/login") => {
+            let action = &path["/v1/auth/".len()..];
+            let password = body_field(&body, "password");
+            fs::write(fake.join(format!("owner-{action}")), password).unwrap();
+            if fake.join(format!("fail-{action}")).exists() {
+                (500, format!(r#"{{"error":"{action} failed"}}"#))
+            } else {
+                (200, r#"{"token":"session-token"}"#.to_string())
+            }
+        }
+        ("POST", "/v1/agents") => {
+            (200, r#"{"av_agent_token":"agent-token-1"}"#.to_string())
+        }
+        ("PUT", "/v1/vaults/default/services") => {
+            fs::write(fake.join("services.json"), &body).unwrap();
+            (200, "{}".to_string())
+        }
+        ("GET", "/v1/mitm/ca.pem") => (200, "FAKE-CA\n".to_string()),
         ("GET", "/v1/credentials?vault=default") => (200, vault.list()),
         ("POST", "/v1/credentials/oauth/connect") => {
             (200, vault.connect(&body))

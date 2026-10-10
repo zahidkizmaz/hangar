@@ -16,13 +16,13 @@ use super::{
 };
 use crate::config::{Fields, valid_bay_name};
 use crate::error::{Context, Result, bail};
-use crate::http::{self, Request};
+use crate::http;
 use crate::json::{self, Json};
 use crate::sandbox::{
     BoxState, Egress, Mount, MountMode, PublishedPort, Sandbox, TOWER_VM,
     VmSpec,
 };
-use crate::secret::{Secret, random_hex};
+use crate::secret::{Secret, random_hex, trim_line_end};
 use crate::state::write_private;
 use log::info;
 use miniserde::json::{Array, Object};
@@ -30,9 +30,6 @@ use miniserde::json::{Array, Object};
 /// The admin API and the proxy inside the VM.
 const ADMIN_PORT: u16 = 14321;
 const PROXY_PORT: u16 = 14322;
-fn inner_address() -> String {
-    format!("http://127.0.0.1:{ADMIN_PORT}")
-}
 const OWNER_EMAIL: &str = "owner@hangar.local";
 /// All of hangar's credentials and settings live in this vault.
 const VAULT: &str = "default";
@@ -126,7 +123,7 @@ impl AgentVault {
     }
 
     fn healthy(&self) -> bool {
-        http::get(self.admin_port, "/health", Duration::from_secs(2))
+        http::get(self.admin_port, "/health")
             .is_ok_and(|response| response.status == 200)
     }
 
@@ -138,10 +135,6 @@ impl AgentVault {
             thread::sleep(pause);
         }
         false
-    }
-
-    fn exec(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-        self.sandbox.exec(TOWER_VM, None, command, stdin)
     }
 
     fn create_vm(&self) -> Result<()> {
@@ -176,6 +169,7 @@ impl AgentVault {
         })
     }
 
+    /// Keeps the session where agent-vault's CLI keeps it.
     fn ensure_owner(&self) -> Result<()> {
         let file = self.owner_password();
         let action = if file.exists() {
@@ -184,25 +178,20 @@ impl AgentVault {
             write_private(&file, random_hex(24)?.as_bytes())?;
             "register"
         };
-        let password = fs::read(&file).context(file.display())?;
-        let result = self.exec(
-            &[
-                "agent-vault",
-                "auth",
-                action,
-                "--address",
-                &inner_address(),
-                "--email",
-                OWNER_EMAIL,
-                "--password-stdin",
-            ],
-            Some(&password),
-        );
-        if result.is_err() && action == "register" {
+        let password = fs::read_to_string(&file).context(file.display())?;
+        let body = json::stringify(&json::object([
+            ("email", json::string(OWNER_EMAIL)),
+            ("password", json::string(trim_line_end(&password))),
+            ("device_label", json::string("hangar")),
+        ]));
+        let path = format!("/v1/auth/{action}");
+        let reply =
+            http::call(self.admin_port, "POST", &path, None, Some(&body));
+        if reply.is_err() && action == "register" {
             // Otherwise every later run would try to log in with it.
             fs::remove_file(&file).context(file.display())?;
         }
-        result.map(drop)
+        write_private(&self.session(), reply?.as_bytes())
     }
 
     /// The bay's token, and whether it was just renewed. Without a token
@@ -214,21 +203,15 @@ impl AgentVault {
             let token = fs::read_to_string(&file).context(file.display())?;
             return Ok((Secret::new(token.trim().to_string()), false));
         }
+        let admin = self.admin()?;
         let agent = vault_agent(bay);
-        let renewed = self.admin()?.delete_agent(&agent)?;
-        let output = self.exec(
-            &[
-                "agent-vault",
-                "agent",
-                "create",
-                &agent,
-                "--vault",
-                "default:proxy",
-                "--token-only",
-            ],
-            None,
-        )?;
-        let token = Secret::new(String::from_utf8_lossy(&output).trim().into());
+        let renewed = admin.delete_agent(&agent)?;
+        let body = format!(
+            r#"{{"name":"{agent}","role":"no-access","vaults":[{{"vault_name":"{VAULT}","vault_role":"proxy"}}]}}"#
+        );
+        let reply = admin.call("POST", "/v1/agents", Some(&body))?;
+        let created: NewAgent = json::from_str(&reply)?;
+        let token = Secret::new(created.av_agent_token);
         if token.expose().is_empty() {
             bail!("could not create the agent token");
         }
@@ -295,10 +278,10 @@ impl Broker for AgentVault {
             }
         }
         if !self.healthy() {
-            let stdin = format!("{}\n", password.expose());
+            let stdin = format!("{}\n", password.expose()).into_bytes();
             let start = self.start_server_args();
             let start: Vec<&str> = start.iter().map(String::as_str).collect();
-            self.exec(&start, Some(stdin.as_bytes()))?;
+            self.sandbox.exec(TOWER_VM, None, &start, Some(&stdin))?;
         }
         if !self.wait_healthy(30, Duration::from_secs(1)) {
             bail!(
@@ -315,16 +298,11 @@ impl Broker for AgentVault {
         self.admin()?.deny_unlisted()
     }
 
-    /// `service set -f` replaces the whole set. Trap: sent over stdin, not
-    /// via the /data mount, because a file deleted and recreated there
-    /// stays unreadable inside the VM.
+    /// A PUT replaces the whole set.
     fn set_routes(&self, routes: &[Route]) -> Result<()> {
+        let path = format!("/v1/vaults/{VAULT}/services");
         let services = render_services(routes);
-        self.exec(
-            &["agent-vault", "vault", "service", "set", "-f", "-"],
-            Some(services.as_bytes()),
-        )
-        .map(drop)
+        self.admin()?.call("PUT", &path, Some(&services)).map(drop)
     }
 
     fn credentials(&self) -> Result<Vec<StoredCredential>> {
@@ -355,10 +333,8 @@ impl Broker for AgentVault {
 
     fn access(&self, bay: &str) -> Result<Access> {
         let (token, renewed) = self.ensure_agent_token(bay)?;
-        let ca_pem = self.exec(
-            &["agent-vault", "ca", "fetch", "--address", &inner_address()],
-            None,
-        )?;
+        let ca = "/v1/mitm/ca.pem";
+        let ca_pem = http::call(self.admin_port, "GET", ca, None, None)?;
         let proxy_url = format!(
             "http://{}:{VAULT}@{}:{}",
             token.expose(),
@@ -367,7 +343,7 @@ impl Broker for AgentVault {
         );
         Ok(Access {
             proxy_url: Secret::new(proxy_url),
-            ca_pem,
+            ca_pem: ca_pem.into_bytes(),
             host_port: self.proxy_port,
             renewed,
         })
@@ -401,9 +377,7 @@ impl Broker for AgentVault {
     fn health(&self) -> BrokerHealth {
         let healthy = self.healthy();
         BrokerHealth {
-            reachable: healthy
-                || http::get(self.admin_port, "/", Duration::from_secs(2))
-                    .is_ok(),
+            reachable: healthy || http::get(self.admin_port, "/").is_ok(),
             healthy,
             unlisted: if healthy { self.policy() } else { None },
         }
@@ -446,8 +420,8 @@ impl Broker for AgentVault {
     }
 }
 
-/// The JSON `vault service set -f` reads: one service per route, with
-/// `extra` flattened in.
+/// The services the vault takes: one per route, with `extra` flattened
+/// in.
 fn render_services(routes: &[Route]) -> String {
     let services = routes
         .iter()
@@ -577,14 +551,10 @@ impl Admin {
     /// True when there was one to delete; 404 means it's already gone.
     fn delete_agent(&self, agent: &str) -> Result<bool> {
         let path = format!("/v1/agents/{agent}/delete");
-        let request = Request {
-            method: "POST",
-            path: &path,
-            token: Some(&self.token),
-            body: Some(b"{}"),
-        };
+        let token = Some(&self.token);
+        let timeout = Duration::from_secs(30);
         let response =
-            http::send(self.port, &request, Duration::from_secs(30))?;
+            http::send(self.port, "POST", &path, token, Some("{}"), timeout)?;
         match response.status {
             200..300 => Ok(true),
             404 => Ok(false),
@@ -598,13 +568,7 @@ impl Admin {
         path: &str,
         body: Option<&str>,
     ) -> Result<String> {
-        let request = Request {
-            method,
-            path,
-            token: Some(&self.token),
-            body: body.map(str::as_bytes),
-        };
-        http::call(self.port, &request)
+        http::call(self.port, method, path, Some(&self.token), body)
     }
 }
 
@@ -690,6 +654,11 @@ struct ConnectResponse {
 #[derive(miniserde::Deserialize)]
 struct Session {
     token: String,
+}
+
+#[derive(miniserde::Deserialize)]
+struct NewAgent {
+    av_agent_token: String,
 }
 
 #[cfg(test)]
@@ -839,9 +808,12 @@ mod tests {
     fn access_mints_a_token_per_bay_once_and_fetches_the_ca() {
         let state = scratch_dir("agent-vault-access");
         let sandbox = Rc::new(FakeSandbox::default());
-        sandbox.reply("agent create hangar-work", "work-token\n");
-        sandbox.reply("ca fetch", "CA\n");
-        let (port, server) = serve_each(vec![("404 Not Found", "{}")]);
+        let (port, server) = serve_each(vec![
+            ("404 Not Found", "{}"),
+            ("200 OK", r#"{"av_agent_token":"work-token"}"#),
+            ("200 OK", "CA\n"),
+            ("200 OK", "CA\n"),
+        ]);
         let vault = logged_in(&state, port, sandbox.clone());
         let access = vault.access("work").unwrap();
         assert!(!access.renewed);
@@ -851,46 +823,49 @@ mod tests {
             access.proxy_url.expose(),
             "http://work-token:default@host.fake:14322"
         );
-        let requests = server.join().unwrap();
-        assert_eq!(
-            first_line(&requests[0]),
-            "POST /v1/agents/hangar-work/delete HTTP/1.1"
-        );
         vault.access("work").unwrap();
+        let requests = server.join().unwrap();
+        let lines: Vec<&str> = requests.iter().map(|r| first_line(r)).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /v1/agents/hangar-work/delete HTTP/1.1",
+                "POST /v1/agents HTTP/1.1",
+                "GET /v1/mitm/ca.pem HTTP/1.1",
+                "GET /v1/mitm/ca.pem HTTP/1.1",
+            ]
+        );
+        assert!(requests[1].contains("authorization: Bearer session-token"));
+        assert!(requests[1].ends_with(
+            r#"{"name":"hangar-work","role":"no-access","vaults":[{"vault_name":"default","vault_role":"proxy"}]}"#
+        ));
+        assert!(!requests[2].contains("authorization"));
         let token = state.join("agent-tokens/work");
         assert_eq!(std::fs::read_to_string(&token).unwrap(), "work-token");
         let mode = std::fs::metadata(&token).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        let minted: Vec<String> = sandbox
-            .changes()
-            .into_iter()
-            .filter(|call| call.contains("agent create"))
-            .collect();
-        assert_eq!(
-            minted,
-            [format!(
-                "exec {TOWER_VM} agent-vault agent create hangar-work --vault \
-                 default:proxy --token-only"
-            )]
-        );
-        assert!(!sandbox.changes().iter().any(|call| call.contains("rotate")));
+        assert_eq!(sandbox.changes(), Vec::<String>::new());
     }
 
     #[test]
     fn a_lost_token_file_replaces_the_bays_agent_and_says_so() {
         let state = scratch_dir("agent-vault-renew");
-        let sandbox = Rc::new(FakeSandbox::default());
-        sandbox.reply("agent create", "new-token\n");
-        let (port, server) = serve_each(vec![("200 OK", "{}")]);
-        let vault = logged_in(&state, port, sandbox);
-        let access = vault.access("work").unwrap();
-        assert!(access.renewed);
+        let (port, server) = serve_each(vec![
+            ("200 OK", "{}"),
+            ("200 OK", r#"{"av_agent_token":"new-token"}"#),
+            ("200 OK", "CA"),
+        ]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        assert!(vault.access("work").unwrap().renewed);
         assert_eq!(
             first_line(&server.join().unwrap()[0]),
             "POST /v1/agents/hangar-work/delete HTTP/1.1"
         );
 
-        let (port, _server) = serve_each(vec![("404 Not Found", "{}")]);
+        let (port, _server) = serve_each(vec![
+            ("404 Not Found", "{}"),
+            ("200 OK", r#"{"av_agent_token":""}"#),
+        ]);
         let empty = scratch_dir("agent-vault-no-token");
         let tokenless =
             logged_in(&empty, port, Rc::new(FakeSandbox::default()));

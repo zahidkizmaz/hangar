@@ -14,13 +14,6 @@ pub(crate) struct Response {
     pub(crate) body: String,
 }
 
-pub(crate) struct Request<'a> {
-    pub(crate) method: &'a str,
-    pub(crate) path: &'a str,
-    pub(crate) token: Option<&'a Secret>,
-    pub(crate) body: Option<&'a [u8]>,
-}
-
 const MAX_BODY: u64 = 1024 * 1024;
 
 /// Trap: ureq's default config takes a proxy from the environment.
@@ -57,51 +50,48 @@ fn run(
     })
 }
 
+/// A request to the broker's admin API.
 pub(crate) fn send(
     port: u16,
-    request: &Request,
+    method: &str,
+    path: &str,
+    token: Option<&Secret>,
+    body: Option<&str>,
     timeout: Duration,
 ) -> Result<Response> {
     // Never the headers or body: they carry tokens and credential values.
-    log::trace!("vault {} {}", request.method, request.path);
-    let url = format!("http://127.0.0.1:{port}{}", request.path);
-    let mut builder = http::Request::builder()
-        .method(request.method)
+    log::trace!("vault {method} {path}");
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut request = http::Request::builder()
+        .method(method)
         .uri(&url)
         .header(header::CONTENT_TYPE, "application/json");
-    if let Some(token) = request.token {
-        builder = builder.header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", token.expose()),
-        );
+    if let Some(token) = token {
+        let bearer = format!("Bearer {}", token.expose());
+        request = request.header(header::AUTHORIZATION, bearer);
     }
-    let body = request.body.unwrap_or_default();
-    run(&agent(timeout, false), builder, Some(body)).context(url)
+    let body = body.unwrap_or_default().as_bytes();
+    run(&agent(timeout, false), request, Some(body)).context(url)
 }
 
 /// A GET without a token, for probes like `/health`.
-pub(crate) fn get(
-    port: u16,
-    path: &str,
-    timeout: Duration,
-) -> Result<Response> {
-    let request = Request {
-        method: "GET",
-        path,
-        token: None,
-        body: None,
-    };
-    send(port, &request, timeout)
+pub(crate) fn get(port: u16, path: &str) -> Result<Response> {
+    send(port, "GET", path, None, None, Duration::from_secs(2))
 }
 
 /// Like [`send`], but a non-2xx status is an error.
-pub(crate) fn call(port: u16, request: &Request) -> Result<String> {
-    let response = send(port, request, Duration::from_secs(30))?;
+pub(crate) fn call(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&Secret>,
+    body: Option<&str>,
+) -> Result<String> {
+    let timeout = Duration::from_secs(30);
+    let response = send(port, method, path, token, body, timeout)?;
     if !(200..300).contains(&response.status) {
         bail!(
-            "{} {}: HTTP {}: {}",
-            request.method,
-            request.path,
+            "{method} {path}: HTTP {}: {}",
             response.status,
             response.body.trim().chars().take(200).collect::<String>()
         );

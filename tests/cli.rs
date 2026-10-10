@@ -294,8 +294,12 @@ fn assert_bay_started(machine: &Machine, log: &str) {
     assert!(machine.fake.join("ca-bundle").exists());
 }
 
-/// Secrets reach the VMs on stdin only, never in argv.
-fn assert_secrets_on_stdin_only(machine: &Machine, log: &str) {
+/// Secrets reach the VMs on stdin only, never in argv or a vault URL.
+fn assert_secrets_on_stdin_only(
+    machine: &Machine,
+    log: &str,
+    vault: &FakeVault,
+) {
     let owner = read(machine.state.join("owner-password"));
     assert_eq!(machine.fake_file("vault-password"), PASSWORD);
     assert_eq!(machine.fake_file("owner-register"), owner);
@@ -303,9 +307,20 @@ fn assert_secrets_on_stdin_only(machine: &Machine, log: &str) {
         proxy_url(machine),
         "http://agent-token-1:default@host.microsandbox.internal:14322"
     );
+    let paths: Vec<String> =
+        vault.requests().into_iter().map(|r| r.path).collect();
     for secret in [PASSWORD, GITHUB_TOKEN, owner.as_str(), "agent-token-1"] {
         assert!(!log.contains(secret), "{secret} in argv:\n{log}");
+        assert!(
+            !paths.iter().any(|path| path.contains(secret)),
+            "{secret} in a URL"
+        );
     }
+}
+
+fn agents_created(vault: &FakeVault) -> usize {
+    let requests = vault.admin_requests();
+    requests.iter().filter(|r| r.path == "/v1/agents").count()
 }
 
 /// Deny before any credential, a bay's first token replaces any vault
@@ -402,17 +417,13 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     assert!(vault_vm[0].contains(&format!("-p 127.0.0.1:{}:", vault.port)));
     assert_bay_started(&machine, &log);
 
-    assert_secrets_on_stdin_only(&machine, &log);
+    assert_secrets_on_stdin_only(&machine, &log, &vault);
 
     assert_eq!(mode(&machine.state), 0o700);
     assert_eq!(mode(&machine.state.join("owner-password")), 0o600);
     let agent_token = machine.state.join("agent-tokens/default");
     assert_eq!(read(&agent_token), "agent-token-1");
-    assert_eq!(
-        lines_with(&log, "agent-vault agent create hangar-default ").len(),
-        1,
-        "{log}"
-    );
+    assert_eq!(agents_created(&vault), 1);
     assert_eq!(mode(&agent_token), 0o600);
     // The VM's mount holds the CA, nothing secret.
     assert_eq!(entries(&machine.state.join("guest")), ["ca.pem"]);
@@ -438,7 +449,7 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     let log = machine.msb_log();
     assert_eq!(calls(&log, "create "), 2, "{log}");
     assert_eq!(lines_with(&log, "hangar-tower -- sh -c").len(), 1, "{log}");
-    assert_eq!(lines_with(&log, "agent create").len(), 1, "{log}");
+    assert_eq!(agents_created(&vault), 1);
     assert_eq!(
         machine.fake_file("owner-login"),
         read(machine.state.join("owner-password"))
@@ -1056,13 +1067,7 @@ fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
         proxy_url(&machine),
         "http://agent-token-0:default@host.microsandbox.internal:14322"
     );
-    assert_eq!(
-        calls(
-            &machine.msb_log(),
-            "exec --no-tty hangar-tower -- agent-vault agent"
-        ),
-        0
-    );
+    assert_eq!(agents_created(&vault), 0);
 }
 
 #[test]
@@ -2038,6 +2043,7 @@ fn no_secret_reaches_any_log_level() {
         client_secret,
         &owner,
         &agent_token,
+        "session-token",
     ] {
         assert!(!printed.contains(secret.trim()), "secret in the logs");
     }
