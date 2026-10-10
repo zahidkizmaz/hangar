@@ -2,17 +2,19 @@
 //! (`--json`), on stdout. Errors go through here too, on stderr. Progress is
 //! `log` on stderr and never mixes into stdout.
 
-use miniserde::json::{Array, Number, Object};
+use std::collections::BTreeMap;
+
+use miniserde::Serialize;
 
 use crate::broker::Policy;
 use crate::credential::CredentialList;
 use crate::error::Error;
 use crate::files::Copied;
-use crate::json::{self, Json};
+use crate::json;
 use crate::mounts::{MountKind, MountStatus};
 use crate::overview::{
-    AppHosts, BayStatus, PortStatus, Ports, RunState, StatusReport, TowerRoute,
-    UpReport, VaultLogin, Vm,
+    AppHosts, BayStatus, Cache, PortStatus, Ports, RunState, StatusReport,
+    TowerRoute, UpReport, VaultLogin, Vm,
 };
 use crate::sandbox::{BoxState, PublishedPort};
 
@@ -31,8 +33,8 @@ pub(crate) enum Format {
 trait Render {
     /// Text for people; empty prints nothing.
     fn human(&self) -> String;
-    /// The documented `--json` shape; `Null` prints nothing.
-    fn json(&self) -> Json;
+    /// The documented `--json` shape; `None` prints nothing.
+    fn json(&self) -> Option<Box<dyn Serialize + '_>>;
 }
 
 pub(crate) enum Outcome {
@@ -70,9 +72,8 @@ pub(crate) fn emit(format: Format, result: &Outcome) {
             }
         }
         Format::Json => {
-            let value = result.json();
-            if !matches!(value, Json::Null) {
-                println!("{}", json::stringify(&value));
+            if let Some(document) = result.json() {
+                println!("{}", json::stringify(&document));
             }
         }
     }
@@ -85,22 +86,40 @@ pub(crate) fn emit_error(format: Format, error: &Error) {
     }
 }
 
-fn error_json(error: &Error) -> String {
-    let hint = error.hint().map_or(Json::Null, json::string);
-    let value = json::object([
-        ("error", json::string(error.message())),
-        ("hint", hint),
-    ]);
-    json::stringify(&value)
+// The derive keeps declaration order: every document declares its fields
+// alphabetically, as `--json` has always printed them.
+#[derive(Serialize)]
+struct ErrorDoc<'a> {
+    error: &'a str,
+    hint: Option<&'a str>,
 }
 
-fn document<const N: usize>(fields: [(&str, Json); N]) -> Json {
-    let mut object = Object::new();
-    object.insert("version".into(), Json::Number(Number::U64(VERSION)));
-    for (key, value) in fields {
-        object.insert(key.into(), value);
-    }
-    Json::Object(object)
+fn error_json(error: &Error) -> String {
+    let (error, hint) = (error.message(), error.hint());
+    json::stringify(&ErrorDoc { error, hint })
+}
+
+#[derive(Serialize)]
+struct DoneDoc {
+    ok: bool,
+    version: u64,
+}
+
+#[derive(Serialize)]
+struct CopiedDoc<'a> {
+    bay: &'a str,
+    copied: &'a [String],
+    ok: bool,
+    removed: &'a [String],
+    version: u64,
+}
+
+#[derive(Serialize)]
+struct RestartedDoc<'a> {
+    bay: &'a str,
+    ok: bool,
+    restarted: &'a [String],
+    version: u64,
 }
 
 impl Render for Outcome {
@@ -120,26 +139,31 @@ impl Render for Outcome {
         }
     }
 
-    fn json(&self) -> Json {
-        match self {
-            Self::Done => document([("ok", Json::Bool(true))]),
-            Self::Streamed => Json::Null,
-            Self::Status(status, _) => status.json(),
-            Self::Up(up) => up.json(),
-            Self::Credentials(list) => list.json(),
-            Self::VaultLogin(login) => login.json(),
-            Self::Copied(bay, copied) => document([
-                ("ok", Json::Bool(true)),
-                ("bay", json::string(bay)),
-                ("copied", strings(&copied.copied)),
-                ("removed", strings(&copied.removed)),
-            ]),
-            Self::Restarted(bay, names) => document([
-                ("ok", Json::Bool(true)),
-                ("bay", json::string(bay)),
-                ("restarted", strings(names)),
-            ]),
-        }
+    fn json(&self) -> Option<Box<dyn Serialize + '_>> {
+        Some(match self {
+            Self::Done => Box::new(DoneDoc {
+                ok: true,
+                version: VERSION,
+            }),
+            Self::Streamed => return None,
+            Self::Status(status, _) => Box::new(status.json()),
+            Self::Up(up) => Box::new(up.json()),
+            Self::Credentials(list) => return list.json(),
+            Self::VaultLogin(login) => return login.json(),
+            Self::Copied(bay, copied) => Box::new(CopiedDoc {
+                bay,
+                copied: &copied.copied,
+                ok: true,
+                removed: &copied.removed,
+                version: VERSION,
+            }),
+            Self::Restarted(bay, names) => Box::new(RestartedDoc {
+                bay,
+                ok: true,
+                restarted: names,
+                version: VERSION,
+            }),
+        })
     }
 }
 
@@ -155,10 +179,6 @@ fn copied_lines(copied: &Copied) -> String {
     } else {
         lines.join("\n")
     }
-}
-
-fn strings(values: &[String]) -> Json {
-    Json::Array(values.iter().map(|value| json::string(value)).collect())
 }
 
 impl StatusReport {
@@ -201,79 +221,94 @@ impl StatusReport {
         lines.join("\n")
     }
 
-    fn json(&self) -> Json {
-        self.json_with([])
-    }
-
-    fn json_with<const N: usize>(&self, extra: [(&str, Json); N]) -> Json {
-        let unlisted = self
-            .broker
-            .unlisted
-            .map_or(Json::Null, |policy| json::string(policy.as_str()));
-        let mut doc = document([
-            ("healthy", Json::Bool(self.healthy())),
-            (
-                "tower",
-                json::object([
-                    ("vm", json::string(self.tower.state_str())),
-                    ("backend", json::string(&self.broker_backend)),
-                    ("reachable", Json::Bool(self.broker.reachable)),
-                    ("healthy", Json::Bool(self.broker.healthy)),
-                    ("unlistedHosts", unlisted),
-                    ("ports", ports_json(&self.tower_ports)),
-                    (
-                        "routes",
-                        Json::Array(
-                            self.routes.iter().map(route_json).collect(),
-                        ),
-                    ),
-                ]),
-            ),
-            (
-                "bays",
-                Json::Array(self.bays.iter().map(bay_json).collect()),
-            ),
-            (
-                "leftovers",
-                Json::Array(
-                    self.leftovers
-                        .iter()
-                        .map(|leftover| {
-                            json::object([
-                                ("name", json::string(&leftover.name)),
-                                ("vm", json::string(&leftover.vm.name)),
-                                (
-                                    "state",
-                                    json::string(leftover.vm.state_str()),
-                                ),
-                            ])
-                        })
-                        .collect(),
-                ),
-            ),
-        ]);
-        if let Json::Object(object) = &mut doc {
-            for (key, value) in extra {
-                object.insert(key.into(), value);
-            }
+    fn json(&self) -> StatusDoc<'_> {
+        StatusDoc {
+            bays: self.bays.iter().map(bay_json).collect(),
+            healthy: self.healthy(),
+            leftovers: self
+                .leftovers
+                .iter()
+                .map(|leftover| LeftoverDoc {
+                    name: &leftover.name,
+                    state: leftover.vm.state_str(),
+                    vm: &leftover.vm.name,
+                })
+                .collect(),
+            tower: TowerDoc {
+                backend: &self.broker_backend,
+                healthy: self.broker.healthy,
+                ports: ports_json(&self.tower_ports),
+                reachable: self.broker.reachable,
+                routes: &self.routes,
+                unlisted_hosts: self.broker.unlisted.map(Policy::as_str),
+                vm: self.tower.state_str(),
+            },
+            version: VERSION,
         }
-        doc
     }
 }
 
+#[derive(Serialize)]
+struct StatusDoc<'a> {
+    bays: Vec<BayDoc<'a>>,
+    healthy: bool,
+    leftovers: Vec<LeftoverDoc<'a>>,
+    tower: TowerDoc<'a>,
+    version: u64,
+}
+
+/// The status document plus the bays that failed; `status --json` has no
+/// `failed`.
+#[derive(Serialize)]
+struct UpDoc<'a> {
+    bays: Vec<BayDoc<'a>>,
+    failed: Vec<FailedDoc<'a>>,
+    healthy: bool,
+    leftovers: Vec<LeftoverDoc<'a>>,
+    tower: TowerDoc<'a>,
+    version: u64,
+}
+
+#[derive(Serialize)]
+struct FailedDoc<'a> {
+    error: &'a str,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct LeftoverDoc<'a> {
+    name: &'a str,
+    state: &'static str,
+    vm: &'a str,
+}
+
+#[derive(Serialize)]
+struct TowerDoc<'a> {
+    backend: &'a str,
+    healthy: bool,
+    ports: Vec<PortDoc<'a>>,
+    reachable: bool,
+    routes: &'a [TowerRoute],
+    #[serde(rename = "unlistedHosts")]
+    unlisted_hosts: Option<&'static str>,
+    vm: &'static str,
+}
+
 impl UpReport {
-    fn json(&self) -> Json {
-        let failed = self
-            .failed
-            .iter()
-            .map(|(name, error)| {
-                json::object([
-                    ("name", json::string(name)),
-                    ("error", json::string(error)),
-                ])
-            })
-            .collect();
-        self.status.json_with([("failed", Json::Array(failed))])
+    fn json(&self) -> UpDoc<'_> {
+        let status = self.status.json();
+        UpDoc {
+            bays: status.bays,
+            failed: self
+                .failed
+                .iter()
+                .map(|(name, error)| FailedDoc { error, name })
+                .collect(),
+            healthy: status.healthy,
+            leftovers: status.leftovers,
+            tower: status.tower,
+            version: VERSION,
+        }
     }
 }
 
@@ -342,54 +377,61 @@ fn detail_lines(bay: &BayStatus, lines: &mut Vec<String>) {
     }
 }
 
-fn bay_json(bay: &BayStatus) -> Json {
-    let run = bay
-        .run
-        .iter()
-        .map(|(name, state)| (name.clone(), json::string(state.as_str())))
-        .collect::<Object>();
-    json::object([
-        ("name", json::string(&bay.name)),
-        ("vm", json::string(&bay.vm.name)),
-        ("state", json::string(bay.vm.state_str())),
-        ("healthy", Json::Bool(bay.healthy())),
-        (
-            "apps",
-            Json::Object(
-                bay.apps
-                    .iter()
-                    .map(|app| (app.name.clone(), app_json(app)))
-                    .collect(),
-            ),
-        ),
-        ("run", Json::Object(run)),
-        (
-            "mounts",
-            Json::Array(bay.mounts.iter().map(mount_json).collect()),
-        ),
-        (
-            "cache",
-            bay.cache.as_ref().map_or(Json::Null, |cache| {
-                json::object([
-                    ("host", json::string(&cache.host)),
-                    ("bytes", Json::Number(Number::U64(cache.bytes))),
-                ])
-            }),
-        ),
-        ("ports", ports_json(&bay.ports)),
-    ])
+#[derive(Serialize)]
+struct BayDoc<'a> {
+    apps: BTreeMap<&'a str, AppDoc<'a>>,
+    cache: Option<&'a Cache>,
+    healthy: bool,
+    mounts: Vec<MountDoc<'a>>,
+    name: &'a str,
+    ports: Vec<PortDoc<'a>>,
+    run: BTreeMap<&'a str, &'static str>,
+    state: &'static str,
+    vm: &'a str,
+}
+
+fn bay_json(bay: &BayStatus) -> BayDoc<'_> {
+    BayDoc {
+        apps: bay
+            .apps
+            .iter()
+            .map(|app| (app.name.as_str(), app_json(app)))
+            .collect(),
+        cache: bay.cache.as_ref(),
+        healthy: bay.healthy(),
+        mounts: bay.mounts.iter().map(mount_json).collect(),
+        name: &bay.name,
+        ports: ports_json(&bay.ports),
+        run: bay
+            .run
+            .iter()
+            .map(|(name, state)| (name.as_str(), state.as_str()))
+            .collect(),
+        state: bay.vm.state_str(),
+        vm: &bay.vm.name,
+    }
 }
 
 /// `applied` is `null` when the VM has no record of its mounts.
-fn mount_json(mount: &MountStatus) -> Json {
-    json::object([
-        ("vm", json::string(&mount.vm)),
-        ("host", json::string(&mount.host)),
-        ("writable", Json::Bool(mount.writable)),
-        ("home", Json::Bool(mount.kind == MountKind::Home)),
-        ("cache", Json::Bool(mount.kind == MountKind::Cache)),
-        ("applied", mount.applied.map_or(Json::Null, Json::Bool)),
-    ])
+#[derive(Serialize)]
+struct MountDoc<'a> {
+    applied: Option<bool>,
+    cache: bool,
+    home: bool,
+    host: &'a str,
+    vm: &'a str,
+    writable: bool,
+}
+
+fn mount_json(mount: &MountStatus) -> MountDoc<'_> {
+    MountDoc {
+        applied: mount.applied,
+        cache: mount.kind == MountKind::Cache,
+        home: mount.kind == MountKind::Home,
+        host: &mount.host,
+        vm: &mount.vm,
+        writable: mount.writable,
+    }
 }
 
 /// Rows padded to each column's widest cell, two spaces apart, indented
@@ -458,33 +500,30 @@ fn route_table(routes: &[TowerRoute]) -> Vec<String> {
     table(&rows)
 }
 
-/// Credential names only, never values.
-fn route_json(route: &TowerRoute) -> Json {
-    json::object([
-        ("name", json::string(&route.name)),
-        ("host", json::string(&route.host)),
-        ("auth", json::string(route.auth)),
-        ("credentials", strings(&route.credentials)),
-        ("app", route.app.as_deref().map_or(Json::Null, json::string)),
-    ])
+#[derive(Serialize)]
+struct AppDoc<'a> {
+    routes: Vec<AppRouteDoc<'a>>,
 }
 
-fn app_json(app: &AppHosts) -> Json {
-    let routes = app
-        .routes
-        .iter()
-        .map(|(name, host, credential)| {
-            json::object([
-                ("name", json::string(name)),
-                ("host", json::string(host)),
-                (
-                    "credential",
-                    credential.as_deref().map_or(Json::Null, json::string),
-                ),
-            ])
-        })
-        .collect();
-    json::object([("routes", Json::Array(routes))])
+#[derive(Serialize)]
+struct AppRouteDoc<'a> {
+    credential: Option<&'a str>,
+    host: &'a str,
+    name: &'a str,
+}
+
+fn app_json(app: &AppHosts) -> AppDoc<'_> {
+    let routes =
+        app.routes
+            .iter()
+            .map(|(name, host, credential)| AppRouteDoc {
+                credential: credential.as_deref(),
+                host,
+                name,
+            });
+    AppDoc {
+        routes: routes.collect(),
+    }
 }
 
 fn size(bytes: u64) -> String {
@@ -527,29 +566,27 @@ fn url(port: &PublishedPort) -> String {
     }
 }
 
-fn ports_json(ports: &Ports) -> Json {
-    Json::Array(
-        ports
-            .0
-            .iter()
-            .map(|status| {
-                let port = &status.port;
-                json::object([
-                    ("name", json::string(&port.name)),
-                    (
-                        "app",
-                        port.app.as_deref().map_or(Json::Null, json::string),
-                    ),
-                    ("url", Json::String(url(port))),
-                    ("purpose", json::string(&port.purpose)),
-                    (
-                        "reachable",
-                        status.reachable.map_or(Json::Null, Json::Bool),
-                    ),
-                ])
-            })
-            .collect(),
-    )
+#[derive(Serialize)]
+struct PortDoc<'a> {
+    app: Option<&'a str>,
+    name: &'a str,
+    purpose: &'a str,
+    reachable: Option<bool>,
+    url: String,
+}
+
+fn ports_json(ports: &Ports) -> Vec<PortDoc<'_>> {
+    let docs = ports
+        .0
+        .iter()
+        .map(|PortStatus { port, reachable }| PortDoc {
+            app: port.app.as_deref(),
+            name: &port.name,
+            purpose: &port.purpose,
+            reachable: *reachable,
+            url: url(port),
+        });
+    docs.collect()
 }
 
 impl Render for CredentialList {
@@ -563,21 +600,33 @@ impl Render for CredentialList {
             .join("\n")
     }
 
-    fn json(&self) -> Json {
-        let credentials = self
-            .entries
-            .iter()
-            .map(|entry| {
-                json::object([
-                    ("name", json::string(&entry.name)),
-                    ("source", json::string(entry.source)),
-                    ("type", json::string(entry.kind())),
-                    ("state", json::string(&entry.state)),
-                ])
-            })
-            .collect::<Array>();
-        document([("credentials", Json::Array(credentials))])
+    fn json(&self) -> Option<Box<dyn Serialize + '_>> {
+        let credentials = self.entries.iter().map(|entry| CredentialDoc {
+            name: &entry.name,
+            source: entry.source,
+            state: &entry.state,
+            kind: entry.kind(),
+        });
+        Some(Box::new(CredentialsDoc {
+            credentials: credentials.collect(),
+            version: VERSION,
+        }))
     }
+}
+
+#[derive(Serialize)]
+struct CredentialsDoc<'a> {
+    credentials: Vec<CredentialDoc<'a>>,
+    version: u64,
+}
+
+#[derive(Serialize)]
+struct CredentialDoc<'a> {
+    name: &'a str,
+    source: &'static str,
+    state: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 impl Render for VaultLogin {
@@ -593,15 +642,25 @@ impl Render for VaultLogin {
         )
     }
 
-    fn json(&self) -> Json {
-        let password = if self.copied { "clipboard" } else { "file" };
-        document([
-            ("url", json::string(&self.url)),
-            ("login", json::string(&self.login)),
-            ("password", json::string(password)),
-            ("passwordFile", json::string(&self.password_file)),
-        ])
+    fn json(&self) -> Option<Box<dyn Serialize + '_>> {
+        Some(Box::new(VaultLoginDoc {
+            login: &self.login,
+            password: if self.copied { "clipboard" } else { "file" },
+            password_file: &self.password_file,
+            url: &self.url,
+            version: VERSION,
+        }))
     }
+}
+
+#[derive(Serialize)]
+struct VaultLoginDoc<'a> {
+    login: &'a str,
+    password: &'static str,
+    #[serde(rename = "passwordFile")]
+    password_file: &'a str,
+    url: &'a str,
+    version: u64,
 }
 
 #[cfg(test)]
@@ -617,7 +676,7 @@ mod tests {
     };
     use crate::sandbox::{BoxState, PublishedPort};
 
-    fn to_string(value: &crate::json::Json) -> String {
+    fn to_string(value: &impl miniserde::Serialize) -> String {
         crate::json::stringify(value)
     }
 
@@ -1155,7 +1214,7 @@ mod tests {
             r#"{"ok":true,"version":1}"#
         );
         assert_eq!(Outcome::Streamed.human(), "");
-        assert!(matches!(Outcome::Streamed.json(), crate::json::Json::Null));
+        assert!(Outcome::Streamed.json().is_none());
     }
 
     #[test]
