@@ -19,14 +19,11 @@ const _: () = assert!(
     "the CLI tests need a debug build (the fake keychain)"
 );
 
-/// The keychain never has the item and takes any store; every call is
-/// logged (argv only: the password is on stdin). `security` exits 44 for a
-/// missing item, `secret-tool` 1.
-const FAKE_KEYCHAIN: &str = r#"echo "$*" >>"$HANGAR_FAKE/keychain.log"
-case $1 in
--i | store) cat >/dev/null ;;
-*) exit $MISSING ;;
-esac"#;
+/// A host tool that logs its argv to `$HANGAR_FAKE/<tool>` and its stdin
+/// to `<tool>.in`, then runs `then` (its exit status).
+const RECORDER: &str = r#"tool=$HANGAR_FAKE/${0##*/}
+echo "$*" >>"$tool"
+cat >>"$tool.in""#;
 
 /// One isolated machine: HOME, the hangar state, the fakes' files and bin.
 pub struct Machine {
@@ -47,12 +44,16 @@ impl Machine {
         };
         fs::create_dir_all(machine.home.join("bin")).unwrap();
         fs::create_dir_all(&machine.fake).unwrap();
-        let missing = if cfg!(target_os = "macos") { "44" } else { "1" };
-        machine.script("keychain", &FAKE_KEYCHAIN.replace("$MISSING", missing));
-        // The host's clipboard and browser are never touched: tests that
-        // need them script their own.
+        machine.script("msb", FAKE_MSB);
+        // Never has the item, takes any store: `security` exits 44 for a
+        // missing item, `secret-tool` 1.
+        let missing = if cfg!(target_os = "macos") { 44 } else { 1 };
+        let keychain =
+            format!("case $1 in -i | store) ;; *) exit {missing} ;; esac");
+        machine.recorder("keychain", &keychain);
+        // The host's clipboard and browser are never touched.
         for tool in ["pbcopy", "wl-copy", "xclip", "open", "xdg-open"] {
-            machine.script(tool, "exit 1");
+            machine.recorder(tool, "exit 1");
         }
         machine
     }
@@ -64,15 +65,13 @@ impl Machine {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    pub fn install_fake_msb(&self) {
-        let path = self.home.join("bin/msb");
-        fs::write(&path, FAKE_MSB).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    pub fn recorder(&self, name: &str, then: &str) {
+        self.script(name, &format!("{RECORDER}\n{then}"));
     }
 
-    /// Makes the fake fail at `what` (see msb.sh).
-    pub fn fail(&self, what: &str) {
-        fs::write(self.fake.join(format!("fail-{what}")), "").unwrap();
+    /// Makes the fake msb fail at `what` with `why` (see msb.sh).
+    pub fn fail(&self, what: &str, why: &str) {
+        fs::write(self.fake.join(format!("fail-{what}")), why).unwrap();
     }
 
     pub fn config(&self, json: &str) -> PathBuf {
@@ -176,7 +175,7 @@ pub struct Request {
 }
 
 /// agent-vault's admin API, as far as hangar uses it. Healthy once the fake
-/// msb has "started" the server (`$HANGAR_FAKE/vault-started`); with
+/// msb has "started" the server (`$HANGAR_FAKE/hangar-vault`); with
 /// `$HANGAR_FAKE/fail-deny` a deny PATCH succeeds but changes nothing, and
 /// `fail-register` or `fail-login` fails the owner's.
 pub struct FakeVault {
@@ -349,7 +348,7 @@ fn serve(
     let body = String::from_utf8(body).unwrap();
 
     let (status, reply) = match (method.as_str(), path.as_str()) {
-        ("GET", "/health") if fake.join("vault-started").exists() => {
+        ("GET", "/health") if fake.join("hangar-vault").exists() => {
             (200, "{}".to_string())
         }
         ("GET", "/health") => (503, "{}".to_string()),

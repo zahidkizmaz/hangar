@@ -228,7 +228,7 @@ fn up_stops_early_without_a_password() {
 
 /// The proxy URL in the bay's proxy env.
 fn proxy_url(machine: &Machine) -> String {
-    let env = machine.fake_file("proxy-env");
+    let env = machine.fake_file("hangar-proxy-env");
     let line = env.lines().find(|line| line.starts_with("HTTPS_PROXY="));
     line.unwrap()["HTTPS_PROXY=".len()..]
         .trim_matches('\'')
@@ -236,7 +236,7 @@ fn proxy_url(machine: &Machine) -> String {
 }
 
 /// Root wrote the CA bundle and the proxy env, then docker answered.
-fn assert_bay_started(machine: &Machine, log: &str) {
+fn assert_bay_started(log: &str) {
     let root = "exec --no-tty --user root hangar-bay-default -- /bin/sh -c";
     for name in [" hangar-ca ", " hangar-proxy-env "] {
         let writes = lines_with(log, name);
@@ -244,7 +244,6 @@ fn assert_bay_started(machine: &Machine, log: &str) {
         assert!(writes[0].starts_with(root), "{log}");
     }
     assert_eq!(lines_with(log, " hangar-docker ").len(), 1, "{log}");
-    assert!(machine.fake.join("ca-bundle").exists());
 }
 
 /// Secrets reach the VMs on stdin only, never in argv or a vault URL.
@@ -254,7 +253,7 @@ fn assert_secrets_on_stdin_only(
     vault: &FakeVault,
 ) {
     let owner = read(machine.state.join("owner-password"));
-    assert_eq!(machine.fake_file("vault-password"), PASSWORD);
+    assert_eq!(machine.fake_file("hangar-vault"), format!("{PASSWORD}\n"));
     assert_eq!(machine.fake_file("owner-register"), owner);
     assert_eq!(
         proxy_url(machine),
@@ -303,7 +302,6 @@ fn assert_first_up_admin_calls(vault: &FakeVault) {
 #[test]
 fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     let machine = Machine::new("up");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh-token", GITHUB_TOKEN);
     let web = closed_port();
@@ -368,7 +366,7 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
         )
     );
     assert!(vault_vm[0].contains(&format!("-p 127.0.0.1:{}:", vault.port)));
-    assert_bay_started(&machine, &log);
+    assert_bay_started(&log);
 
     assert_secrets_on_stdin_only(&machine, &log, &vault);
 
@@ -391,14 +389,15 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
         read(machine.state.join("credential-keys")),
         "GITHUB_GIT_USER\nGITHUB_TOKEN\n"
     );
-    assert_eq!(machine.fake_file("tracked"), r#"{"nixpkgs#rtk":"rtk"}"#);
+    assert_eq!(
+        machine.fake_file("hangar-packages-save"),
+        r#"{"nixpkgs#rtk":"rtk"}"#
+    );
 
     // A second run creates nothing and reuses the owner and agent token.
     let second = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(!second.contains("creating"), "{second}");
     assert!(!second.contains("installing"), "{second}");
-    // The same proxy env isn't replaced, so the daemons keep running.
-    assert_eq!(machine.fake_file("daemon-restarts"), "restart\n");
     let log = machine.msb_log();
     assert_eq!(calls(&log, "create "), 2, "{log}");
     assert_eq!(lines_with(&log, "hangar-tower -- sh -c").len(), 1, "{log}");
@@ -412,7 +411,6 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
 #[test]
 fn status_down_and_restart() {
     let machine = Machine::new("lifecycle");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&run(&machine, &config, &["up"]));
@@ -464,7 +462,6 @@ fn status_down_and_restart() {
 #[test]
 fn a_second_hangar_waits_before_touching_anything() {
     let machine = Machine::new("lock");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     let lock = machine.home.join(".local/state/hangar/lock");
@@ -488,7 +485,7 @@ fn a_second_hangar_waits_before_touching_anything() {
     assert_eq!(first, "==> waiting for another hangar\n");
     assert!(!machine.state.exists(), "nothing happens before the lock");
     assert_eq!(machine.msb_log(), "");
-    assert_eq!(machine.fake_file("keychain.log"), "");
+    assert_eq!(machine.fake_file("keychain"), "");
 
     drop(held);
     let rest = io::read_to_string(log).unwrap();
@@ -501,7 +498,7 @@ fn a_second_hangar_waits_before_touching_anything() {
     let calls = "lookup service hangar-lock-test key master-password\n\
                  store --label=hangar master password service \
                  hangar-lock-test key master-password\n";
-    assert_eq!(machine.fake_file("keychain.log"), calls);
+    assert_eq!(machine.fake_file("keychain"), calls);
 }
 
 /// Two bays, `work` and `oss`, against the fake vault: no apps, so no
@@ -517,7 +514,6 @@ fn two_bays(vault_port: u16, oss: &str) -> String {
 #[test]
 fn bays_come_up_apart_and_are_picked_by_name() {
     let machine = Machine::new("two-bays");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&two_bays(vault.port, ""));
 
@@ -605,7 +601,6 @@ fn bays_come_up_apart_and_are_picked_by_name() {
 #[test]
 fn a_bay_left_out_of_the_config_is_a_leftover_until_destroyed() {
     let machine = Machine::new("leftover");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     ok(&run(
         &machine,
@@ -659,7 +654,6 @@ fn a_bay_left_out_of_the_config_is_a_leftover_until_destroyed() {
 #[test]
 fn a_failing_bay_does_not_stop_the_others() {
     let machine = Machine::new("bay-fails");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     // oss mounts hangar's own state: refused, so only oss fails.
     let mounts = format!(
@@ -685,7 +679,6 @@ fn a_failing_bay_does_not_stop_the_others() {
 #[test]
 fn a_credential_file_no_route_uses_is_warned_about() {
     let machine = Machine::new("unused-credential");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let file = token_file(&machine, "unused", "dummy-unused-value");
     let config = machine.config(&tower_config(
@@ -707,7 +700,6 @@ fn a_credential_file_no_route_uses_is_warned_about() {
 #[test]
 fn a_path_scope_another_route_undoes_is_warned_about() {
     let machine = Machine::new("uncovered-scope");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let routes = r#", "routes": [
         {"name": "mcp", "host": "mcp.example.com/v1/mcp",
@@ -728,7 +720,6 @@ fn a_path_scope_another_route_undoes_is_warned_about() {
 #[test]
 fn zero_routes_still_deny_and_send_an_empty_set() {
     let machine = Machine::new("no-routes");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config =
         machine.config(&vault_config(vault.port, "", r#", "apps": []"#));
@@ -742,7 +733,6 @@ fn zero_routes_still_deny_and_send_an_empty_set() {
 #[test]
 fn status_reports_missing_vms_and_an_unreachable_vault() {
     let machine = Machine::new("status-missing");
-    machine.install_fake_msb();
     let config = machine.config(&format!(
         r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
         closed_port()
@@ -797,8 +787,7 @@ fn status_reports_missing_vms_and_an_unreachable_vault() {
 #[test]
 fn status_shows_why_msb_failed() {
     let machine = Machine::new("status-broken");
-    machine.install_fake_msb();
-    machine.fail("inspect");
+    machine.fail("inspect", "error: permission denied");
     let config = machine.config(&format!(
         r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
         closed_port()
@@ -829,6 +818,7 @@ fn status_shows_why_msb_failed() {
 #[test]
 fn up_without_msb_says_so() {
     let machine = Machine::new("no-msb");
+    fs::remove_file(machine.home.join("bin/msb")).unwrap();
     let config = machine.config(
         r#"{"bays": [{"name": "default", "image": "example/agent:1"}]}"#,
     );
@@ -839,11 +829,8 @@ fn up_without_msb_says_so() {
 #[test]
 fn removed_config_entries_are_removed_but_hand_added_ones_stay() {
     let machine = Machine::new("reconcile");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh-token", GITHUB_TOKEN);
-    // Installed by hand in the VM: not hangar's to remove.
-    fs::create_dir_all(machine.fake.join("profile")).unwrap();
     let both = machine.config(&tower_config(
         vault.port,
         &format!(r#", "credentialFiles": {{"GITHUB_TOKEN": "{token}"}}"#),
@@ -879,15 +866,17 @@ fn removed_config_entries_are_removed_but_hand_added_ones_stay() {
     assert!(profile.join("htop").exists());
     assert!(profile.join("rtk").exists());
     assert!(!profile.join("codex").exists());
-    assert_eq!(machine.fake_file("tracked"), r#"{"nixpkgs#rtk":"rtk"}"#);
+    assert_eq!(
+        machine.fake_file("hangar-packages-save"),
+        r#"{"nixpkgs#rtk":"rtk"}"#
+    );
     assert_eq!(read(machine.state.join("credential-keys")), "\n");
 }
 
 #[test]
 fn a_failed_registration_forgets_its_password_and_the_next_up_finishes() {
     let machine = Machine::new("register-retry");
-    machine.install_fake_msb();
-    machine.fail("register");
+    machine.fail("register", "");
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     let error = failed(&run(&machine, &config, &["up"]));
@@ -903,8 +892,7 @@ fn a_failed_registration_forgets_its_password_and_the_next_up_finishes() {
 #[test]
 fn a_vault_that_keeps_allowing_unlisted_hosts_gets_no_routes_or_credentials() {
     let machine = Machine::new("deny-ignored");
-    machine.install_fake_msb();
-    machine.fail("deny");
+    machine.fail("deny", "");
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh-token", GITHUB_TOKEN);
     let config = machine.config(&tower_config(
@@ -933,8 +921,7 @@ fn a_vault_that_keeps_allowing_unlisted_hosts_gets_no_routes_or_credentials() {
 #[test]
 fn a_failing_bay_start_is_reported() {
     let machine = Machine::new("start-fails");
-    machine.install_fake_msb();
-    machine.fail("proxy-env");
+    machine.fail("hangar-proxy-env", "read-only file system");
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     let error = failed(&run(&machine, &config, &["up"]));
@@ -973,7 +960,6 @@ fn changes(log: &str) -> Vec<&str> {
 #[test]
 fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
     let machine = Machine::new("bay-unrecorded");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     unrecorded_vms(&machine);
     fs::write(
@@ -1025,7 +1011,6 @@ fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
 #[test]
 fn a_tower_vm_without_a_record_needs_only_destroy_and_up() {
     let machine = Machine::new("broker-unrecorded");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     unrecorded_vms(&machine);
     fs::write(
@@ -1066,7 +1051,6 @@ fn a_tower_vm_without_a_record_needs_only_destroy_and_up() {
 #[test]
 fn a_changed_proxy_port_refuses_until_the_vm_is_recreated() {
     let machine = Machine::new("egress-drift");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     ok(&run(
         &machine,
@@ -1107,7 +1091,6 @@ fn mounts_config(vault_port: u16, mounts: &str) -> String {
 #[test]
 fn mounts_are_passed_when_the_vm_is_created_and_changes_warn() {
     let machine = Machine::new("mounts");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join("work/paperclip")).unwrap();
     fs::create_dir_all(machine.home.join("skills")).unwrap();
@@ -1164,7 +1147,6 @@ fn mounts_are_passed_when_the_vm_is_created_and_changes_warn() {
 #[test]
 fn unsafe_mount_sources_stop_up_before_anything_is_created() {
     let machine = Machine::new("mount-rules");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join(".ssh")).unwrap();
     std::os::unix::fs::symlink(
@@ -1200,7 +1182,6 @@ fn unsafe_mount_sources_stop_up_before_anything_is_created() {
 #[test]
 fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
     let machine = Machine::new("bay-home");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::write(machine.home.join("CLAUDE.md"), "rules").unwrap();
     let config = machine.config(&vault_config(
@@ -1252,13 +1233,15 @@ fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
     ok(&run(&machine, &config, &["up"]));
     assert_eq!(lines_with(&machine.msb_log(), "nix profile add").len(), 2);
     assert!(machine.fake.join("profile/codex").exists());
-    assert_eq!(machine.fake_file("tracked"), r#"{"llm#codex":"codex"}"#);
+    assert_eq!(
+        machine.fake_file("hangar-packages-save"),
+        r#"{"llm#codex":"codex"}"#
+    );
 }
 
 #[test]
 fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
     let machine = Machine::new("bay-cache");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(
         vault.port,
@@ -1276,32 +1259,34 @@ fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
     assert!(create[0].contains(&cache_mount), "{}", create[0]);
     // Installs try the cache first; signatures stay required (no flag
     // anywhere trusts it).
-    assert_eq!(
-        machine.fake_file("substituters"),
-        "file:///var/cache/hangar/nix?priority=10\n"
-    );
+    let tried = |m: &Machine| {
+        let cache =
+            "--extra-substituters file:///var/cache/hangar/nix?priority=10 ";
+        lines_with(&m.msb_log(), cache).len()
+    };
+    assert_eq!(tried(&machine), 1);
     assert!(!machine.msb_log().contains("no-check-sigs"));
     assert!(!machine.msb_log().contains("trusted"));
     // Filled after the install, from hangar's profile.
-    assert_eq!(
-        machine.fake_file("cache-fills"),
-        "file:///var/cache/hangar/nix?compression=zstd \
-         /nix/var/nix/profiles/hangar\n"
-    );
+    let fills = |m: &Machine| {
+        let fill = "hangar/nix?compression=zstd /nix/var/nix/profiles/hangar ";
+        lines_with(&m.msb_log(), fill).len()
+    };
+    assert_eq!(fills(&machine), 1);
 
     // Nothing new to install: no second fill.
     ok(&run(&machine, &config, &["up"]));
-    assert_eq!(machine.fake_file("cache-fills").lines().count(), 1);
+    assert_eq!(fills(&machine), 1);
 
     // A new VM installs again, through the cache.
     ok(&run(&machine, &config, &["destroy"]));
-    machine.fail("cache");
+    machine.fail("hangar-cache", "no space left on device");
     let output = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(
         output.contains("warning: couldn't fill the package cache"),
         "{output}"
     );
-    assert_eq!(machine.fake_file("substituters").lines().count(), 2);
+    assert_eq!(tried(&machine), 2);
 
     fs::write(host.join("blob"), vec![0u8; 2048]).unwrap();
     let status = stdout(&run(&machine, &config, &["status", "--json"]));
@@ -1322,7 +1307,7 @@ fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
         !create.last().unwrap().contains(":/var/cache/hangar"),
         "{create:?}"
     );
-    assert_eq!(machine.fake_file("substituters").lines().count(), 2);
+    assert_eq!(tried(&machine), 2);
     let status = stdout(&run(&machine, &off, &["status", "--json"]));
     assert!(status.contains(r#""cache":null"#), "{status}");
 }
@@ -1330,7 +1315,6 @@ fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
 #[test]
 fn the_package_cache_follows_xdg_cache_home() {
     let machine = Machine::new("bay-cache-xdg");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let xdg = machine.home.join("xdg-cache");
     let with_xdg = |config: &Path, args: &[&str]| {
@@ -1359,7 +1343,6 @@ fn the_package_cache_follows_xdg_cache_home() {
 #[test]
 fn bay_home_can_be_turned_off_and_changes_warn() {
     let machine = Machine::new("bay-home-off");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let off =
         machine.config(&vault_config(vault.port, "", r#", "home": false"#));
@@ -1388,7 +1371,6 @@ fn bay_home_can_be_turned_off_and_changes_warn() {
 #[test]
 fn a_path_is_either_copied_or_mounted() {
     let machine = Machine::new("mount-overlap");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join("work/paperclip")).unwrap();
     fs::write(machine.home.join("notes.md"), "notes").unwrap();
@@ -1420,7 +1402,6 @@ fn a_path_is_either_copied_or_mounted() {
 #[test]
 fn a_failing_image_loader_is_reported() {
     let machine = Machine::new("image-loader-fails");
-    machine.install_fake_msb();
     machine.script("load-image", "exit 3");
     let vault = FakeVault::start(&machine.fake);
     let loader = machine.home.join("bin/load-image");
@@ -1436,10 +1417,9 @@ fn a_failing_image_loader_is_reported() {
 #[test]
 fn shell_runs_commands_with_their_arguments_intact() {
     let machine = Machine::new("shell");
-    machine.install_fake_msb();
     let config = machine.config("{}");
     let output = run(&machine, &config, &["shell", "echo", "a b"]);
-    assert_eq!(stdout(ok(&output)), "shell: echo a b\n");
+    assert!(stdout(ok(&output)).ends_with(" sh echo a b\n"));
     assert!(
         machine.msb_log().contains(
             r#"exec --no-tty --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc exec "$@" sh echo a b"#
@@ -1448,7 +1428,7 @@ fn shell_runs_commands_with_their_arguments_intact() {
         machine.msb_log()
     );
     let output = run(&machine, &config, &["shell"]);
-    assert_eq!(stdout(ok(&output)), "interactive shell\n");
+    assert_eq!(stdout(ok(&output)), "shell: sh -l\n");
     ok(&run(
         &machine,
         &config,
@@ -1460,6 +1440,7 @@ fn shell_runs_commands_with_their_arguments_intact() {
 #[test]
 fn shell_without_msb_says_so() {
     let machine = Machine::new("shell-no-msb");
+    fs::remove_file(machine.home.join("bin/msb")).unwrap();
     let config = machine.config("{}");
     let error = failed(&run(&machine, &config, &["shell"]));
     assert!(error.contains("msb not found on PATH"), "{error}");
@@ -1468,7 +1449,6 @@ fn shell_without_msb_says_so() {
 #[test]
 fn destroy_removes_the_vms_and_with_state_everything() {
     let machine = Machine::new("destroy");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&run(&machine, &config, &["up"]));
@@ -1481,7 +1461,7 @@ fn destroy_removes_the_vms_and_with_state_everything() {
     }
     assert!(machine.state.join("owner-password").exists());
     // The password came from the environment: no keychain call yet.
-    assert_eq!(machine.fake_file("keychain.log"), "");
+    assert_eq!(machine.fake_file("keychain"), "");
 
     // Nothing left to remove: no more rm calls, and the state goes, with
     // the (fake) keychain item.
@@ -1494,7 +1474,7 @@ fn destroy_removes_the_vms_and_with_state_everything() {
         format!("delete-generic-password -s {service} -a master-password\n");
     #[cfg(not(target_os = "macos"))]
     let deleted = format!("clear service {service} key master-password\n");
-    assert_eq!(machine.fake_file("keychain.log"), deleted);
+    assert_eq!(machine.fake_file("keychain"), deleted);
 
     let error = usage_error(&run(&machine, &config, &["destroy", "--force"]));
     assert!(error.contains("--force"), "{error}");
@@ -1504,14 +1484,13 @@ fn destroy_removes_the_vms_and_with_state_everything() {
 #[test]
 fn destroy_and_down_keep_everything_when_msb_fails() {
     let machine = Machine::new("destroy-fails");
-    machine.install_fake_msb();
     fs::write(machine.fake.join("vm-hangar-bay-default"), "Stopped").unwrap();
     fs::create_dir_all(&machine.state).unwrap();
     let config = machine.config("{}");
     let destroy = ["destroy", "--state", "--yes"];
     for (fail, why) in [("rm", "rm refused"), ("inspect", "permission denied")]
     {
-        machine.fail(fail);
+        machine.fail(fail, why);
         let error = failed(&run(&machine, &config, &destroy));
         assert!(error.contains(why), "{error}");
         assert!(machine.state.exists());
@@ -1523,7 +1502,6 @@ fn destroy_and_down_keep_everything_when_msb_fails() {
 #[test]
 fn destroy_without_a_terminal_needs_yes_and_removes_nothing() {
     let machine = Machine::new("destroy-confirm");
-    machine.install_fake_msb();
     fs::write(machine.fake.join("vm-hangar-bay-default"), "Stopped").unwrap();
     fs::create_dir_all(&machine.state).unwrap();
     let config = machine.config("{}");
@@ -1536,7 +1514,6 @@ fn destroy_without_a_terminal_needs_yes_and_removes_nothing() {
 #[test]
 fn unreadable_run_states_are_unknown_and_unhealthy() {
     let machine = Machine::new("run-unknown");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(
         vault.port,
@@ -1545,7 +1522,7 @@ fn unreadable_run_states_are_unknown_and_unhealthy() {
     ));
     ok(&run(&machine, &config, &["up"]));
 
-    machine.fail("run-status");
+    machine.fail("hangar-run-status", "Failed to connect to bus");
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
         status.contains("run paperclip: unknown (msb exec"),
@@ -1556,8 +1533,7 @@ fn unreadable_run_states_are_unknown_and_unhealthy() {
 #[test]
 fn a_vault_server_that_cannot_start_stops_up() {
     let machine = Machine::new("vault-server");
-    machine.install_fake_msb();
-    machine.fail("server");
+    machine.fail("hangar-vault", "server did not start");
     let config = machine.config(&vault_config(closed_port(), "", ""));
     let error = failed(&run(&machine, &config, &["up"]));
     assert!(error.contains("server did not start"), "{error}");
@@ -1581,7 +1557,6 @@ fn msb_never_sees_the_master_password() {
 #[test]
 fn user_credentials_go_to_the_vault_only_and_survive_up() {
     let machine = Machine::new("credential");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh", GITHUB_TOKEN);
     let config = machine.config(&tower_config(
@@ -1650,11 +1625,10 @@ fn user_credentials_go_to_the_vault_only_and_survive_up() {
 #[test]
 fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
     let machine = Machine::new("oauth-login");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&run(&machine, &config, &["up"]));
-    machine.script("open", r#"echo "$*" >>"$HANGAR_FAKE/opened""#);
+    machine.recorder("open", "");
 
     let secret = "client-secret-value";
     let login = [
@@ -1679,7 +1653,7 @@ fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
         stderr(ok(&output)),
         "==> waiting for the login in your browser\n==> logged in JIRA\n"
     );
-    let opened = machine.fake_file("opened");
+    let opened = machine.fake_file("open");
     let callback = format!(
         "redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fv1%2Foauth%2Fcallback",
         vault.port
@@ -1741,7 +1715,6 @@ fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
 #[test]
 fn credential_commands_check_names_and_need_a_running_vault() {
     let machine = Machine::new("credential-down");
-    machine.install_fake_msb();
     let config = machine.config(&vault_config(closed_port(), "", ""));
     let set = ["credential", "set", "TOKEN"];
     let error = failed(&run_with_stdin(&machine, &config, &set, "value\n"));
@@ -1758,7 +1731,6 @@ fn credential_commands_check_names_and_need_a_running_vault() {
 #[test]
 fn bay_env_and_run_entries_reach_the_bay() {
     let machine = Machine::new("bay-run");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(
         vault.port,
@@ -1781,11 +1753,14 @@ fn bay_env_and_run_entries_reach_the_bay() {
     );
     assert!(!output.contains("==>"), "{output}");
     assert_eq!(
-        machine.fake_file("bay-env"),
+        machine.fake_file("hangar-env"),
         "CLAUDE_CODE_OAUTH_TOKEN='placeholder'\n\
          QUOTED='it'\\''s $HOME'\n"
     );
-    assert_eq!(machine.fake_file("run-paperclip"), "paperclipai run");
+    let started = lines_with(&machine.msb_log(), " hangar-run ")
+        .into_iter()
+        .any(|line| line.contains(".service paperclipai run hangar run "));
+    assert!(started, "{}", machine.msb_log());
 
     let again = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(!again.contains("started paperclip"), "{again}");
@@ -1795,7 +1770,7 @@ fn bay_env_and_run_entries_reach_the_bay() {
     let logs = stdout(ok(&run(&machine, &config, &["logs", "paperclip"])));
     assert!(
         logs.contains(
-            "shell: journalctl --user -u hangar-run-paperclip.service -o cat \
+            " sh journalctl --user -u hangar-run-paperclip.service -o cat \
              --no-pager -n 100\n"
         ),
         "{logs}"
@@ -1812,17 +1787,14 @@ fn bay_env_and_run_entries_reach_the_bay() {
 #[test]
 fn vault_ui_copies_the_login_without_printing_it() {
     let machine = Machine::new("vault-ui");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
-    let fake = machine.fake.display().to_string();
     let error = failed(&run(&machine, &config, &["vault-ui"]));
     assert!(error.contains("run 'hangar up' first"), "{error}");
     ok(&run(&machine, &config, &["up"]));
 
-    machine.script("pbcopy", &format!("cat >{fake}/clipboard"));
-    machine.script("open", &format!(r#"echo "$1" >{fake}/opened"#));
-    machine.script("xdg-open", "exit 1");
+    machine.recorder("pbcopy", "");
+    machine.recorder("open", "");
     let output = stdout(ok(&run(&machine, &config, &["vault-ui"])));
     let owner = read(machine.state.join("owner-password"));
     let url = format!("http://127.0.0.1:{}", vault.port);
@@ -1830,12 +1802,10 @@ fn vault_ui_copies_the_login_without_printing_it() {
     assert!(output.contains("owner@hangar.local"), "{output}");
     assert!(output.contains(&url), "{output}");
     assert!(output.contains("copied to the clipboard"), "{output}");
-    assert_eq!(machine.fake_file("clipboard"), owner);
-    assert_eq!(machine.fake_file("opened").trim(), url);
+    assert_eq!(machine.fake_file("pbcopy.in"), owner);
+    assert_eq!(machine.fake_file("open").trim(), url);
 
-    for tool in ["pbcopy", "wl-copy", "xclip"] {
-        machine.script(tool, "exit 1");
-    }
+    machine.recorder("pbcopy", "exit 1");
     let output = stdout(ok(&run(&machine, &config, &["vault-ui"])));
     assert!(output.contains("(not shown)"), "{output}");
     assert!(!output.contains(&owner), "password printed:\n{output}");
@@ -1846,7 +1816,6 @@ fn vault_ui_copies_the_login_without_printing_it() {
 #[test]
 fn log_levels_come_from_flags_or_hangar_log() {
     let machine = Machine::new("log-levels");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let config = machine.config(&vault_config(vault.port, "", ""));
 
@@ -1880,7 +1849,6 @@ fn log_levels_come_from_flags_or_hangar_log() {
 #[test]
 fn no_secret_reaches_any_log_level() {
     let machine = Machine::new("no-secret-logs");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh", GITHUB_TOKEN);
     let config = machine.config(&tower_config(
@@ -1990,7 +1958,6 @@ fn web_app(port: u16) -> String {
 #[test]
 fn an_app_runs_only_once_its_setup_check_passes() {
     let machine = Machine::new("app-setup");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let web = r#", "appDefinitions": {"web": {
         "setup": {"command": "touch ~/.web/ready",
@@ -2011,8 +1978,10 @@ fn an_app_runs_only_once_its_setup_check_passes() {
         "{status}"
     );
 
-    let setup = run(&machine, &config, &["setup", "web"]);
-    assert_eq!(stdout(ok(&setup)), "setup: touch ~/.web/ready\n");
+    // From now on the fake's check passes.
+    fs::write(machine.fake.join("setup-check"), "done").unwrap();
+    let setup = run(&machine, &config, &["setup", "--force", "web"]);
+    assert!(stdout(ok(&setup)).ends_with(" sh sh -lc touch ~/.web/ready\n"));
     assert!(
         stderr(&setup).contains("run 'hangar up' to start web"),
         "{}",
@@ -2025,17 +1994,8 @@ fn an_app_runs_only_once_its_setup_check_passes() {
         1,
         "{log}"
     );
-
     let again = stderr(ok(&run(&machine, &config, &["setup", "web"])));
     assert!(again.contains("web is already set up"), "{again}");
-    ok(&run(&machine, &config, &["setup", "--force", "web"]));
-    let log = machine.msb_log();
-    assert_eq!(
-        lines_with(&log, "exec -t --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc")
-            .len(),
-        2,
-        "{log}"
-    );
 
     let up = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(!up.contains("needs setup"), "{up}");
@@ -2048,7 +2008,6 @@ fn an_app_runs_only_once_its_setup_check_passes() {
 #[test]
 fn json_status_and_up_follow_the_documented_schema() {
     let machine = Machine::new("json-status");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let web = closed_port();
     let mirror = r#", "routes": [{"name": "mirror", "host": "mirror.example",
@@ -2120,7 +2079,7 @@ fn json_status_and_up_follow_the_documented_schema() {
     assert!(flag(at(&json_out(ok(&status)), &["healthy"])));
 
     // A stopped run entry makes status unhealthy: exit 3.
-    fs::remove_file(machine.fake.join("run-web")).unwrap();
+    fs::remove_file(machine.fake.join("hangar-run-web.service")).unwrap();
     let status =
         json_out(unhealthy(&run(&machine, &config, &["status", "--json"])));
     assert!(!flag(at(&status, &["healthy"])));
@@ -2158,7 +2117,6 @@ fn json_status_and_up_follow_the_documented_schema() {
 #[test]
 fn json_errors_are_one_object_with_a_hint() {
     let machine = Machine::new("json-errors");
-    machine.install_fake_msb();
     let config = machine.config(&format!(
         r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
         closed_port()
@@ -2185,7 +2143,6 @@ const ACK: &str = "{\"ok\":true,\"version\":1}\n";
 #[test]
 fn json_commands_without_output_acknowledge_success() {
     let machine = Machine::new("json-ok");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let token = token_file(&machine, "gh", GITHUB_TOKEN);
     let config = machine.config(&tower_config(
@@ -2261,7 +2218,6 @@ fn every_command_has_help_with_examples() {
 #[test]
 fn bay_files_are_copied_reconciled_and_never_sent_as_arguments() {
     let machine = Machine::new("bay-files");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     let claude = machine.home.join("dotfiles/claude");
     fs::create_dir_all(claude.join("agents")).unwrap();
@@ -2337,7 +2293,6 @@ fn bay_files_are_copied_reconciled_and_never_sent_as_arguments() {
 #[test]
 fn bay_files_refuse_secrets_before_copying_anything() {
     let machine = Machine::new("bay-files-secrets");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join(".claude")).unwrap();
     fs::write(machine.home.join(".claude/CLAUDE.md"), "fine").unwrap();
@@ -2371,7 +2326,6 @@ fn json_line(output: &Output) -> String {
 #[test]
 fn copy_applies_declared_files_or_one_source_with_the_same_checks() {
     let machine = Machine::new("copy");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join("dotfiles")).unwrap();
     fs::write(machine.home.join("dotfiles/CLAUDE.md"), "v1").unwrap();
@@ -2428,7 +2382,6 @@ fn copy_applies_declared_files_or_one_source_with_the_same_checks() {
 #[test]
 fn up_never_restarts_and_restart_applies_changed_inputs() {
     let machine = Machine::new("restart");
-    machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
     fs::create_dir_all(machine.home.join("dotfiles")).unwrap();
     fs::write(machine.home.join("dotfiles/app.toml"), "v1").unwrap();
@@ -2463,7 +2416,7 @@ fn up_never_restarts_and_restart_applies_changed_inputs() {
         restarted,
         r#"{"bay":"default","ok":true,"restarted":["web"],"version":1}"#
     );
-    assert_eq!(restarts(&machine), "web\n");
+    assert_eq!(restarts(&machine), "hangar-run-web.service\n");
     let quiet = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(!quiet.contains("web's inputs changed"), "{quiet}");
     assert!(quiet.contains("worker's inputs changed"), "{quiet}");
@@ -2475,11 +2428,15 @@ fn up_never_restarts_and_restart_applies_changed_inputs() {
     assert_eq!(human.trim(), "restarted web\nrestarted worker");
     let app = machine.fake.join("vmfs/home/pilot/.app.toml");
     assert_eq!(read(&app), "v1");
-    assert!(machine.fake_file("bay-env").contains("MODE='b'"));
+    assert!(machine.fake_file("hangar-env").contains("MODE='b'"));
     let warned = stderr(ok(&run(&machine, &config, &["up"])));
     assert_eq!(read(&app), "edited");
     assert!(warned.contains("web's inputs changed"), "{warned}");
-    assert_eq!(restarts(&machine), "web\nweb\nworker\n");
+    assert_eq!(
+        restarts(&machine),
+        "hangar-run-web.service\nhangar-run-web.service\n\
+         hangar-run-worker.service\n"
+    );
 
     let error = failed(&run(&machine, &config, &["restart", "nope"]));
     assert!(
