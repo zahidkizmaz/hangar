@@ -22,7 +22,8 @@ impl Secret {
 /// A secret read from a file or tool: one trailing newline (LF or CRLF) is
 /// formatting, not part of the value.
 pub(crate) fn trim_line_end(value: &str) -> &str {
-    value.trim_end_matches(['\r', '\n'])
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    value.strip_suffix('\r').unwrap_or(value)
 }
 
 /// How real credentials start. Shared by every check that keeps secrets out
@@ -132,5 +133,7 @@ mod tests {
         assert_eq!(trim_line_end("token\r\n"), "token");
         assert_eq!(trim_line_end("token\n"), "token");
         assert_eq!(trim_line_end("a\nb\n"), "a\nb");
+        assert_eq!(trim_line_end("token\n\n"), "token\n");
+        assert_eq!(trim_line_end("token\r\r\n"), "token\r");
     }
 }
