@@ -206,18 +206,11 @@ fn would_be(path: &Path) -> Result<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(Error::new("can't contain .."));
     }
-    let mut missing = Vec::new();
-    let mut existing = path;
-    while fs::symlink_metadata(existing).is_err() {
-        let (Some(parent), Some(name)) =
-            (existing.parent(), existing.file_name())
-        else {
-            return Err(Error::new("no existing ancestor"));
-        };
-        missing.push(name);
-        existing = parent;
-    }
-    let mut host = fs::canonicalize(existing)
+    let existing = path
+        .ancestors()
+        .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        .context("no existing ancestor")?;
+    let host = fs::canonicalize(existing)
         .context(format!("resolving {}", existing.display()))?;
     if !host.is_dir() {
         return Err(Error::new(format!(
@@ -225,25 +218,21 @@ fn would_be(path: &Path) -> Result<PathBuf> {
             host.display()
         )));
     }
-    for name in missing.into_iter().rev() {
-        host.push(name);
+    match path.strip_prefix(existing) {
+        // `join("")` would add a trailing `/` to the recorded mount.
+        Ok(rest) if !rest.as_os_str().is_empty() => Ok(host.join(rest)),
+        _ => Ok(host),
     }
-    Ok(host)
 }
 
 /// Creates the missing components of a checked path, each 0700; existing
 /// ancestors are left as they are.
 fn create(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    let missing: Vec<&Path> = path
-        .ancestors()
-        .take_while(|p| fs::symlink_metadata(p).is_err())
-        .collect();
-    for dir in missing.into_iter().rev() {
-        fs::DirBuilder::new().mode(0o700).create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 /// Why a resolved source can't be used, if it can't, for what only hangar
