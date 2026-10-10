@@ -12,6 +12,7 @@ pub(crate) mod fake;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::{Source, managed_credentials};
 use crate::error::{Context, Error, Result, bail};
@@ -174,6 +175,57 @@ pub(crate) struct BrokerHealth {
     pub(crate) unlisted: Option<Policy>,
 }
 
+/// A credential the broker holds, by name; never its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Credential {
+    pub(crate) key: String,
+    pub(crate) kind: CredentialKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialKind {
+    Static,
+    OAuth(OAuthState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OAuthState {
+    Connected,
+    NotConnected,
+    /// The token endpoint's answer to the last refresh.
+    Failed(String),
+}
+
+/// The provider's endpoints and the client registered there.
+#[derive(Debug, Default)]
+pub(crate) struct OAuthClient {
+    pub(crate) authorization_url: String,
+    pub(crate) token_url: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<Secret>,
+    /// Space-separated.
+    pub(crate) scopes: String,
+    /// How the client authenticates at the token endpoint; empty for the
+    /// broker's default.
+    pub(crate) token_auth_method: String,
+}
+
+/// A login waiting for the user's consent at `url`.
+pub(crate) struct PendingLogin {
+    pub(crate) key: String,
+    pub(crate) url: String,
+    /// The backend's own: how it tells this login has finished.
+    pub(crate) marker: String,
+}
+
+/// What `oauth_wait` returns when no login came in time.
+pub(crate) fn login_timed_out(key: &str) -> Error {
+    Error::with_hint(
+        format!("no login for {key} yet"),
+        "the browser page shows the result; check 'hangar credential list'",
+    )
+}
+
 /// The broker's admin login, for `hangar vault-ui`.
 pub(crate) struct UiLogin {
     pub(crate) url: String,
@@ -195,9 +247,32 @@ pub(crate) trait Broker {
     fn deny_unlisted(&self) -> Result<()>;
     /// Replaces the whole route set.
     fn set_routes(&self, routes: &[Route]) -> Result<()>;
-    fn credential_keys(&self) -> Result<Vec<String>>;
+    fn credentials(&self) -> Result<Vec<Credential>>;
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()>;
     fn delete_credentials(&self, keys: &[String]) -> Result<()>;
+    /// Where the provider sends the browser back after a login.
+    fn oauth_redirect_uri(&self) -> Result<String> {
+        Err(no_oauth())
+    }
+    /// Saves `client` for `key` (`None`: the one it holds, secret
+    /// included) and returns where the user consents; the broker takes
+    /// the tokens at its callback.
+    fn oauth_begin(
+        &self,
+        _key: &str,
+        _client: Option<&OAuthClient>,
+    ) -> Result<PendingLogin> {
+        Err(no_oauth())
+    }
+    /// Blocks until `login` has its tokens; [`login_timed_out`] after
+    /// `timeout`.
+    fn oauth_wait(
+        &self,
+        _login: &PendingLogin,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(no_oauth())
+    }
     /// What bay `bay` needs; mints its token the first time.
     fn access(&self, bay: &str) -> Result<Access>;
     /// Deletes the tokens it minted for bays not in `bays`; tokens it
@@ -209,6 +284,10 @@ pub(crate) trait Broker {
     fn ports(&self) -> Vec<PublishedPort>;
     /// `None` until there is a login.
     fn ui(&self) -> Result<Option<UiLogin>>;
+}
+
+fn no_oauth() -> Error {
+    Error::new("this broker can't hold OAuth credentials")
 }
 
 const RECREATE: &str = "run 'hangar destroy && hangar up' (home is kept)";

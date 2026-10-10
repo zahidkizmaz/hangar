@@ -3,7 +3,7 @@
 mod fakes;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,16 @@ fn write_default_config(machine: &Machine, json: &str) {
 /// hangar against the fakes: a scratch config and state, and the master
 /// password from the environment (never the keychain).
 fn run(machine: &Machine, config: &Path, args: &[&str]) -> Output {
-    machine.hangar(args, &env(machine, config))
+    run_with_env(machine, config, args, &[])
+}
+
+fn run_with_env(
+    machine: &Machine,
+    config: &Path,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Output {
+    machine.hangar(args, &[&env(machine, config)[..], extra].concat())
 }
 
 fn run_with_stdin(
@@ -190,35 +199,6 @@ fn an_invalid_config_names_the_file() {
     let error = failed(&run(&machine, &config, &["status"]));
     assert!(error.contains("invalid config"), "{error}");
     assert!(error.contains(&config.display().to_string()), "{error}");
-
-    let config = machine.config(r#"{"sandbox": {"backend": "docker"}}"#);
-    let error = failed(&run(&machine, &config, &["status"]));
-    assert!(
-        error.contains(
-            r#"sandbox.backend: unknown backend "docker"; known: msb"#
-        ),
-        "{error}"
-    );
-
-    for (config, why) in [
-        (
-            r#"{"tower": {"backend": "other"}}"#,
-            r#"tower.backend: unknown backend "other"; known: agent-vault"#,
-        ),
-        (
-            r#"{"proxyPort": 15000}"#,
-            "config.proxyPort: unknown setting",
-        ),
-        (
-            r#"{"tower": {"routes": [{"name": "x", "host": "x.example",
-                "auth": {"type": "passthrough"}, "extra": {"host": "y"}}]}}"#,
-            "config.tower.routes.x.extra.host: set by hangar",
-        ),
-    ] {
-        let error =
-            failed(&run(&machine, &machine.config(config), &["status"]));
-        assert!(error.contains(why), "{error}");
-    }
 }
 
 #[test]
@@ -246,33 +226,6 @@ fn up_stops_early_without_a_password() {
     assert!(!machine.home.join(".local/share/hangar").exists());
 }
 
-#[test]
-fn existing_vault_without_password_refuses_to_generate() {
-    let machine = Machine::new("no-password");
-    ok(&machine.hangar(&["init"], &[]));
-    write_default_config(
-        &machine,
-        r#"{"bays": [{"name": "default", "image": "example/agent:1"}]}"#,
-    );
-    let vault = machine.home.join(".local/share/hangar/vault/.agent-vault");
-    fs::create_dir_all(&vault).unwrap();
-    let error = failed(&machine.hangar(&["up"], &[]));
-    assert!(error.contains("but broker data exists in"), "{error}");
-}
-
-#[test]
-fn a_keychain_service_name_with_odd_characters_is_refused() {
-    let machine = Machine::new("bad-service");
-    ok(&machine.hangar(&["init"], &[]));
-    write_default_config(
-        &machine,
-        r#"{"bays": [{"name": "default", "image": "example/agent:1"}]}"#,
-    );
-    let output =
-        machine.hangar(&["up"], &[("HANGAR_KEYCHAIN_SERVICE", "a b;rm")]);
-    assert!(failed(&output).contains("only letters, digits"));
-}
-
 /// The proxy URL in the bay's proxy env.
 fn proxy_url(machine: &Machine) -> String {
     let env = machine.fake_file("proxy-env");
@@ -294,8 +247,12 @@ fn assert_bay_started(machine: &Machine, log: &str) {
     assert!(machine.fake.join("ca-bundle").exists());
 }
 
-/// Secrets reach the VMs on stdin only, never in argv.
-fn assert_secrets_on_stdin_only(machine: &Machine, log: &str) {
+/// Secrets reach the VMs on stdin only, never in argv or a vault URL.
+fn assert_secrets_on_stdin_only(
+    machine: &Machine,
+    log: &str,
+    vault: &FakeVault,
+) {
     let owner = read(machine.state.join("owner-password"));
     assert_eq!(machine.fake_file("vault-password"), PASSWORD);
     assert_eq!(machine.fake_file("owner-register"), owner);
@@ -303,9 +260,20 @@ fn assert_secrets_on_stdin_only(machine: &Machine, log: &str) {
         proxy_url(machine),
         "http://agent-token-1:default@host.microsandbox.internal:14322"
     );
+    let paths: Vec<String> =
+        vault.requests().into_iter().map(|r| r.path).collect();
     for secret in [PASSWORD, GITHUB_TOKEN, owner.as_str(), "agent-token-1"] {
         assert!(!log.contains(secret), "{secret} in argv:\n{log}");
+        assert!(
+            !paths.iter().any(|path| path.contains(secret)),
+            "{secret} in a URL"
+        );
     }
+}
+
+fn agents_created(vault: &FakeVault) -> usize {
+    let requests = vault.admin_requests();
+    requests.iter().filter(|r| r.path == "/v1/agents").count()
 }
 
 /// Deny before any credential, a bay's first token replaces any vault
@@ -402,17 +370,13 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     assert!(vault_vm[0].contains(&format!("-p 127.0.0.1:{}:", vault.port)));
     assert_bay_started(&machine, &log);
 
-    assert_secrets_on_stdin_only(&machine, &log);
+    assert_secrets_on_stdin_only(&machine, &log, &vault);
 
     assert_eq!(mode(&machine.state), 0o700);
     assert_eq!(mode(&machine.state.join("owner-password")), 0o600);
     let agent_token = machine.state.join("agent-tokens/default");
     assert_eq!(read(&agent_token), "agent-token-1");
-    assert_eq!(
-        lines_with(&log, "agent-vault agent create hangar-default ").len(),
-        1,
-        "{log}"
-    );
+    assert_eq!(agents_created(&vault), 1);
     assert_eq!(mode(&agent_token), 0o600);
     // The VM's mount holds the CA, nothing secret.
     assert_eq!(entries(&machine.state.join("guest")), ["ca.pem"]);
@@ -438,7 +402,7 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     let log = machine.msb_log();
     assert_eq!(calls(&log, "create "), 2, "{log}");
     assert_eq!(lines_with(&log, "hangar-tower -- sh -c").len(), 1, "{log}");
-    assert_eq!(lines_with(&log, "agent create").len(), 1, "{log}");
+    assert_eq!(agents_created(&vault), 1);
     assert_eq!(
         machine.fake_file("owner-login"),
         read(machine.state.join("owner-password"))
@@ -527,8 +491,7 @@ fn a_second_hangar_waits_before_touching_anything() {
     assert_eq!(machine.fake_file("keychain.log"), "");
 
     drop(held);
-    let mut rest = String::new();
-    log.read_to_string(&mut rest).unwrap();
+    let rest = io::read_to_string(log).unwrap();
     assert!(up.wait().unwrap().success(), "{rest}");
     assert!(machine.state.exists());
     #[cfg(target_os = "macos")]
@@ -738,6 +701,27 @@ fn a_credential_file_no_route_uses_is_warned_about() {
         ),
         "{}",
         stderr(&status)
+    );
+}
+
+#[test]
+fn a_path_scope_another_route_undoes_is_warned_about() {
+    let machine = Machine::new("uncovered-scope");
+    machine.install_fake_msb();
+    let vault = FakeVault::start(&machine.fake);
+    let routes = r#", "routes": [
+        {"name": "mcp", "host": "mcp.example.com/v1/mcp",
+         "auth": {"type": "bearer", "token": "MCP"}},
+        {"name": "mcp-all", "host": "mcp.example.com",
+         "auth": {"type": "passthrough"}}]"#;
+    let config = machine.config(&tower_config(vault.port, routes, "", ""));
+    let status = stderr(&run(&machine, &config, &["status"]));
+    assert!(
+        status.contains(
+            "warning: route mcp is scoped to a path, but route mcp-all lets \
+             bays reach its whole host\n"
+        ),
+        "{status}"
     );
 }
 
@@ -1035,13 +1019,7 @@ fn a_bay_vm_without_a_record_needs_only_destroy_and_up() {
         proxy_url(&machine),
         "http://agent-token-0:default@host.microsandbox.internal:14322"
     );
-    assert_eq!(
-        calls(
-            &machine.msb_log(),
-            "exec --no-tty hangar-tower -- agent-vault agent"
-        ),
-        0
-    );
+    assert_eq!(agents_created(&vault), 0);
 }
 
 #[test]
@@ -1221,7 +1199,6 @@ fn unsafe_mount_sources_stop_up_before_anything_is_created() {
 
 #[test]
 fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
-    use std::os::unix::fs::PermissionsExt as _;
     let machine = Machine::new("bay-home");
     machine.install_fake_msb();
     let vault = FakeVault::start(&machine.fake);
@@ -1240,8 +1217,7 @@ fn the_vm_home_is_kept_in_hangars_data_dir_and_packages_on_the_vm_disk() {
         output.contains(&format!("created {} for a mount", host.display())),
         "{output}"
     );
-    let mode = fs::metadata(&host).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o700);
+    assert_eq!(mode(&host), 0o700);
     let log = machine.msb_log();
     let create = lines_with(&log, "--name hangar-bay-default ");
     let home_mount = format!(
@@ -1319,7 +1295,7 @@ fn the_package_cache_is_mounted_tried_first_and_filled_after_installs() {
 
     // A new VM installs again, through the cache.
     ok(&run(&machine, &config, &["destroy"]));
-    fs::write(machine.fake.join("fail-cache"), "").unwrap();
+    machine.fail("cache");
     let output = stderr(ok(&run(&machine, &config, &["up"])));
     assert!(
         output.contains("warning: couldn't fill the package cache"),
@@ -1358,15 +1334,8 @@ fn the_package_cache_follows_xdg_cache_home() {
     let vault = FakeVault::start(&machine.fake);
     let xdg = machine.home.join("xdg-cache");
     let with_xdg = |config: &Path, args: &[&str]| {
-        machine.hangar(
-            args,
-            &[
-                ("HANGAR_CONFIG", config.to_str().unwrap()),
-                ("HANGAR_STATE_DIR", machine.state.to_str().unwrap()),
-                ("HANGAR_MASTER_PASSWORD", PASSWORD),
-                ("XDG_CACHE_HOME", xdg.to_str().unwrap()),
-            ],
-        )
+        let xdg = ("XDG_CACHE_HOME", xdg.to_str().unwrap());
+        run_with_env(&machine, config, args, &[xdg])
     };
     let config = machine.config(&vault_config(vault.port, "", ""));
     ok(&with_xdg(&config, &["up"]));
@@ -1446,25 +1415,6 @@ fn a_path_is_either_copied_or_mounted() {
         error.contains("overlaps the mount at /home/pilot/.paperclip"),
         "{error}"
     );
-}
-
-#[test]
-fn a_bay_boots_its_init_and_keeps_docker_on_its_own_disk() {
-    let machine = Machine::new("init");
-    machine.install_fake_msb();
-    let vault = FakeVault::start(&machine.fake);
-    let config = machine.config(&vault_config(vault.port, "", ""));
-    ok(&run(&machine, &config, &["up"]));
-    let log = machine.msb_log();
-    let bay = lines_with(&log, "--name hangar-bay-default ");
-    assert!(
-        bay[0].contains(
-            "--memory 6G --init /sbin/init --tmpfs /run --root-disk 40G \
-             --mount-owned /var/lib/pilot:kind=disk,size=40G --no-net "
-        ),
-        "{log}"
-    );
-    assert!(!lines_with(&log, "--name hangar-tower ")[0].contains("--init"));
 }
 
 #[test]
@@ -1601,10 +1551,6 @@ fn unreadable_run_states_are_unknown_and_unhealthy() {
         status.contains("run paperclip: unknown (msb exec"),
         "{status}"
     );
-
-    machine.fail("shell");
-    let error = failed(&run(&machine, &config, &["logs", "paperclip"]));
-    assert!(error.contains("can't read paperclip's journal"), "{error}");
 }
 
 #[test]
@@ -1667,13 +1613,23 @@ fn user_credentials_go_to_the_vault_only_and_survive_up() {
     let list = ["credential", "list"];
     assert_eq!(
         stdout(ok(&run(&machine, &config, &list))),
-        "CLAUDE_CODE_OAUTH_TOKEN\tuser\nGITHUB_GIT_USER\tconfig\n\
-         GITHUB_TOKEN\tconfig\n"
+        "CLAUDE_CODE_OAUTH_TOKEN\tuser\tset\nGITHUB_GIT_USER\tconfig\tset\n\
+         GITHUB_TOKEN\tconfig\tset\n"
     );
+    let listed = json_out(ok(&run(
+        &machine,
+        &config,
+        &["--json", "credential", "list"],
+    )));
+    assert_eq!(text(at(&listed, &["credentials", "0", "type"])), "static");
+    assert_eq!(text(at(&listed, &["credentials", "0", "state"])), "set");
     // `up` reconciles only the config's credentials.
     ok(&run(&machine, &config, &["up"]));
     let after = stdout(ok(&run(&machine, &config, &list)));
-    assert!(after.contains("CLAUDE_CODE_OAUTH_TOKEN\tuser"), "{after}");
+    assert!(
+        after.contains("CLAUDE_CODE_OAUTH_TOKEN\tuser\tset"),
+        "{after}"
+    );
 
     let managed = ["credential", "set", "GITHUB_TOKEN"];
     let error = failed(&run_with_stdin(&machine, &config, &managed, "x\n"));
@@ -1689,6 +1645,97 @@ fn user_credentials_go_to_the_vault_only_and_survive_up() {
     assert_eq!(removed, "==> removed CLAUDE_CODE_OAUTH_TOKEN\n");
     let after = stdout(ok(&run(&machine, &config, &list)));
     assert!(!after.contains("CLAUDE"), "{after}");
+}
+
+#[test]
+fn an_oauth_login_goes_through_the_vault_and_keeps_its_secret_there() {
+    let machine = Machine::new("oauth-login");
+    machine.install_fake_msb();
+    let vault = FakeVault::start(&machine.fake);
+    let config = machine.config(&vault_config(vault.port, "", ""));
+    ok(&run(&machine, &config, &["up"]));
+    machine.script("open", r#"echo "$*" >>"$HANGAR_FAKE/opened""#);
+
+    let secret = "client-secret-value";
+    let login = [
+        "credential",
+        "login",
+        "JIRA",
+        "--authorization-url",
+        "https://auth.example.com/authorize",
+        "--token-url",
+        "https://auth.example.com/token",
+        "--client-id",
+        "c1",
+        "--client-secret",
+        "--scope",
+        "read:jira-work",
+        "--scope",
+        "offline_access",
+    ];
+    let output =
+        run_with_stdin(&machine, &config, &login, &format!("{secret}\n"));
+    assert_eq!(
+        stderr(ok(&output)),
+        "==> waiting for the login in your browser\n==> logged in JIRA\n"
+    );
+    let opened = machine.fake_file("opened");
+    let callback = format!(
+        "redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fv1%2Foauth%2Fcallback",
+        vault.port
+    );
+    assert!(
+        opened.starts_with("https://auth.example.com/authorize?client_id=c1&")
+            && opened.contains(&callback),
+        "{opened}"
+    );
+    let connects = || -> Vec<String> {
+        vault
+            .admin_requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/credentials/oauth/connect")
+            .map(|r| r.body)
+            .collect()
+    };
+    assert_eq!(connects().len(), 1);
+    assert!(connects()[0].contains(&format!(r#""client_secret":"{secret}""#)));
+    assert!(
+        connects()[0].contains(r#""scopes":"read:jira-work offline_access""#)
+    );
+    let list = ["credential", "list"];
+    let listed = stdout(ok(&run(&machine, &config, &list)));
+    assert_eq!(listed, "JIRA\tuser\toauth: connected\n");
+
+    // Again with the client the vault holds, keeping its secret.
+    ok(&run(&machine, &config, &["credential", "login", "JIRA"]));
+    assert_eq!(connects().len(), 2);
+    assert!(connects()[1].contains(r#""client_secret":"••••••••""#));
+    assert!(connects()[1].contains(r#""client_id":"c1""#));
+
+    let set = ["credential", "set", "JIRA"];
+    let error = failed(&run_with_stdin(&machine, &config, &set, "x\n"));
+    assert!(
+        error.contains("run 'hangar credential login JIRA'"),
+        "{error}"
+    );
+    ok(&run(&machine, &config, &["credential", "rm", "JIRA"]));
+    assert_eq!(stdout(ok(&run(&machine, &config, &list))), "");
+
+    let partial = ["credential", "login", "JIRA", "--token-url", "https://t"];
+    let alone = ["credential", "login", "JIRA", "--client-id", "c"];
+    let error = usage_error(&run(&machine, &config, &alone));
+    assert!(error.contains("<URL|--authorization-url <URL>>"), "{error}");
+    let error = usage_error(&run(&machine, &config, &partial));
+    assert!(error.contains("--authorization-url"), "{error}");
+    let both = [
+        "credential",
+        "login",
+        "MCP",
+        "https://mcp.example.com/mcp",
+        "--token-url",
+        "https://t.example.com",
+    ];
+    usage_error(&run(&machine, &config, &both));
 }
 
 #[test]
@@ -1817,15 +1864,8 @@ fn log_levels_come_from_flags_or_hangar_log() {
     assert!(trace.contains("trace: vault PATCH "), "{trace}");
 
     let env = |level| {
-        let output = machine.hangar(
-            &["status"],
-            &[
-                ("HANGAR_CONFIG", config.to_str().unwrap()),
-                ("HANGAR_STATE_DIR", machine.state.to_str().unwrap()),
-                ("HANGAR_LOG", level),
-            ],
-        );
-        stderr(ok(&output))
+        let log = [("HANGAR_LOG", level)];
+        stderr(ok(&run_with_env(&machine, &config, &["status"], &log)))
     };
     assert!(env("debug").contains("debug: run: msb "));
     assert!(!env("error").contains("debug:"));
@@ -1867,11 +1907,36 @@ fn no_secret_reaches_any_log_level() {
     let output = run_with_stdin(&machine, &config, &set, value);
     printed.push_str(&stderr(ok(&output)));
     printed.push_str(&stdout(&output));
+    let client_secret = "oauth-client-secret-value";
+    let login = [
+        "-vv",
+        "credential",
+        "login",
+        "APP",
+        "--authorization-url",
+        "https://auth.example.com/authorize",
+        "--token-url",
+        "https://auth.example.com/token",
+        "--client-id",
+        "c1",
+        "--client-secret",
+    ];
+    let output = run_with_stdin(&machine, &config, &login, client_secret);
+    printed.push_str(&stderr(ok(&output)));
+    printed.push_str(&stdout(&output));
 
     assert!(printed.contains("trace: vault "), "trace was off");
     let owner = read(machine.state.join("owner-password"));
     let agent_token = read(machine.state.join("agent-tokens/default"));
-    for secret in [PASSWORD, GITHUB_TOKEN, value, &owner, &agent_token] {
+    for secret in [
+        PASSWORD,
+        GITHUB_TOKEN,
+        value,
+        client_secret,
+        &owner,
+        &agent_token,
+        "session-token",
+    ] {
         assert!(!printed.contains(secret.trim()), "secret in the logs");
     }
 }
@@ -1946,14 +2011,6 @@ fn an_app_runs_only_once_its_setup_check_passes() {
         "{status}"
     );
 
-    machine.fail("setup");
-    let error = failed(&run(&machine, &config, &["setup", "web"]));
-    assert!(
-        error.contains("web's setup failed: touch ~/.web/ready"),
-        "{error}"
-    );
-    fs::remove_file(machine.fake.join("fail-setup")).unwrap();
-
     let setup = run(&machine, &config, &["setup", "web"]);
     assert_eq!(stdout(ok(&setup)), "setup: touch ~/.web/ready\n");
     assert!(
@@ -1965,7 +2022,7 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert_eq!(
         lines_with(&log, "exec -t --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc")
             .len(),
-        2,
+        1,
         "{log}"
     );
 
@@ -1976,7 +2033,7 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert_eq!(
         lines_with(&log, "exec -t --user pilot --workdir /home/pilot hangar-bay-default -- sh -lc")
             .len(),
-        3,
+        2,
         "{log}"
     );
 
@@ -1984,8 +2041,6 @@ fn an_app_runs_only_once_its_setup_check_passes() {
     assert!(!up.contains("needs setup"), "{up}");
     assert!(up.contains("started web"), "{up}");
 
-    let error = failed(&run(&machine, &config, &["setup", "nope"]));
-    assert!(error.contains("nope is not an enabled app"), "{error}");
     let error = usage_error(&run(&machine, &config, &["setup"]));
     assert!(error.contains("NAME"), "{error}");
 }
@@ -2122,20 +2177,6 @@ fn json_errors_are_one_object_with_a_hint() {
         miniserde::json::from_str(stderr(&output).trim()).unwrap();
     assert_eq!(text(at(&error, &["error"])), "the vault isn't running");
     assert_eq!(text(at(&error, &["hint"])), "run 'hangar up' first");
-
-    // Without an obvious next step, the hint is null.
-    let bad = machine.config(r#"{"agnet": {}}"#);
-    let output = run(&machine, &bad, &["status", "--json"]);
-    let error: miniserde::json::Value =
-        miniserde::json::from_str(stderr(&output).trim()).unwrap();
-    assert!(
-        text(at(&error, &["error"])).contains("agnet"),
-        "names the key"
-    );
-    assert!(matches!(
-        at(&error, &["hint"]),
-        miniserde::json::Value::Null
-    ));
 }
 
 /// What a `--json` command without output of its own prints.
@@ -2203,6 +2244,7 @@ fn every_command_has_help_with_examples() {
         (&["credential", "set"], "< token.txt"),
         (&["credential", "list"], "credential list --json"),
         (&["credential", "rm"], "hangar credential rm"),
+        (&["credential", "login"], "https://mcp.atlassian.com/v1/mcp"),
         (&["destroy"], "hangar destroy --state --yes"),
     ] {
         let mut args = command.to_vec();

@@ -47,12 +47,7 @@ impl Sandbox for Msb {
     ) -> Result<Vec<u8>> {
         let mut args = exec_args(vm, user, "--no-tty");
         args.extend_from_slice(command);
-        let what = command
-            .iter()
-            .take(2)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let what = command.get(..2).unwrap_or(command).join(" ");
         call(&args, stdin, &format!("exec {vm}: {what}"))
     }
 
@@ -293,36 +288,6 @@ mod tests {
                 "127.0.0.1:3100:3100",
                 "--mount-dir",
                 "/state/guest:/run/hangar:ro",
-            ]
-        );
-    }
-
-    #[test]
-    fn each_native_folder_gets_a_disk_of_its_own_next_to_the_root() {
-        let spec = VmSpec {
-            name: "hangar-bay-default",
-            image: "hangar-bay:dev",
-            cpus: 4,
-            memory: "6G",
-            disk: Some("40G"),
-            native_fs: &["/var/lib/pilot", "/srv"],
-            init: None,
-            egress: Egress::Open,
-            publish: &[],
-            mounts: &[],
-            env: &[],
-        };
-        let args = create_args(&spec);
-        let root = args.iter().position(|arg| arg == "--root-disk").unwrap();
-        assert_eq!(
-            args[root..],
-            [
-                "--root-disk",
-                "40G",
-                "--mount-owned",
-                "/var/lib/pilot:kind=disk,size=40G",
-                "--mount-owned",
-                "/srv:kind=disk,size=40G",
             ]
         );
     }

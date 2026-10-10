@@ -61,6 +61,9 @@ variable's name shows up in the binary. So the CLI tests need a debug
 build: `tests/fakes` doesn't compile without `debug_assertions`, and the Nix
 package runs them with `checkType = "debug"`.
 
+No test reaches the network either: unit tests give `src/oauth.rs` a
+fake `Https`, and `src/http.rs` is tested against loopback servers.
+
 ## End-to-end tests
 
 They need msb and must never touch real state:
@@ -94,7 +97,7 @@ bodies (`no_secret_reaches_any_log_level` checks this).
 | ------------------ | ------------------------------------------------------ | ---------------------------------------------------- |
 | gitleaks           | committed secrets                                      | prek (staged), CI (full history)                     |
 | zizmor, actionlint | workflow security and correctness                      | prek                                                 |
-| cargo-deny         | licenses, banned/duplicate crates, sources; advisories | prek (offline), CI + weekly `audit.yml` (advisories) |
+| cargo-deny         | licenses, banned/duplicate crates, sources; advisories | prek (no advisories), CI, weekly `audit.yml`         |
 | sbomnix            | SBOM of the bay image                                  | `image.yml` artifact                                 |
 
 The image's SBOM lists every package in its Nix closure, the input for a

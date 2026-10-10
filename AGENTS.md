@@ -28,6 +28,7 @@ overview) and `docs/usage.md`, `docs/configuration.md`, `docs/nix.md`.
   restart` restarts run entries. A bay restarts its daemons only when
   their proxy env (which names the CA) changed: hangar never replaces an
   unchanged one.
+- OAuth secrets stay in the vault (no `reveal`); providers: public https only.
 - Every bay gets placeholders only: a bay's `env` refuses real-looking
   values. Never print or change the broker admin login (hangar logs in
   with it on every `up`).

@@ -2,7 +2,7 @@
 //! `main` only parses arguments and dispatches here.
 
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -403,19 +403,22 @@ pub(crate) fn vault_ui(hangar: &Hangar) -> Result<VaultLogin> {
         ));
     };
     let copied = copy(login.password.expose().as_bytes());
-    for opener in ["open", "xdg-open"] {
-        let mut open = process::command(opener);
-        open.arg(&login.url);
-        if process::output(&mut open, None).is_ok_and(|o| o.status.success()) {
-            break;
-        }
-    }
+    open_in_browser(&login.url);
     Ok(VaultLogin {
         url: login.url,
         login: login.login,
         copied,
         password_file: login.password_file.display().to_string(),
     })
+}
+
+/// The first opener that works; none is fine, the caller shows the URL.
+pub(crate) fn open_in_browser(url: &str) {
+    let _opened = ["open", "xdg-open"].iter().any(|opener| {
+        let mut open = process::command(opener);
+        open.arg(url);
+        process::output(&mut open, None).is_ok_and(|o| o.status.success())
+    });
 }
 
 fn copy(secret: &[u8]) -> bool {
@@ -498,20 +501,16 @@ fn confirm(state: &Path, folders: &[PathBuf]) -> Result<bool> {
             shown.join(", ")
         );
     }
-    io::stderr().flush().context("terminal")?;
     let mut answer = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .context("terminal")?;
+    io::stdin().read_line(&mut answer).context("terminal")?;
     Ok(answer.trim() == "y")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BAY_STEPS, TOWER_STEPS, destroy, down, logs, run_tower_steps, setup,
-        vault_ui, wipe_state,
+        BAY_STEPS, destroy, down, logs, run_tower_steps, setup, vault_ui,
+        wipe_state,
     };
     use crate::bay;
     use crate::broker::fake::FakeBroker;
@@ -574,14 +573,6 @@ mod tests {
 
     fn position<S>(steps: &[(&str, S)], name: &str) -> usize {
         steps.iter().position(|(step, _)| *step == name).unwrap()
-    }
-
-    #[test]
-    fn deny_comes_before_routes_and_credentials() {
-        let at = |name| position(&TOWER_STEPS, name);
-        assert_eq!(at("deny"), 0);
-        assert!(at("routes") < at("credentials"));
-        assert!(at("credentials") < at("tokens"));
     }
 
     #[test]

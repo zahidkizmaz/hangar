@@ -206,18 +206,11 @@ fn would_be(path: &Path) -> Result<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(Error::new("can't contain .."));
     }
-    let mut missing = Vec::new();
-    let mut existing = path;
-    while fs::symlink_metadata(existing).is_err() {
-        let (Some(parent), Some(name)) =
-            (existing.parent(), existing.file_name())
-        else {
-            return Err(Error::new("no existing ancestor"));
-        };
-        missing.push(name);
-        existing = parent;
-    }
-    let mut host = fs::canonicalize(existing)
+    let existing = path
+        .ancestors()
+        .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        .context("no existing ancestor")?;
+    let host = fs::canonicalize(existing)
         .context(format!("resolving {}", existing.display()))?;
     if !host.is_dir() {
         return Err(Error::new(format!(
@@ -225,25 +218,21 @@ fn would_be(path: &Path) -> Result<PathBuf> {
             host.display()
         )));
     }
-    for name in missing.into_iter().rev() {
-        host.push(name);
+    match path.strip_prefix(existing) {
+        // `join("")` would add a trailing `/` to the recorded mount.
+        Ok(rest) if !rest.as_os_str().is_empty() => Ok(host.join(rest)),
+        _ => Ok(host),
     }
-    Ok(host)
 }
 
 /// Creates the missing components of a checked path, each 0700; existing
 /// ancestors are left as they are.
 fn create(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    let missing: Vec<&Path> = path
-        .ancestors()
-        .take_while(|p| fs::symlink_metadata(p).is_err())
-        .collect();
-    for dir in missing.into_iter().rev() {
-        fs::DirBuilder::new().mode(0o700).create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 /// Why a resolved source can't be used, if it can't, for what only hangar
@@ -416,7 +405,7 @@ mod tests {
         overlaps, recheck, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
-    use crate::testing::scratch_dir;
+    use crate::testing::{roots, scratch_dir};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -438,22 +427,6 @@ mod tests {
 
     fn source(host: &str, writable: bool) -> Result<(), &'static str> {
         check_source(Path::new(host), writable, &bay_roots(STATE, CACHE))
-    }
-
-    /// Roots for bay `default` in a scratch home, with `state` created
-    /// under it and the cache root at `~/.cache/hangar`.
-    fn roots(home: &Path, state: &str) -> Roots {
-        let state = home.join(state);
-        fs::create_dir_all(&state).unwrap();
-        let cache = home.join(".cache/hangar");
-        Roots::new(
-            home,
-            &state,
-            &cache,
-            &state.join("bays/default/home"),
-            &cache.join("bays/default"),
-        )
-        .unwrap()
     }
 
     fn mounts(entries: &[(&str, &str, bool)]) -> BTreeMap<String, MountSpec> {
@@ -541,7 +514,7 @@ mod tests {
     #[test]
     fn resolve_follows_symlinks_and_needs_directories() {
         let home = fs::canonicalize(scratch_dir("mount-resolve")).unwrap();
-        let roots = roots(&home, "state");
+        let roots = roots(&home, "state", ".cache/hangar");
         fs::create_dir_all(home.join("data")).unwrap();
         fs::create_dir_all(home.join(".config")).unwrap();
         fs::write(home.join("file"), "x").unwrap();
@@ -580,7 +553,7 @@ mod tests {
     fn missing_sources_are_checked_then_created_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let home = fs::canonicalize(scratch_dir("mount-create")).unwrap();
-        let roots = roots(&home, ".local/share/hangar");
+        let roots = roots(&home, ".local/share/hangar", ".cache/hangar");
         fs::create_dir_all(home.join("work")).unwrap();
         fs::create_dir_all(home.join(".ssh")).unwrap();
         fs::set_permissions(
@@ -852,7 +825,7 @@ mod tests {
     #[test]
     fn a_symlinked_default_folder_loses_the_exception() {
         let home = fs::canonicalize(scratch_dir("mount-own-link")).unwrap();
-        let roots = roots(&home, ".local/share/hangar");
+        let roots = roots(&home, ".local/share/hangar", ".cache/hangar");
         let own = home.join(".cache/hangar/bays/default");
         fs::create_dir_all(home.join(".config")).unwrap();
         fs::create_dir_all(own.parent().unwrap()).unwrap();

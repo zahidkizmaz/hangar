@@ -27,10 +27,11 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
-      # Advisories need the network; CI checks them.
+      # Advisories are left to CI. Not --offline: the graph spans every
+      # platform, and a fresh cache lacks the crates no host build fetches.
       - id: cargo-deny
         name: cargo deny
-        entry: cargo deny --offline check licenses bans sources
+        entry: cargo deny --locked check licenses bans sources
         language: system
         files: ^(Cargo\.(toml|lock)|deny\.toml)$
         pass_filenames: false

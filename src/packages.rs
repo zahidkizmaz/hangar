@@ -143,12 +143,12 @@ fn plan(
             remove.push(element.clone());
         }
     }
-    let mut install: Vec<String> = Vec::new();
-    for installable in desired {
-        if !keep.contains_key(installable) && !install.contains(installable) {
-            install.push(installable.clone());
-        }
-    }
+    let mut seen = BTreeSet::new();
+    let install = desired
+        .iter()
+        .filter(|item| !keep.contains_key(*item) && seen.insert(*item))
+        .cloned()
+        .collect();
     Plan {
         remove,
         install,

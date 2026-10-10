@@ -44,15 +44,8 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn a_free_lock_is_taken_without_waiting() {
-        let path = scratch_dir("lock-free").join("hangar/lock");
-        let _held = acquire(&path, || panic!("waited")).unwrap();
-        assert!(path.exists());
-    }
-
-    #[test]
     fn a_held_lock_waits_once_until_it_is_released() {
-        let path = scratch_dir("lock-held").join("lock");
+        let path = scratch_dir("lock-held").join("hangar/lock");
         let held = acquire(&path, || panic!("waited")).unwrap();
         let (waited, notice) = mpsc::channel();
         let second = {

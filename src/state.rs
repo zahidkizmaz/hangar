@@ -2,7 +2,6 @@
 //! describes under "State". The broker backend names its own files.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -81,10 +80,10 @@ pub(crate) fn write_hashes(
     path: &Path,
     hashes: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let text = hashes.iter().fold(String::new(), |mut text, (name, hash)| {
-        let _ = writeln!(text, "{hash}\t{name}");
-        text
-    });
+    let text: String = hashes
+        .iter()
+        .flat_map(|(name, hash)| [hash, "\t", name, "\n"])
+        .collect();
     write_private(path, text.as_bytes())
 }
 

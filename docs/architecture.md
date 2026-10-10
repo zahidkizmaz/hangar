@@ -227,7 +227,7 @@ changed):
    a later part of the start fails, so the next `up` can finish it.
 4. Deny mode; the core then reads the policy back (`Broker::health`) and
    refuses to go on unless unlisted hosts are denied.
-5. Routes (the whole set; agent-vault: `service set -f -` on stdin).
+5. Routes (the whole set; agent-vault: one `PUT` of its services).
 6. Credentials from `tower.credentialFiles` (values on stdin or in a request
    body); delete those in `credential-keys` that left the config. The
    broker only ever gets explicit keys.
@@ -328,10 +328,28 @@ an error. `status` shows a stopped entry of an app with a setup as
   `credentials` value (e.g. `github-token`'s `GITHUB_GIT_USER`) whenever
   a route references it; two apps may share one only with the same value,
   and `credentialFiles` can't name it.
-- `hangar credential set/list/rm`: the user's own. Values come from a
+- `hangar credential set/list/rm`: the user's own. `list` reads each
+  one's kind and state from the broker (`Broker::credentials`: static, or
+  OAuth with whether it's connected), and `set` refuses an OAuth one: the
+  vault would store the value as its access token (`SetCredential`
+  keeps the row's type). Values come from a
   hidden prompt (`stty -echo` in a trapped `sh`, value back over a pipe) or
   stdin and go to the admin API in-process. Never recorded, so `up` never
   deletes them; names managed by the config are refused.
+- `hangar credential login`: an OAuth credential the vault keeps and
+  refreshes. With a URL, `src/oauth.rs` finds the provider (RFC 9728
+  resource metadata, else RFC 8414 or OpenID metadata at the issuer,
+  checking issuer and resource) and registers hangar as a public client
+  (RFC 7591, `none` only) with `Broker::oauth_redirect_uri`; it fetches
+  only `https` URLs with public host names. `Broker::oauth_begin` saves
+  the client (none: a re-login with the one the broker holds, secret
+  included) and returns a `PendingLogin`: the consent URL and a marker
+  only the backend reads. hangar opens the URL only when it's https and
+  its `redirect_uri` is `Broker::oauth_redirect_uri` (a tower from before
+  `AGENT_VAULT_ADDR` would send the browser to `0.0.0.0`), then blocks in
+  `Broker::oauth_wait` (agent-vault: until `last_refreshed_at` moves off
+  the marker, no clock involved). The lock covers only the begin.
+  Brokers without OAuth keep the trait's refusing defaults.
 - `hangar vault-ui`: pipes `owner-password` into `pbcopy`, `wl-copy` or
   `xclip` and opens the UI; it never prints the password.
 
@@ -422,7 +440,9 @@ reach them by name.
   package cache root, sandbox and broker), which builds each `Bay`; the
   only place that picks the backends (`sandbox.backend`,
   `tower.backend`).
-- `src/credential.rs`: `hangar credential`.
+- `src/credential.rs`: `hangar credential`, OAuth logins included.
+- `src/url.rs`: query parameters (the consent URL's, `resource=`).
+- `src/oauth.rs`: provider discovery and client registration.
 - `src/overview.rs`: what `status`, the port summary and `vault-ui`
   report (data only).
 - `src/output.rs`: renders command results as text or `--json`, errors
@@ -434,7 +454,7 @@ reach them by name.
 - `src/broker/mod.rs`: the `Broker` trait, `Route`/`Auth`, and the core
   side: the pre-flight, `tower-vm`, the deny check, the credential
   reconcile, the bays' tokens and the access check. `src/broker/agent_vault.rs` is the
-  agent-vault backend (its VM, CLI, admin API and state files) and
+  agent-vault backend (its VM, admin API and state files) and
   `src/broker/fake.rs` the in-process test double.
 - `src/bay.rs`: `Bay` and its steps (its pre-flight, create or start,
   image loading, placeholders, `run`).
@@ -455,7 +475,7 @@ reach them by name.
 - `src/state.rs`: the `stateDir` layout (`StateDir`, one method per file)
   and `write_private` for owner-only files.
 - `src/process.rs`: child processes (strips `HANGAR_MASTER_PASSWORD`).
-- `src/http.rs`: minimal HTTP/1.1 client for the admin API.
+- `src/http.rs`: HTTP through ureq: the admin API and the providers.
 - `src/secret.rs`: `Secret` (redacting `Debug`, no `Display`),
   `random_hex` and `find_secret`, the scan `env` and `files`
   share.

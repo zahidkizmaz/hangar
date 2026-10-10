@@ -124,7 +124,7 @@ impl Ports {
 
 fn reachable(port: &PublishedPort) -> bool {
     if port.http {
-        http::get(port.host, "/", Duration::from_secs(2)).is_ok()
+        http::get(port.host, "/").is_ok()
     } else {
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port.host));
         TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()

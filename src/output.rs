@@ -556,7 +556,9 @@ impl Render for CredentialList {
     fn human(&self) -> String {
         self.entries
             .iter()
-            .map(|(name, source)| format!("{name}\t{source}"))
+            .map(|entry| {
+                format!("{}\t{}\t{}", entry.name, entry.source, entry.state)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -565,10 +567,12 @@ impl Render for CredentialList {
         let credentials = self
             .entries
             .iter()
-            .map(|(name, source)| {
+            .map(|entry| {
                 json::object([
-                    ("name", json::string(name)),
-                    ("source", json::string(source)),
+                    ("name", json::string(&entry.name)),
+                    ("source", json::string(entry.source)),
+                    ("type", json::string(entry.kind())),
+                    ("state", json::string(&entry.state)),
                 ])
             })
             .collect::<Array>();
@@ -604,7 +608,7 @@ impl Render for VaultLogin {
 mod tests {
     use super::{Outcome, Render, UNHEALTHY, error_json, ports_json};
     use crate::broker::{BrokerHealth, Policy};
-    use crate::credential::CredentialList;
+    use crate::credential::{CredentialEntry, CredentialList};
     use crate::error::Error;
     use crate::mounts::{MountKind, MountStatus};
     use crate::overview::{
@@ -1052,22 +1056,29 @@ mod tests {
 
     #[test]
     fn credential_lists_never_carry_values() {
+        let entry = |name: &str, source, oauth, state: &str| CredentialEntry {
+            name: name.into(),
+            source,
+            oauth,
+            state: state.into(),
+        };
         let list = CredentialList {
             entries: vec![
-                ("GITHUB_TOKEN".into(), "config"),
-                ("CLAUDE_CODE_OAUTH_TOKEN".into(), "user"),
+                entry("GITHUB_TOKEN", "config", false, "set"),
+                entry("JIRA", "user", true, "oauth: connected"),
             ],
         };
         assert_eq!(
             list.human(),
-            "GITHUB_TOKEN\tconfig\nCLAUDE_CODE_OAUTH_TOKEN\tuser"
+            "GITHUB_TOKEN\tconfig\tset\nJIRA\tuser\toauth: connected"
         );
         assert_eq!(
             to_string(&list.json()),
             concat!(
-                r#"{"credentials":[{"name":"GITHUB_TOKEN","source":"config"},"#,
-                r#"{"name":"CLAUDE_CODE_OAUTH_TOKEN","source":"user"}],"#,
-                r#""version":1}"#,
+                r#"{"credentials":[{"name":"GITHUB_TOKEN","source":"config","#,
+                r#""state":"set","type":"static"},"#,
+                r#"{"name":"JIRA","source":"user","state":"oauth: connected","#,
+                r#""type":"oauth"}],"version":1}"#,
             )
         );
         let empty = CredentialList { entries: vec![] };

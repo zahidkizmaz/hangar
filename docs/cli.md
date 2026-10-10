@@ -27,7 +27,9 @@ Bays left out of the config don't count. `up` never exits 3: health is
 msb is never mistaken for a stopped or missing VM.
 
 One hangar changes state at a time. `up`, `down`, `restart`, `copy`,
-`destroy` and `credential set|rm` hold a lock
+`destroy` and `credential set|rm|login` hold a lock (`login` only
+while it hands the client to the vault, not while it waits for the
+browser)
 (`$XDG_STATE_HOME/hangar/lock`); a second one logs
 `==> waiting for another hangar` and continues once the first is done.
 `status`, `shell`, `logs`, `setup`, `vault-ui`, `credential list` and
@@ -46,7 +48,7 @@ an error (exit 1).
 |---|---|
 | `up [BAY…]` | the status document below plus `failed` (as text: `status`'s short view) |
 | `status [--all]` | the status document, always complete (`--all` changes only the text); exit 3 when unhealthy |
-| `down`, `init`, `destroy`, `credential set`, `credential rm` | `{"ok":true,"version":1}` |
+| `down`, `init`, `destroy`, `credential set`, `credential rm`, `credential login` | `{"ok":true,"version":1}` |
 | `credential list` | names and who manages them, never values |
 | `vault-ui` | where the vault login is, never the password |
 | `copy [SRC [DEST]]` | `{"ok":true,"bay":…,"copied":[…],"removed":[…],"version":1}` (VM paths only) |
@@ -134,13 +136,20 @@ disappears. Key order isn't significant.
 
 ```json
 { "version": 1, "credentials": [
-  { "name": "GITHUB_TOKEN", "source": "config" },
-  { "name": "CLAUDE_CODE_OAUTH_TOKEN", "source": "user" } ] }
+  { "name": "GITHUB_TOKEN", "source": "config", "type": "static",
+    "state": "set" },
+  { "name": "JIRA", "source": "user", "type": "oauth",
+    "state": "oauth: connected" } ] }
 ```
 
 `config` entries come from `tower.credentialFiles` and the apps' fixed
 `credentials` (e.g. `GITHUB_GIT_USER`); `user` ones from `hangar
-credential set`.
+credential set` or an OAuth login. `type` is `static` or `oauth` (other
+kinds the vault holds count as `static`). `state` is `set` for a static
+value; for an OAuth one it's `oauth: connected`, `oauth: not connected`
+(no token yet) or `oauth: refresh failed (…)` with the first line of the
+token endpoint's answer. The text form prints name, source and state,
+tab-separated.
 
 ### `vault-ui --json`
 

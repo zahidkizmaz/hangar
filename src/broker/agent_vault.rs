@@ -8,28 +8,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{Access, Broker, BrokerHealth, PROXY, Policy, Route, UiLogin};
+use super::{
+    Access, Broker, BrokerHealth, Credential, CredentialKind, OAuthClient,
+    OAuthState, PROXY, PendingLogin, Policy, Route, UiLogin, login_timed_out,
+};
 use crate::config::{Fields, valid_bay_name};
-use crate::error::{Context, Result, bail};
-use crate::http::{self, Request};
+use crate::error::{Context, Error, Result, bail};
+use crate::http;
 use crate::json::{self, Json};
 use crate::sandbox::{
     BoxState, Egress, Mount, MountMode, PublishedPort, Sandbox, TOWER_VM,
     VmSpec,
 };
-use crate::secret::{Secret, random_hex};
+use crate::secret::{Secret, random_hex, trim_line_end};
 use crate::state::write_private;
 use log::info;
-use miniserde::json::Array;
+use miniserde::json::{Array, Object};
 
 /// The admin API and the proxy inside the VM.
 const ADMIN_PORT: u16 = 14321;
 const PROXY_PORT: u16 = 14322;
-fn inner_address() -> String {
-    format!("http://127.0.0.1:{ADMIN_PORT}")
-}
 const OWNER_EMAIL: &str = "owner@hangar.local";
 /// All of hangar's credentials and settings live in this vault.
 const VAULT: &str = "default";
@@ -123,7 +123,7 @@ impl AgentVault {
     }
 
     fn healthy(&self) -> bool {
-        http::get(self.admin_port, "/health", Duration::from_secs(2))
+        http::get(self.admin_port, "/health")
             .is_ok_and(|response| response.status == 200)
     }
 
@@ -135,10 +135,6 @@ impl AgentVault {
             thread::sleep(pause);
         }
         false
-    }
-
-    fn exec(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-        self.sandbox.exec(TOWER_VM, None, command, stdin)
     }
 
     fn create_vm(&self) -> Result<()> {
@@ -173,6 +169,7 @@ impl AgentVault {
         })
     }
 
+    /// Keeps the session where agent-vault's CLI keeps it.
     fn ensure_owner(&self) -> Result<()> {
         let file = self.owner_password();
         let action = if file.exists() {
@@ -181,25 +178,20 @@ impl AgentVault {
             write_private(&file, random_hex(24)?.as_bytes())?;
             "register"
         };
-        let password = fs::read(&file).context(file.display())?;
-        let result = self.exec(
-            &[
-                "agent-vault",
-                "auth",
-                action,
-                "--address",
-                &inner_address(),
-                "--email",
-                OWNER_EMAIL,
-                "--password-stdin",
-            ],
-            Some(&password),
-        );
-        if result.is_err() && action == "register" {
+        let password = fs::read_to_string(&file).context(file.display())?;
+        let body = json::stringify(&json::object([
+            ("email", json::string(OWNER_EMAIL)),
+            ("password", json::string(trim_line_end(&password))),
+            ("device_label", json::string("hangar")),
+        ]));
+        let path = format!("/v1/auth/{action}");
+        let reply =
+            http::call(self.admin_port, "POST", &path, None, Some(&body));
+        if reply.is_err() && action == "register" {
             // Otherwise every later run would try to log in with it.
             fs::remove_file(&file).context(file.display())?;
         }
-        result.map(drop)
+        write_private(&self.session(), reply?.as_bytes())
     }
 
     /// The bay's token, and whether it was just renewed. Without a token
@@ -211,21 +203,21 @@ impl AgentVault {
             let token = fs::read_to_string(&file).context(file.display())?;
             return Ok((Secret::new(token.trim().to_string()), false));
         }
+        let admin = self.admin()?;
         let agent = vault_agent(bay);
-        let renewed = self.admin()?.delete_agent(&agent)?;
-        let output = self.exec(
-            &[
-                "agent-vault",
-                "agent",
-                "create",
-                &agent,
-                "--vault",
-                "default:proxy",
-                "--token-only",
-            ],
-            None,
-        )?;
-        let token = Secret::new(String::from_utf8_lossy(&output).trim().into());
+        let renewed = admin.delete_agent(&agent)?;
+        let grant = json::object([
+            ("vault_name", json::string(VAULT)),
+            ("vault_role", json::string("proxy")),
+        ]);
+        let body = json::stringify(&json::object([
+            ("name", json::string(&agent)),
+            ("role", json::string("no-access")),
+            ("vaults", Json::Array(Array::from_iter([grant]))),
+        ]));
+        let reply = admin.call("POST", "/v1/agents", Some(&body))?;
+        let created: NewAgent = json::from_str(&reply)?;
+        let token = Secret::new(created.av_agent_token);
         if token.expose().is_empty() {
             bail!("could not create the agent token");
         }
@@ -292,10 +284,10 @@ impl Broker for AgentVault {
             }
         }
         if !self.healthy() {
-            let stdin = format!("{}\n", password.expose());
+            let stdin = format!("{}\n", password.expose()).into_bytes();
             let start = self.start_server_args();
             let start: Vec<&str> = start.iter().map(String::as_str).collect();
-            self.exec(&start, Some(stdin.as_bytes()))?;
+            self.sandbox.exec(TOWER_VM, None, &start, Some(&stdin))?;
         }
         if !self.wait_healthy(30, Duration::from_secs(1)) {
             bail!(
@@ -312,20 +304,22 @@ impl Broker for AgentVault {
         self.admin()?.deny_unlisted()
     }
 
-    /// `service set -f` replaces the whole set. Trap: sent over stdin, not
-    /// via the /data mount, because a file deleted and recreated there
-    /// stays unreadable inside the VM.
+    /// A PUT replaces the whole set.
     fn set_routes(&self, routes: &[Route]) -> Result<()> {
+        let path = format!("/v1/vaults/{VAULT}/services");
         let services = render_services(routes);
-        self.exec(
-            &["agent-vault", "vault", "service", "set", "-f", "-"],
-            Some(services.as_bytes()),
-        )
-        .map(drop)
+        self.admin()?.call("PUT", &path, Some(&services)).map(drop)
     }
 
-    fn credential_keys(&self) -> Result<Vec<String>> {
-        self.admin()?.credential_keys()
+    fn credentials(&self) -> Result<Vec<Credential>> {
+        let listed = self.admin()?.list()?;
+        Ok(listed
+            .into_iter()
+            .map(|(key, entry)| Credential {
+                key,
+                kind: entry.map_or(CredentialKind::Static, Entry::kind),
+            })
+            .collect())
     }
 
     fn put_credential(&self, key: &str, value: &Secret) -> Result<()> {
@@ -336,12 +330,47 @@ impl Broker for AgentVault {
         self.admin()?.delete(keys)
     }
 
+    /// Built by agent-vault from `AGENT_VAULT_ADDR`, the host address.
+    fn oauth_redirect_uri(&self) -> Result<String> {
+        Ok(format!("{}/v1/oauth/callback", self.host_address()))
+    }
+
+    /// The login is done once `last_refreshed_at` moves off the marker,
+    /// whatever the tower's clock says.
+    fn oauth_begin(
+        &self,
+        key: &str,
+        client: Option<&OAuthClient>,
+    ) -> Result<PendingLogin> {
+        let admin = self.admin()?;
+        let stored = admin.oauth_entry(key)?;
+        let marker = stored
+            .as_ref()
+            .and_then(|entry| entry.last_refreshed_at.clone())
+            .unwrap_or_default();
+        let url = match client {
+            Some(client) => admin.connect(key, client)?,
+            None => admin.connect(key, &stored_client(key, stored)?)?,
+        };
+        Ok(PendingLogin {
+            key: key.to_string(),
+            url,
+            marker,
+        })
+    }
+
+    fn oauth_wait(
+        &self,
+        login: &PendingLogin,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.admin()?.wait_for_tokens(login, timeout, POLL)
+    }
+
     fn access(&self, bay: &str) -> Result<Access> {
         let (token, renewed) = self.ensure_agent_token(bay)?;
-        let ca_pem = self.exec(
-            &["agent-vault", "ca", "fetch", "--address", &inner_address()],
-            None,
-        )?;
+        let ca = "/v1/mitm/ca.pem";
+        let ca_pem = http::call(self.admin_port, "GET", ca, None, None)?;
         let proxy_url = format!(
             "http://{}:{VAULT}@{}:{}",
             token.expose(),
@@ -350,7 +379,7 @@ impl Broker for AgentVault {
         );
         Ok(Access {
             proxy_url: Secret::new(proxy_url),
-            ca_pem,
+            ca_pem: ca_pem.into_bytes(),
             host_port: self.proxy_port,
             renewed,
         })
@@ -384,9 +413,7 @@ impl Broker for AgentVault {
     fn health(&self) -> BrokerHealth {
         let healthy = self.healthy();
         BrokerHealth {
-            reachable: healthy
-                || http::get(self.admin_port, "/", Duration::from_secs(2))
-                    .is_ok(),
+            reachable: healthy || http::get(self.admin_port, "/").is_ok(),
             healthy,
             unlisted: if healthy { self.policy() } else { None },
         }
@@ -429,8 +456,8 @@ impl Broker for AgentVault {
     }
 }
 
-/// The JSON `vault service set -f` reads: one service per route, with
-/// `extra` flattened in.
+/// The services the vault takes: one per route, with `extra` flattened
+/// in.
 fn render_services(routes: &[Route]) -> String {
     let services = routes
         .iter()
@@ -473,11 +500,57 @@ impl Admin {
         Ok(settings.unmatched_host_policy)
     }
 
-    fn credential_keys(&self) -> Result<Vec<String>> {
+    /// Names in the vault's order, with what it lists about each.
+    fn list(&self) -> Result<Vec<(String, Option<Entry>)>> {
         let path = format!("/v1/credentials?vault={VAULT}");
-        let list: KeysResponse =
+        let list: ListResponse =
             json::from_str(&self.call("GET", &path, None)?)?;
-        Ok(list.keys.unwrap_or_default())
+        let mut entries: BTreeMap<String, Entry> = list
+            .credentials
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect();
+        Ok(list
+            .keys
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| {
+                let entry = entries.remove(&key);
+                (key, entry)
+            })
+            .collect())
+    }
+
+    fn oauth_entry(&self, key: &str) -> Result<Option<Entry>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|(listed, _)| listed == key)
+            .and_then(|(_, entry)| entry)
+            .filter(Entry::is_oauth))
+    }
+
+    /// A refresh error left by an earlier login doesn't end the wait.
+    fn wait_for_tokens(
+        &self,
+        login: &PendingLogin,
+        timeout: Duration,
+        pause: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let refreshed = self
+                .oauth_entry(&login.key)?
+                .and_then(|entry| entry.last_refreshed_at);
+            if refreshed.is_some_and(|at| at != login.marker) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(login_timed_out(&login.key));
+            }
+            thread::sleep(pause);
+        }
     }
 
     fn post(&self, key: &str, value: &Secret) -> Result<()> {
@@ -493,6 +566,33 @@ impl Admin {
             .context(format!("credential {key}"))
     }
 
+    /// The client secret travels only in the body.
+    fn connect(&self, key: &str, client: &OAuthClient) -> Result<String> {
+        let mut body = Object::new();
+        let mut put = |name: &str, value: &str| {
+            if !value.is_empty() {
+                body.insert(name.into(), json::string(value));
+            }
+        };
+        put("vault", VAULT);
+        put("key", key);
+        put("authorization_url", &client.authorization_url);
+        put("token_url", &client.token_url);
+        put("client_id", &client.client_id);
+        put("scopes", &client.scopes);
+        put("token_auth_method", &client.token_auth_method);
+        if let Some(secret) = &client.client_secret {
+            put("client_secret", secret.expose());
+        }
+        let body = json::stringify(&Json::Object(body));
+        let path = "/v1/credentials/oauth/connect";
+        let reply = self
+            .call("POST", path, Some(&body))
+            .context(format!("OAuth login {key}"))?;
+        let consent: ConnectResponse = json::from_str(&reply)?;
+        Ok(consent.authorization_url)
+    }
+
     fn delete(&self, keys: &[String]) -> Result<()> {
         let body = json::stringify(&DeleteBody {
             vault: VAULT.into(),
@@ -506,14 +606,10 @@ impl Admin {
     /// True when there was one to delete; 404 means it's already gone.
     fn delete_agent(&self, agent: &str) -> Result<bool> {
         let path = format!("/v1/agents/{agent}/delete");
-        let request = Request {
-            method: "POST",
-            path: &path,
-            token: Some(&self.token),
-            body: Some(b"{}"),
-        };
+        let token = Some(&self.token);
+        let timeout = Duration::from_secs(30);
         let response =
-            http::send(self.port, &request, Duration::from_secs(30))?;
+            http::send(self.port, "POST", &path, token, Some("{}"), timeout)?;
         match response.status {
             200..300 => Ok(true),
             404 => Ok(false),
@@ -527,15 +623,39 @@ impl Admin {
         path: &str,
         body: Option<&str>,
     ) -> Result<String> {
-        let request = Request {
-            method,
-            path,
-            token: Some(&self.token),
-            body: body.map(str::as_bytes),
-        };
-        let response = http::call(self.port, &request)?;
-        Ok(String::from_utf8_lossy(&response).into_owned())
+        http::call(self.port, method, path, Some(&self.token), body)
     }
+}
+
+/// agent-vault's `oauthSecretSentinel`: keep the stored client secret.
+/// It keeps it only while `token_url` stays.
+const KEEP_SECRET: &str = "••••••••";
+
+/// How often a login's wait asks the vault.
+const POLL: Duration = Duration::from_secs(1);
+
+/// The client the vault holds for `key`, its secret kept.
+fn stored_client(key: &str, stored: Option<Entry>) -> Result<OAuthClient> {
+    let client = stored.and_then(|entry| {
+        Some(OAuthClient {
+            authorization_url: entry
+                .authorization_url
+                .filter(|url| !url.is_empty())?,
+            token_url: entry.token_url?,
+            client_id: entry.client_id?,
+            client_secret: entry
+                .client_secret
+                .map(|_| Secret::new(KEEP_SECRET.into())),
+            scopes: entry.scopes.unwrap_or_default(),
+            token_auth_method: entry.token_auth_method.unwrap_or_default(),
+        })
+    });
+    client.ok_or_else(|| {
+        Error::with_hint(
+            format!("{key} has no OAuth client to log in with"),
+            "pass --authorization-url, --token-url and --client-id",
+        )
+    })
 }
 
 fn vault_agent(bay: &str) -> String {
@@ -564,8 +684,52 @@ struct DeleteBody {
 }
 
 #[derive(miniserde::Deserialize)]
-struct KeysResponse {
+struct ListResponse {
     keys: Option<Vec<String>>,
+    credentials: Option<Vec<Entry>>,
+}
+
+/// What the vault lists about a credential; it masks every secret.
+#[derive(miniserde::Deserialize)]
+struct Entry {
+    key: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    connected_at: Option<String>,
+    last_refreshed_at: Option<String>,
+    last_refresh_error: Option<String>,
+    authorization_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<String>,
+    token_auth_method: Option<String>,
+    /// Only ever the mask.
+    client_secret: Option<String>,
+}
+
+impl Entry {
+    /// Its other kinds (dynamic secrets) count as static.
+    fn is_oauth(&self) -> bool {
+        self.kind.as_deref() == Some("oauth")
+    }
+
+    fn kind(self) -> CredentialKind {
+        if !self.is_oauth() {
+            return CredentialKind::Static;
+        }
+        CredentialKind::OAuth(
+            match (self.last_refresh_error, self.connected_at) {
+                (Some(error), _) => OAuthState::Failed(error),
+                (None, Some(_)) => OAuthState::Connected,
+                (None, None) => OAuthState::NotConnected,
+            },
+        )
+    }
+}
+
+#[derive(miniserde::Deserialize)]
+struct ConnectResponse {
+    authorization_url: String,
 }
 
 #[derive(miniserde::Deserialize)]
@@ -573,21 +737,26 @@ struct Session {
     token: String,
 }
 
+#[derive(miniserde::Deserialize)]
+struct NewAgent {
+    av_agent_token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Admin, AgentVault, render_services};
-    use crate::broker::{Auth, Broker, Route};
+    use crate::broker::{
+        Auth, Broker, Credential, CredentialKind, OAuthClient, OAuthState,
+        PendingLogin, Route,
+    };
     use crate::json;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{Egress, TOWER_VM};
     use crate::secret::Secret;
-    use crate::testing::{closed_port, scratch_dir, settings};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use crate::testing::{closed_port, scratch_dir, serve_each, settings};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::rc::Rc;
-    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     fn agent_vault(
@@ -596,39 +765,6 @@ mod tests {
         sandbox: Rc<FakeSandbox>,
     ) -> AgentVault {
         AgentVault::new(&settings(config).tower, sandbox, state).unwrap()
-    }
-
-    /// Answers one request per `(status, body)`, in order, and returns
-    /// what it received.
-    fn serve_each(
-        responses: Vec<(&'static str, &'static str)>,
-    ) -> (u16, JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            responses
-                .into_iter()
-                .map(|(status, body)| {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let mut request = String::new();
-                    let mut buffer = [0; 4096];
-                    // Head and body may arrive in separate writes.
-                    while !complete(&request) {
-                        let read = stream.read(&mut buffer).unwrap();
-                        request.push_str(&String::from_utf8_lossy(
-                            &buffer[..read],
-                        ));
-                    }
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).unwrap();
-                    request
-                })
-                .collect()
-        });
-        (port, server)
     }
 
     /// A vault whose admin API is at `port`, logged in.
@@ -655,18 +791,6 @@ mod tests {
             port,
             token: Secret::new("session-token".into()),
         }
-    }
-
-    fn complete(request: &str) -> bool {
-        let Some((head, body)) = request.split_once("\r\n\r\n") else {
-            return false;
-        };
-        let length = head
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .and_then(|length| length.parse::<usize>().ok())
-            .unwrap_or(0);
-        body.len() >= length
     }
 
     #[test]
@@ -765,9 +889,12 @@ mod tests {
     fn access_mints_a_token_per_bay_once_and_fetches_the_ca() {
         let state = scratch_dir("agent-vault-access");
         let sandbox = Rc::new(FakeSandbox::default());
-        sandbox.reply("agent create hangar-work", "work-token\n");
-        sandbox.reply("ca fetch", "CA\n");
-        let (port, server) = serve_each(vec![("404 Not Found", "{}")]);
+        let (port, server) = serve_each(vec![
+            ("404 Not Found", "{}"),
+            ("200 OK", r#"{"av_agent_token":"work-token"}"#),
+            ("200 OK", "CA\n"),
+            ("200 OK", "CA\n"),
+        ]);
         let vault = logged_in(&state, port, sandbox.clone());
         let access = vault.access("work").unwrap();
         assert!(!access.renewed);
@@ -777,46 +904,49 @@ mod tests {
             access.proxy_url.expose(),
             "http://work-token:default@host.fake:14322"
         );
-        let requests = server.join().unwrap();
-        assert_eq!(
-            first_line(&requests[0]),
-            "POST /v1/agents/hangar-work/delete HTTP/1.1"
-        );
         vault.access("work").unwrap();
+        let requests = server.join().unwrap();
+        let lines: Vec<&str> = requests.iter().map(|r| first_line(r)).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /v1/agents/hangar-work/delete HTTP/1.1",
+                "POST /v1/agents HTTP/1.1",
+                "GET /v1/mitm/ca.pem HTTP/1.1",
+                "GET /v1/mitm/ca.pem HTTP/1.1",
+            ]
+        );
+        assert!(requests[1].contains("authorization: Bearer session-token"));
+        assert!(requests[1].ends_with(
+            r#"{"name":"hangar-work","role":"no-access","vaults":[{"vault_name":"default","vault_role":"proxy"}]}"#
+        ));
+        assert!(!requests[2].contains("authorization"));
         let token = state.join("agent-tokens/work");
         assert_eq!(std::fs::read_to_string(&token).unwrap(), "work-token");
         let mode = std::fs::metadata(&token).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        let minted: Vec<String> = sandbox
-            .changes()
-            .into_iter()
-            .filter(|call| call.contains("agent create"))
-            .collect();
-        assert_eq!(
-            minted,
-            [format!(
-                "exec {TOWER_VM} agent-vault agent create hangar-work --vault \
-                 default:proxy --token-only"
-            )]
-        );
-        assert!(!sandbox.changes().iter().any(|call| call.contains("rotate")));
+        assert_eq!(sandbox.changes(), Vec::<String>::new());
     }
 
     #[test]
     fn a_lost_token_file_replaces_the_bays_agent_and_says_so() {
         let state = scratch_dir("agent-vault-renew");
-        let sandbox = Rc::new(FakeSandbox::default());
-        sandbox.reply("agent create", "new-token\n");
-        let (port, server) = serve_each(vec![("200 OK", "{}")]);
-        let vault = logged_in(&state, port, sandbox);
-        let access = vault.access("work").unwrap();
-        assert!(access.renewed);
+        let (port, server) = serve_each(vec![
+            ("200 OK", "{}"),
+            ("200 OK", r#"{"av_agent_token":"new-token"}"#),
+            ("200 OK", "CA"),
+        ]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        assert!(vault.access("work").unwrap().renewed);
         assert_eq!(
             first_line(&server.join().unwrap()[0]),
             "POST /v1/agents/hangar-work/delete HTTP/1.1"
         );
 
-        let (port, _server) = serve_each(vec![("404 Not Found", "{}")]);
+        let (port, _server) = serve_each(vec![
+            ("404 Not Found", "{}"),
+            ("200 OK", r#"{"av_agent_token":""}"#),
+        ]);
         let empty = scratch_dir("agent-vault-no-token");
         let tokenless =
             logged_in(&empty, port, Rc::new(FakeSandbox::default()));
@@ -920,21 +1050,169 @@ mod tests {
     }
 
     #[test]
-    fn credential_keys_are_listed_with_the_session_token() {
+    fn credentials_are_listed_with_the_session_token_and_their_state() {
+        let state = scratch_dir("agent-vault-credentials");
         let (port, server) =
             serve_each(vec![("200 OK", r#"{"keys":["A","B"]}"#)]);
-        assert_eq!(admin(port).credential_keys().unwrap(), ["A", "B"]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        let listed = |key: &str, kind| Credential {
+            key: key.into(),
+            kind,
+        };
+        assert_eq!(
+            vault.credentials().unwrap(),
+            [
+                listed("A", CredentialKind::Static),
+                listed("B", CredentialKind::Static)
+            ]
+        );
         let request = server.join().unwrap().remove(0);
         assert!(request.starts_with("GET /v1/credentials?vault=default "));
-        assert!(request.contains("Authorization: Bearer session-token"));
+        assert!(request.contains("authorization: Bearer session-token"));
+
+        let entries = r#"{"keys":["OLD","NEW","ON","DYN","S"],"credentials":[
+            {"key":"S","type":"static"},
+            {"key":"DYN","type":"dynamic","value":"leased"},
+            {"key":"ON","type":"oauth","connected_at":"t1"},
+            {"key":"NEW","type":"oauth","client_secret":"••••••••"},
+            {"key":"OLD","type":"oauth","connected_at":"t1",
+             "last_refreshed_at":"t2","last_refresh_error":"invalid_grant",
+             "access_token":"••••••••","refresh_token":"••••••••"}]}"#;
+        let (port, _) = serve_each(vec![("200 OK", entries)]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        let oauth =
+            |key: &str, state| listed(key, CredentialKind::OAuth(state));
+        assert_eq!(
+            vault.credentials().unwrap(),
+            [
+                oauth("OLD", OAuthState::Failed("invalid_grant".into())),
+                oauth("NEW", OAuthState::NotConnected),
+                oauth("ON", OAuthState::Connected),
+                listed("DYN", CredentialKind::Static),
+                listed("S", CredentialKind::Static),
+            ]
+        );
 
         let (port, _) =
             serve_each(vec![("500 Internal Server Error", " no store \n")]);
-        let error = admin(port).credential_keys().unwrap_err().to_string();
+        let error = admin(port).list().err().unwrap().to_string();
         assert_eq!(
             error,
             "GET /v1/credentials?vault=default: HTTP 500: no store"
         );
+    }
+
+    const CONSENT: &str =
+        r#"{"authorization_url":"https://a.example/authorize?state=s"}"#;
+    const JIRA_STORED: &str = r#"{"keys":["JIRA"],"credentials":[
+        {"key":"JIRA","type":"oauth","client_secret":"••••••••",
+         "connected_at":"t0","last_refreshed_at":"t1",
+         "authorization_url":"https://a.example/authorize",
+         "token_url":"https://a.example/token","client_id":"stored",
+         "scopes":"read","token_auth_method":"client_secret_basic"}]}"#;
+
+    fn body(request: &str) -> &str {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("POST /v1/credentials/oauth/connect "));
+        body
+    }
+
+    #[test]
+    fn a_login_sends_exactly_the_client_it_is_given() {
+        let state = scratch_dir("agent-vault-oauth-begin");
+        let (port, server) = serve_each(vec![
+            ("200 OK", JIRA_STORED),
+            ("200 OK", CONSENT),
+            ("200 OK", r#"{"keys":[]}"#),
+            ("200 OK", CONSENT),
+            ("200 OK", r#"{"keys":[]}"#),
+            ("400 Bad Request", r#"{"error":"bad token_url"}"#),
+        ]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        let client = |secret: Option<&str>| OAuthClient {
+            authorization_url: "https://a.example/authorize".into(),
+            token_url: "https://a.example/token".into(),
+            client_id: "c1".into(),
+            client_secret: secret.map(|value| Secret::new(value.into())),
+            scopes: "read".into(),
+            token_auth_method: String::new(),
+        };
+        let login = vault.oauth_begin("JIRA", Some(&client(Some("s3cret"))));
+        let login = login.unwrap();
+        assert_eq!(login.url, "https://a.example/authorize?state=s");
+        assert_eq!((login.key.as_str(), login.marker.as_str()), ("JIRA", "t1"));
+        let login = vault.oauth_begin("JIRA", Some(&client(None))).unwrap();
+        assert_eq!(login.marker, "");
+        let error = vault.oauth_begin("JIRA", Some(&client(None)));
+        let error = error.err().unwrap().to_string();
+        assert!(error.starts_with("OAuth login JIRA: POST "), "{error}");
+
+        let requests = server.join().unwrap();
+        let fields = r#""authorization_url":"https://a.example/authorize","client_id":"c1""#;
+        let rest = r#""key":"JIRA","scopes":"read","token_url":"https://a.example/token","vault":"default"}"#;
+        assert!(!requests[1].split("\r\n\r\n").next().unwrap().contains("s3"));
+        assert_eq!(
+            body(&requests[1]),
+            format!(r#"{{{fields},"client_secret":"s3cret",{rest}"#)
+        );
+        assert_eq!(body(&requests[3]), format!("{{{fields},{rest}"));
+    }
+
+    #[test]
+    fn a_re_login_sends_the_stored_client_and_keeps_its_secret() {
+        let state = scratch_dir("agent-vault-oauth-relogin");
+        let no_authorize = r#"{"keys":["JIRA"],"credentials":[
+            {"key":"JIRA","type":"oauth","token_url":"https://t.example",
+             "client_id":"c1","authorization_url":""}]}"#;
+        let (port, server) = serve_each(vec![
+            ("200 OK", JIRA_STORED),
+            ("200 OK", CONSENT),
+            ("200 OK", r#"{"keys":["JIRA"]}"#),
+            ("200 OK", no_authorize),
+        ]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        let login = vault.oauth_begin("JIRA", None).unwrap();
+        assert_eq!(login.marker, "t1");
+        let expected = "JIRA has no OAuth client to log in with: pass \
+                        --authorization-url, --token-url and --client-id";
+        for _ in 0..2 {
+            let error = vault.oauth_begin("JIRA", None).err().unwrap();
+            assert_eq!(error.to_string(), expected);
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(
+            body(&requests[1]),
+            r#"{"authorization_url":"https://a.example/authorize","client_id":"stored","client_secret":"••••••••","key":"JIRA","scopes":"read","token_auth_method":"client_secret_basic","token_url":"https://a.example/token","vault":"default"}"#
+        );
+    }
+
+    #[test]
+    fn the_wait_ends_when_the_refresh_time_moves_or_gives_up() {
+        let state = scratch_dir("agent-vault-oauth-wait");
+        let (port, server) = serve_each(vec![
+            ("200 OK", JIRA_STORED),
+            ("200 OK", r#"{"keys":["JIRA"]}"#),
+            ("200 OK", JIRA_STORED),
+            ("200 OK", JIRA_STORED),
+            ("200 OK", JIRA_STORED),
+        ]);
+        let vault = logged_in(&state, port, Rc::new(FakeSandbox::default()));
+        let login = |marker: &str| PendingLogin {
+            key: "JIRA".into(),
+            url: String::new(),
+            marker: marker.into(),
+        };
+        vault.oauth_wait(&login(""), Duration::ZERO).unwrap();
+        let admin = admin(port);
+        let twice = Duration::from_millis(200);
+        admin.wait_for_tokens(&login("t0"), twice, twice).unwrap();
+        let error = admin.wait_for_tokens(&login("t1"), twice, twice);
+        assert_eq!(
+            error.unwrap_err().to_string(),
+            "no login for JIRA yet: the browser page shows the result; \
+             check 'hangar credential list'"
+        );
+        assert_eq!(server.join().unwrap().len(), 5);
     }
 
     #[test]
@@ -951,18 +1229,5 @@ mod tests {
             body,
             r#"{"vault":"default","credentials":{"TOKEN":"the-value"}}"#
         );
-    }
-
-    #[test]
-    fn deleting_names_the_keys_and_reading_the_policy_parses_it() {
-        let (port, server) = serve_each(vec![("200 OK", "{}")]);
-        admin(port).delete(&["A".into(), "B".into()]).unwrap();
-        let request = server.join().unwrap().remove(0);
-        assert!(request.starts_with("DELETE /v1/credentials "));
-        assert!(request.ends_with(r#"{"vault":"default","keys":["A","B"]}"#));
-
-        let (port, _) =
-            serve_each(vec![("200 OK", r#"{"unmatched_host_policy":"deny"}"#)]);
-        assert_eq!(admin(port).policy().unwrap().as_deref(), Some("deny"));
     }
 }

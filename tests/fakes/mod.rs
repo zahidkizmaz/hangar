@@ -1,7 +1,8 @@
 //! Test doubles: a fake `msb` (shell script, state in files) and a fake
 //! agent-vault admin API (a loopback HTTP server that records requests).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -128,8 +129,7 @@ impl Machine {
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
-        let path =
-            format!("{}:{}", self.home.join("bin").display(), tools_path());
+        let path = tools_path(self.home.join("bin"));
         let service = format!("hangar-test-{}", std::process::id());
         let mut command = Command::new(env!("CARGO_BIN_EXE_hangar"));
         command
@@ -152,13 +152,11 @@ impl Machine {
 /// The caller's PATH (the fake scripts need coreutils, which the Nix build
 /// sandbox has only there) minus any directory holding a real `msb`, so a
 /// test can never drive real VMs.
-fn tools_path() -> String {
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .filter(|dir| !dir.join("msb").exists())
-        .map(|dir| dir.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":")
+fn tools_path(fakes: PathBuf) -> OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tools =
+        std::env::split_paths(&path).filter(|dir| !dir.join("msb").exists());
+    std::env::join_paths(std::iter::once(fakes).chain(tools)).unwrap()
 }
 
 pub fn stdout(output: &Output) -> String {
@@ -179,7 +177,8 @@ pub struct Request {
 
 /// agent-vault's admin API, as far as hangar uses it. Healthy once the fake
 /// msb has "started" the server (`$HANGAR_FAKE/vault-started`); with
-/// `$HANGAR_FAKE/fail-deny` a deny PATCH succeeds but changes nothing.
+/// `$HANGAR_FAKE/fail-deny` a deny PATCH succeeds but changes nothing, and
+/// `fail-register` or `fail-login` fails the owner's.
 pub struct FakeVault {
     pub port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -195,6 +194,9 @@ impl FakeVault {
             let mut vault = Stored {
                 policy: String::from("allow"),
                 keys: BTreeSet::new(),
+                oauth: BTreeMap::new(),
+                logins: 0,
+                port,
             };
             for stream in listener.incoming().flatten() {
                 serve(stream, &fake, &recorded, &mut vault);
@@ -207,14 +209,19 @@ impl FakeVault {
         self.requests.lock().unwrap().clone()
     }
 
-    /// Admin calls only: health checks and port probes (`GET /`) are
-    /// noise for assertions.
+    /// Calls with the session token only: health checks, port probes
+    /// (`GET /`), the owner's login and the CA are noise for assertions.
     pub fn admin_requests(&self) -> Vec<Request> {
+        let public = [
+            "/health",
+            "/",
+            "/v1/auth/register",
+            "/v1/auth/login",
+            "/v1/mitm/ca.pem",
+        ];
         self.requests()
             .into_iter()
-            .filter(|request| {
-                !["/health", "/"].contains(&request.path.as_str())
-            })
+            .filter(|request| !public.contains(&request.path.as_str()))
             .collect()
     }
 }
@@ -223,6 +230,70 @@ impl FakeVault {
 struct Stored {
     policy: String,
     keys: BTreeSet<String>,
+    /// An OAuth key's list entry; a login completes the moment it starts.
+    oauth: BTreeMap<String, String>,
+    logins: usize,
+    port: u16,
+}
+
+impl Stored {
+    fn list(&self) -> String {
+        let keys: Vec<String> =
+            self.keys.iter().map(|key| format!(r#""{key}""#)).collect();
+        let entries: Vec<String> = self
+            .keys
+            .iter()
+            .map(|key| {
+                self.oauth.get(key).cloned().unwrap_or_else(|| {
+                    format!(r#"{{"key":"{key}","type":"static"}}"#)
+                })
+            })
+            .collect();
+        format!(
+            r#"{{"keys":[{}],"credentials":[{}]}}"#,
+            keys.join(","),
+            entries.join(",")
+        )
+    }
+
+    fn connect(&mut self, body: &str) -> String {
+        let field = |name| body_field(body, name);
+        let key = field("key");
+        self.logins += 1;
+        let secret = if body.contains(r#""client_secret""#) {
+            r#","client_secret":"••••••••""#
+        } else {
+            ""
+        };
+        let entry = format!(
+            r#"{{"key":"{key}","type":"oauth","connected_at":"t0","last_refreshed_at":"t{}","authorization_url":"{}","token_url":"{}","client_id":"{}","scopes":"{}"{secret}}}"#,
+            self.logins,
+            field("authorization_url"),
+            field("token_url"),
+            field("client_id"),
+            field("scopes"),
+        );
+        self.keys.insert(key.clone());
+        self.oauth.insert(key, entry);
+        format!(
+            r#"{{"authorization_url":"{}?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fv1%2Foauth%2Fcallback&state=s"}}"#,
+            field("authorization_url"),
+            field("client_id"),
+            self.port
+        )
+    }
+}
+
+fn body_field(body: &str, field: &str) -> String {
+    use miniserde::json::Value;
+    let Ok(Value::Object(top)) = miniserde::json::from_str::<Value>(body)
+    else {
+        return String::new();
+    };
+    match top.get(field) {
+        Some(Value::String(value)) => value.clone(),
+        _ => String::new(),
+    }
 }
 
 /// The keys of a credentials body: `credentials` (POST) or `keys` (DELETE).
@@ -292,10 +363,27 @@ fn serve(
             200,
             format!(r#"{{"unmatched_host_policy":"{}"}}"#, vault.policy),
         ),
-        ("GET", "/v1/credentials?vault=default") => {
-            let keys: Vec<String> =
-                vault.keys.iter().map(|key| format!(r#""{key}""#)).collect();
-            (200, format!(r#"{{"keys":[{}]}}"#, keys.join(",")))
+        ("POST", "/v1/auth/register" | "/v1/auth/login") => {
+            let action = &path["/v1/auth/".len()..];
+            let password = body_field(&body, "password");
+            fs::write(fake.join(format!("owner-{action}")), password).unwrap();
+            if fake.join(format!("fail-{action}")).exists() {
+                (500, format!(r#"{{"error":"{action} failed"}}"#))
+            } else {
+                (200, r#"{"token":"session-token"}"#.to_string())
+            }
+        }
+        ("POST", "/v1/agents") => {
+            (200, r#"{"av_agent_token":"agent-token-1"}"#.to_string())
+        }
+        ("PUT", "/v1/vaults/default/services") => {
+            fs::write(fake.join("services.json"), &body).unwrap();
+            (200, "{}".to_string())
+        }
+        ("GET", "/v1/mitm/ca.pem") => (200, "FAKE-CA\n".to_string()),
+        ("GET", "/v1/credentials?vault=default") => (200, vault.list()),
+        ("POST", "/v1/credentials/oauth/connect") => {
+            (200, vault.connect(&body))
         }
         ("POST", "/v1/credentials") => {
             vault.keys.extend(body_keys(&body, "credentials"));
@@ -304,6 +392,7 @@ fn serve(
         ("DELETE", "/v1/credentials") => {
             for key in body_keys(&body, "keys") {
                 vault.keys.remove(&key);
+                vault.oauth.remove(&key);
             }
             (200, "{}".to_string())
         }

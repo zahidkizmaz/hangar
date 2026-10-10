@@ -140,17 +140,19 @@ fn app_names(apps: Option<&Json>, path: &str) -> Result<Vec<String>> {
         Some(Json::Array(items)) => items,
         Some(_) => bail!("{path}: expected strings"),
     };
-    let mut names = Vec::new();
-    for item in items {
-        let Json::String(name) = item else {
-            bail!("{path}: expected strings");
-        };
-        if names.contains(name) {
-            bail!("{path}: {name} is listed twice");
-        }
-        names.push(name.clone());
-    }
-    Ok(names)
+    let mut seen = BTreeSet::new();
+    items
+        .iter()
+        .map(|item| {
+            let Json::String(name) = item else {
+                bail!("{path}: expected strings");
+            };
+            if !seen.insert(name) {
+                bail!("{path}: {name} is listed twice");
+            }
+            Ok(name.clone())
+        })
+        .collect()
 }
 
 fn parse(name: &str, value: &Json) -> Result<AppDef> {
@@ -247,12 +249,8 @@ pub(crate) fn merge_routes(
 ) -> Result<(BTreeMap<String, Route>, BTreeMap<String, Origin>)> {
     let mut routes: BTreeMap<String, Route> = BTreeMap::new();
     let mut origins: BTreeMap<String, Origin> = BTreeMap::new();
-    let mut seen: Vec<&str> = Vec::new();
-    let apps = bays.iter().flatten().filter(|app| {
-        let first = !seen.contains(&app.name.as_str());
-        seen.push(&app.name);
-        first
-    });
+    let mut seen = BTreeSet::new();
+    let apps = bays.iter().flatten().filter(|app| seen.insert(&app.name));
     for (index, app) in apps.enumerate() {
         for (name, route) in &app.routes {
             if let Some(Origin::App(_, other)) = origins.get(name)
@@ -352,17 +350,14 @@ pub(crate) fn check_placeholders(
 
 pub(crate) fn apply(bay: &mut BaySettings, apps: &[AppDef]) -> Result<()> {
     let env = app_env(apps)?;
-    let mut packages: Vec<String> = Vec::new();
-    for package in apps
+    let mut seen = BTreeSet::new();
+    bay.packages = apps
         .iter()
         .flat_map(|app| &app.packages)
         .chain(&bay.packages)
-    {
-        if !packages.contains(package) {
-            packages.push(package.clone());
-        }
-    }
-    bay.packages = packages;
+        .filter(|package| seen.insert(*package))
+        .cloned()
+        .collect();
     bay.env = env
         .into_iter()
         .chain(std::mem::take(&mut bay.env))
@@ -443,12 +438,10 @@ fn check_hosts(
     }
     for (host, mut users) in by_host {
         users.sort();
-        for (index, (origin, name)) in users.iter().enumerate() {
-            let Some((first, first_name)) =
-                users[..index].iter().find(|(other, _)| other != origin)
-            else {
-                continue;
-            };
+        let (first, first_name) = users[0];
+        if let Some((origin, name)) =
+            users.iter().find(|(origin, _)| *origin != first)
+        {
             bail!("host {host}: {first} {first_name} and {origin} {name}");
         }
     }
@@ -492,27 +485,9 @@ fn origin<'a>(origins: &'a BTreeMap<String, Origin>, name: &str) -> &'a Origin {
 mod tests {
     use super::BUILTINS;
     use crate::config::{BaySettings, Settings};
-    use crate::testing::resolved as resolve_text;
-
-    fn error(config: &str) -> String {
-        resolve_text(config).unwrap_err().to_string()
-    }
-
-    /// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
-    /// `"apps": ["web"]`), plus top-level `rest`.
-    fn one_bay(bay: &str, rest: &str) -> String {
-        let bay = if bay.is_empty() {
-            String::new()
-        } else {
-            format!(", {bay}")
-        };
-        let rest = if rest.is_empty() {
-            String::new()
-        } else {
-            format!(", {rest}")
-        };
-        format!(r#"{{"bays": [{{"name": "default"{bay}}}]{rest}}}"#)
-    }
+    use crate::testing::{
+        config_error as error, one_bay, resolved as resolve_text,
+    };
 
     fn bay(settings: &Settings) -> &BaySettings {
         &settings.bays[0]

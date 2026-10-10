@@ -22,8 +22,11 @@ strip = true
 
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+http = "1.5.0"
 log = "0.4.34"
 miniserde = "0.1.46"
+percent-encoding = "2.3.2"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 
 # Dev tools, run through cargo-run-bin (`cargo install cargo-run-bin
 # cargo-binstall`): `cargo nextest`, `cargo llvm-cov` and `cargo deny` use

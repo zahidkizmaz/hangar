@@ -211,8 +211,101 @@ Name a credential after the environment variable your tool reads (e.g.
 `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`). hangar then sets
 `NAME=hangar-placeholder` in every bay for every credential a route
 injects, and the vault swaps in the real value on the way out.
-`hangar credential list` shows the names and who manages them, never the
-values; `hangar credential rm NAME` deletes one of yours.
+`hangar credential list` shows the names, who manages them and their
+state (`set`, or for an OAuth credential whether it's connected), never
+the values; `hangar credential rm NAME` deletes one of yours. Names are
+`UPPER_SNAKE_CASE` starting with a letter, agent-vault's rule.
+
+### OAuth credentials
+
+Some APIs hand out OAuth tokens instead of a key you can paste: a login in
+your browser, then an access token that expires and a refresh token that
+renews it. The vault can hold such a credential and refresh it itself, so
+neither token ever enters a bay. Log it in once from your machine, giving
+the API's URL:
+
+```sh
+hangar credential login ATLASSIAN https://mcp.atlassian.com/v1/mcp
+```
+
+- hangar finds the provider's endpoints from that URL (the resource's
+  OAuth metadata, else the authorization server's or OpenID's at its
+  origin) and registers itself there as a public client, one without a
+  secret. Every URL it fetches must be `https` with a public host name.
+  `--scope` asks for a scope (repeat it), and `--client-id ID` uses a
+  client you registered instead.
+- A provider without that registration needs a client you register
+  yourself, with `http://127.0.0.1:14321/v1/oauth/callback` as its
+  redirect URL (your `tower.agentVault.adminPort`): the provider sends
+  your browser back to the vault there. Then pass its endpoints:
+
+  ```sh
+  hangar credential login EXAMPLE_API \
+    --authorization-url https://auth.example.com/authorize \
+    --token-url https://auth.example.com/token \
+    --client-id abc123 --client-secret --scope read
+  ```
+
+  `--client-secret` reads the secret like `credential set` (hidden
+  prompt, or stdin) and gives it to the vault only.
+- hangar opens the provider's consent page (`open` or `xdg-open`, and
+  prints the URL when you're at a terminal) and waits up to 10 minutes
+  until the vault has the tokens. The page in your browser says whether it
+  worked.
+- A route injects it like any credential, e.g.
+  `{"type": "bearer", "token": "ATLASSIAN"}` on the API's host; bays get
+  the placeholder.
+- `hangar credential login ATLASSIAN` alone logs in again with the client
+  the vault holds (and its secret), e.g. after `credential list` shows
+  `oauth: refresh failed`. `hangar credential rm ATLASSIAN` is the logout:
+  it deletes the tokens from the vault. Revoke the grant at the provider
+  too if you want it gone there.
+- A tower started before hangar knew its host address sends the browser
+  to an address it can't reach; `login` then refuses and says to restart
+  the tower (`hangar down && hangar up`).
+
+### MCP servers
+
+A remote MCP server is a host like any other: a route, a credential, and
+the server in your tool's own config. hangar never reads or writes that
+config, and it holds no secret.
+
+1. A route in `tower.routes`. Scope it to the server's path, so the bay
+   can reach only the MCP endpoint, never the provider's `/register` or
+   `/token` (a tool can't log itself in from inside the bay):
+
+   ```json
+   { "name": "atlassian-mcp", "host": "mcp.atlassian.com/v1/mcp",
+     "auth": { "type": "bearer", "token": "ATLASSIAN" } }
+   ```
+
+   A server that also needs other paths (an SSE server's `/sse` and
+   `/messages`) gets a glob such as `mcp.example.com/v1/*`. The scope
+   only guards while no other route covers the whole host.
+2. The credential: `hangar credential login ATLASSIAN
+   https://mcp.atlassian.com/v1/mcp` for OAuth, or `hangar credential set
+   NAME` for a key.
+3. The server in your tool, the way you always add it, with the
+   credential's placeholder for auth, so the tool sends a header the vault
+   replaces, and never starts a login of its own:
+
+   ```sh
+   hangar shell claude mcp add-json --scope user atlassian \
+     '{"type":"http","url":"https://mcp.atlassian.com/v1/mcp",
+       "headers":{"Authorization":"Bearer ${ATLASSIAN}"}}'
+   ```
+
+   Claude Code keeps user-scope servers in `~/.claude.json` in the bay's
+   kept home (it rewrites that file itself, so don't copy it with
+   `files`); a project's `.mcp.json` works too. opencode reads
+   `{env:ATLASSIAN}` in `headers` (set `"oauth": false`), and Codex
+   `bearer_token_env_var = "ATLASSIAN"`; their config files can come in
+   with `files`.
+
+A local (stdio) MCP server runs in the bay and calls its API through the
+tower: route that API's host with the credential the server reads from
+its environment (e.g. `context7.com` with bearer `CONTEXT7_API_KEY`), and
+the bay's placeholder does the rest.
 
 ## Claude Code, Codex and Paperclip
 

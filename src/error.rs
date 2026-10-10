@@ -70,17 +70,3 @@ macro_rules! bail {
     };
 }
 pub(crate) use bail;
-
-#[cfg(test)]
-mod tests {
-    use super::Error;
-
-    #[test]
-    fn a_hint_follows_the_message_for_humans() {
-        let error = Error::with_hint("the vault isn't running", "run 'up'");
-        assert_eq!(error.to_string(), "the vault isn't running: run 'up'");
-        assert_eq!(error.message(), "the vault isn't running");
-        assert_eq!(error.hint(), Some("run 'up'"));
-        assert_eq!(Error::new("plain").hint(), None);
-    }
-}

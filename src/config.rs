@@ -252,7 +252,7 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
     if items.is_empty() {
         return Ok(vec![json::object([("name", json::string("default"))])]);
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut names = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
         let entry = Fields::new(item, &format!("config.bays.{index}"))?;
         let name = entry.string("name")?;
@@ -262,10 +262,9 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
                  digits, joined by single -, at most 32 characters"
             );
         }
-        if names.contains(&name) {
+        if !names.insert(name.clone()) {
             bail!("config.bays: two bays named {name}");
         }
-        names.push(name);
     }
     Ok(items)
 }
@@ -347,6 +346,49 @@ pub(crate) fn unused_credential_files(settings: &Settings) -> Vec<String> {
         .collect()
 }
 
+/// Path-scoped routes (`host/path`) that another route covers whole: the
+/// scope then keeps nothing out. Pairs of (scoped, covering) names.
+pub(crate) fn uncovered_path_scopes(
+    settings: &Settings,
+) -> Vec<(String, String)> {
+    let routes = settings.routes.values();
+    let scoped = routes.clone().filter_map(|route| {
+        let (host, _) = route.host.split_once('/')?;
+        Some((route, host))
+    });
+    scoped
+        .flat_map(|(route, host)| {
+            routes
+                .clone()
+                .filter(move |whole| covers(&whole.host, host))
+                .map(|whole| (route.name.clone(), whole.name.clone()))
+        })
+        .collect()
+}
+
+/// Whether route host `whole` (no path) matches every request to `host`:
+/// the same name, or a `*.` wildcard one label up, on any port unless it
+/// names one.
+fn covers(whole: &str, host: &str) -> bool {
+    if whole.contains('/') {
+        return false;
+    }
+    let split = |host: &str| {
+        let (name, port) = host.split_once(':').unwrap_or((host, ""));
+        (name.to_ascii_lowercase(), port.to_string())
+    };
+    let ((whole_name, whole_port), (name, port)) = (split(whole), split(host));
+    if !whole_port.is_empty() && whole_port != port {
+        return false;
+    }
+    let one_label_below = |suffix: &str| {
+        name.strip_suffix(suffix)
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    };
+    whole_name == name
+        || whole_name.strip_prefix('*').is_some_and(one_label_below)
+}
+
 pub(crate) fn state_dir(settings: &Settings, var: Var) -> Result<PathBuf> {
     if let Some(dir) = var("HANGAR_STATE_DIR") {
         return Ok(dir.into());
@@ -409,11 +451,10 @@ pub(crate) fn route_json(route: &Route) -> Json {
     Json::Object(object)
 }
 
+/// agent-vault's credential key rule, `^[A-Z][A-Z0-9_]*$`.
 pub(crate) fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
-    chars
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+    chars.next().is_some_and(|first| first.is_ascii_uppercase())
         && chars
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
@@ -711,13 +752,8 @@ impl<'a> Fields<'a> {
     }
 
     pub(crate) fn only(&self, known: &[&str]) -> Result<()> {
-        let mut unknown: Vec<&String> = self
-            .map
-            .keys()
-            .filter(|key| !known.contains(&key.as_str()))
-            .collect();
-        unknown.sort();
-        if let Some(key) = unknown.first() {
+        let mut keys = self.map.keys();
+        if let Some(key) = keys.find(|key| !known.contains(&key.as_str())) {
             bail!("{}: unknown setting", self.at(key));
         }
         Ok(())
@@ -741,20 +777,22 @@ mod tests {
     use super::*;
 
     use crate::testing::{
-        resolved as resolve_text, settings as resolve_with, vars,
+        config_error as error, one_bay, resolved as resolve_text,
+        settings as resolve_with, vars,
     };
-
-    fn error(config: &str) -> String {
-        resolve_text(config).unwrap_err().to_string()
-    }
-
-    /// One bay `default` with `bay`'s fields (a JSON fragment).
-    fn one_bay(bay: &str) -> String {
-        format!(r#"{{"bays": [{{"name": "default", {bay}}}]}}"#)
-    }
 
     fn names(settings: &Settings) -> Vec<&str> {
         settings.bays.iter().map(|bay| bay.name.as_str()).collect()
+    }
+
+    #[test]
+    fn keys_follow_agent_vaults_rule() {
+        for key in ["A", "GITHUB_TOKEN", "K8S_", "X_1"] {
+            assert!(valid_key(key), "{key}");
+        }
+        for key in ["", "_LEADING", "1ST", "lower", "MIXED_case", "A-B"] {
+            assert!(!valid_key(key), "{key}");
+        }
     }
 
     #[test]
@@ -888,15 +926,15 @@ mod tests {
     #[test]
     fn bad_bay_values_name_the_bay() {
         assert_eq!(
-            error(&one_bay(r#""packages": ["a", 1]"#)),
+            error(&one_bay(r#""packages": ["a", 1]"#, "")),
             "config.bays.default.packages: expected strings"
         );
         assert_eq!(
-            error(&one_bay(r#""cpus": 8.5"#)),
+            error(&one_bay(r#""cpus": 8.5"#, "")),
             "config.bays.default.cpus: expected a whole number"
         );
         assert_eq!(
-            error(&one_bay(r#""cpu": 8"#)),
+            error(&one_bay(r#""cpu": 8"#, "")),
             "config.bays.default.cpu: unknown setting"
         );
     }
@@ -933,10 +971,10 @@ mod tests {
         let bay = |config: &str| resolve_with(config).bays.remove(0);
         let unset = bay("{}");
         assert_eq!((unset.home, unset.cache), (true, true));
-        let off = bay(&one_bay(r#""home": false, "cache": false"#));
+        let off = bay(&one_bay(r#""home": false, "cache": false"#, ""));
         assert_eq!((off.home, off.cache), (false, false));
         for value in ["null", r#""~/h""#, "1"] {
-            let message = error(&one_bay(&format!(r#""cache": {value}"#)));
+            let message = error(&one_bay(&format!(r#""cache": {value}"#), ""));
             assert_eq!(
                 message,
                 "config.bays.default.cache: expected true or false"
@@ -944,6 +982,7 @@ mod tests {
         }
         let mount = one_bay(
             r#""mounts": {"~/data": {"host": "~/d", "writable": null}}"#,
+            "",
         );
         assert!(!bay(&mount).mounts["/home/pilot/data"].writable);
     }
@@ -1007,7 +1046,8 @@ mod tests {
                 "overlap",
             ),
         ] {
-            let message = error(&one_bay(&format!(r#""mounts": {mounts}"#)));
+            let message =
+                error(&one_bay(&format!(r#""mounts": {mounts}"#), ""));
             assert!(message.contains(why), "{mounts}: {message}");
         }
     }
@@ -1021,11 +1061,11 @@ mod tests {
             format!("ghcr.io/zahidkizmaz/hangar-bay:v{version}")
         );
         assert_eq!(
-            image(&one_bay(r#""imageRepository": "ghcr.io/fork/agent""#)),
+            image(&one_bay(r#""imageRepository": "ghcr.io/fork/agent""#, "")),
             format!("ghcr.io/fork/agent:v{version}")
         );
         assert_eq!(
-            image(&one_bay(r#""image": "hangar-bay:dev""#)),
+            image(&one_bay(r#""image": "hangar-bay:dev""#, "")),
             "hangar-bay:dev"
         );
     }
@@ -1089,6 +1129,51 @@ mod tests {
             unused_credential_files(&resolve_with(&app("GIT_USER"))),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn a_path_scope_another_route_covers_whole_is_found() {
+        let routes = |hosts: &[&str]| {
+            let routes: Vec<String> = hosts
+                .iter()
+                .enumerate()
+                .map(|(index, host)| {
+                    format!(
+                        r#"{{"name": "r{index}", "host": "{host}",
+                             "auth": {{"type": "passthrough"}}}}"#
+                    )
+                })
+                .collect();
+            let config =
+                format!(r#"{{"tower": {{"routes": [{}]}}}}"#, routes.join(","));
+            uncovered_path_scopes(&resolve_with(&config))
+        };
+        let pair = |scoped: &str, whole: &str| (scoped.into(), whole.into());
+        assert_eq!(
+            routes(&["mcp.example.com/v1/mcp", "mcp.example.com"]),
+            [pair("r0", "r1")]
+        );
+        assert_eq!(
+            routes(&[
+                "mcp.example.com/v1/*",
+                "*.example.com",
+                "x.mcp.example.com"
+            ]),
+            [pair("r0", "r1")]
+        );
+        assert_eq!(
+            routes(&["MCP.example.com:8443/v1", "mcp.example.com:8443"]),
+            [pair("r0", "r1")]
+        );
+        for alone in [
+            &["mcp.example.com/v1/mcp", "mcp.example.com/v2/*"][..],
+            &["mcp.example.com/v1", "mcp.example.com:8443"],
+            &["mcp.example.com/v1", "*.mcp.example.com"],
+            &["a.mcp.example.com/v1", "*.example.com"],
+            &["mcp.example.com/v1", "example.com"],
+        ] {
+            assert_eq!(routes(alone), Vec::new(), "{alone:?}");
+        }
     }
 
     #[test]
@@ -1164,20 +1249,21 @@ mod tests {
 
     #[test]
     fn bay_env_and_run_are_validated() {
-        let lower = error(&one_bay(r#""env": {"lower": "x"}"#));
+        let lower = error(&one_bay(r#""env": {"lower": "x"}"#, ""));
         assert!(lower.contains("UPPER_SNAKE_CASE"), "{lower}");
         for secret in ["ghp_abc", "sk-ant-123", &"a".repeat(40)] {
             let message =
-                error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#)));
+                error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#), ""));
             assert!(message.contains("looks like a real secret"), "{message}");
             assert!(message.contains("hangar credential set T"), "{message}");
         }
         let ok = resolve_with(&one_bay(
             r#""env": {"T": "placeholder value"}, "run": {"paper-clip2": "x"}"#,
+            "",
         ));
         assert_eq!(ok.bays[0].env["T"], "placeholder value");
         assert_eq!(ok.bays[0].run["paper-clip2"], "x");
-        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#));
+        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#, ""));
         assert_eq!(
             name,
             "config.bays.default.run.Bad Name: names are lowercase, digits and -"
