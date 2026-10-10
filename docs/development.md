@@ -97,7 +97,7 @@ bodies (`no_secret_reaches_any_log_level` checks this).
 | ------------------ | ------------------------------------------------------ | ---------------------------------------------------- |
 | gitleaks           | committed secrets                                      | prek (staged), CI (full history)                     |
 | zizmor, actionlint | workflow security and correctness                      | prek                                                 |
-| cargo-deny         | licenses, banned/duplicate crates, sources; advisories | prek (offline), CI + weekly `audit.yml` (advisories) |
+| cargo-deny         | licenses, banned/duplicate crates, sources; advisories | prek (no advisories), CI, weekly `audit.yml`         |
 | sbomnix            | SBOM of the bay image                                  | `image.yml` artifact                                 |
 
 The image's SBOM lists every package in its Nix closure, the input for a
