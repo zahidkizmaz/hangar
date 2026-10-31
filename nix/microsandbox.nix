@@ -9,7 +9,7 @@
 }:
 let
   # Renovate bumps the version; update the three hashes in the same PR.
-  version = "0.7.6";
+  version = "0.7.8";
 
   releases = {
     aarch64-darwin = {
