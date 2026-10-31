@@ -108,6 +108,9 @@ proxy](https://infisical.com/docs/documentation/platform/agent-vault/proxies):
   a bay on one can't use apps that need hangar's routes or credentials
   (e.g. `github`, `nix`, `claude-code`)—the failure names the app.
   `hangar credential` only works on an `agent-vault` tower.
+- Packages are allowed: their downloads go through the proxy, whose own
+  allowlist decides which hosts it reaches. Hangar cannot check that
+  allowlist, so it does not require routes for a proxy tower's packages.
 - Infisical session tokens are time-bound: refresh `tokenFile` when the
   session expires. (hangar doesn't mint them yet.)
 
@@ -159,7 +162,7 @@ must already be enrolled once: its `dataDir` holds the enrollment and CA.
   defaults to `http://127.0.0.1:<port>/_agent-vault/ca`; a local file works
   too.
 - A local proxy tower manages its own routes and credentials, so the same
-  refusals apply as for a remote one.
+  refusals apply as for a remote one; its packages also need no routes.
 
 ## Where hangar keeps things
 

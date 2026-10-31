@@ -424,7 +424,8 @@ enabled per bay by its `apps` (the built-ins are listed in
    moving one to another host port. Then `check_packages`: a bay with
    packages needs a route whose host is exactly `cache.nixos.org`, and for
    `github:` or registry refs (`nixpkgs#x`, `flake:nixpkgs#x`) exactly
-   `api.github.com`.
+   `api.github.com`. A `proxy` tower is exempt: its own proxy decides
+   egress, so hangar cannot check that allowlist.
 
 An app's route can't set `extra`, which reaches the broker unchecked and
 so is trusted user config only. `Hangar::load` refuses two published

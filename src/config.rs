@@ -277,7 +277,8 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
         apps::apply(&mut bays[i], &enabled[i])?;
         let tower = bays[i].tower.clone();
         let routes = settings.towers[&tower].routes.clone();
-        check_packages(&bays[i], &routes)?;
+        let is_proxy = settings.towers[&tower].backend == "proxy";
+        check_packages(&bays[i], &routes, is_proxy)?;
     }
     settings.bays = bays;
     Ok(settings)
@@ -418,7 +419,13 @@ pub(crate) fn routes(
 fn check_packages(
     bay: &BaySettings,
     routes: &BTreeMap<String, Route>,
+    is_proxy: bool,
 ) -> Result<()> {
+    // A proxy tower's own proxy decides egress; hangar can't see its
+    // allowlist, so packages there need no routes hangar could check.
+    if is_proxy {
+        return Ok(());
+    }
     let has_route =
         |host: &str| routes.values().any(|route| route.host == host);
     let via_github = |package: &String| {
@@ -1431,6 +1438,15 @@ mod tests {
         let two = r#"{"bays": [{"name": "a", "apps": ["nix", "github"]},
                                {"name": "b", "packages": ["nixpkgs#rtk"]}]}"#;
         assert!(resolve_text(two).is_ok());
+    }
+
+    #[test]
+    fn a_proxy_tower_allows_packages_without_routes() {
+        let config = r#"{"bays": [{"name": "work", "tower": "corp",
+            "packages": ["nixpkgs#rtk"]}],
+            "towers": {"corp": {"backend": "proxy",
+                "proxy": {"host": "h", "caFile": "/x"}}}}"#;
+        assert!(resolve_text(config).is_ok());
     }
 
     #[test]
