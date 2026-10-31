@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crate::broker::Broker;
@@ -18,10 +19,15 @@ use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
 use crate::state::StateDir;
 
-/// An empty directory unique to this test process and `name`.
+static SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+/// An empty directory unique to this test process and call.
 pub(crate) fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("hangar-test-{}-{name}", std::process::id()));
+    let serial = SCRATCH.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "hangar-test-{}-{serial}-{name}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

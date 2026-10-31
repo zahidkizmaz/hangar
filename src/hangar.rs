@@ -211,7 +211,7 @@ pub(crate) fn broker(
         }
         "proxy" => {
             reject(&path, tower, true)?;
-            Ok(Box::new(Proxy::new(tower)?))
+            Ok(Box::new(Proxy::new(tower, sandbox.as_ref(), state)?))
         }
         other => Err(Error::new(format!(
             "{path}.backend: unknown backend {other:?}; known: \

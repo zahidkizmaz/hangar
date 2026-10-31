@@ -1,13 +1,16 @@
-//! A remote `proxy` tower: an HTTP forward proxy hangar doesn't run or
-//! drive. Bays leave through it and trust the CA it serves; the operator
-//! runs it and manages what it injects (for example Infisical's
-//! agent-vault proxy). hangar sets no routes, credentials or deny mode
-//! here, so [`Broker::manages_policy`] is false and `up` skips those
-//! steps.
+//! A `proxy` tower: an HTTP forward proxy hangar either runs itself
+//! (`local`) or points at (`host`). Bays leave through it and trust the CA
+//! it serves; the operator manages what it injects (for example
+//! Infisical's agent-vault proxy). hangar sets no routes, credentials or
+//! deny mode here, so [`Broker::manages_policy`] is false and `up` skips
+//! those steps.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::thread;
 use std::time::Duration;
 
 use super::{
@@ -18,8 +21,10 @@ use crate::config::{Fields, Tower};
 use crate::error::{Context, Error, Result, bail};
 use crate::http;
 use crate::json::{self, Json};
-use crate::sandbox::Egress;
+use crate::process;
+use crate::sandbox::{Egress, Sandbox};
 use crate::secret::{Secret, trim_line_end};
+use crate::state::{StateDir, write_private};
 
 /// The proxy URL's basic-auth user when the tower doesn't name one; the
 /// value Infisical's agent-vault proxy expects.
@@ -30,6 +35,12 @@ const DEFAULT_CA_FIELD: &str = "certificate";
 const DEFAULT_PORT: u16 = 17323;
 const CA_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The command a local proxy starts with, and its subcommand.
+const DEFAULT_COMMAND: &str = "infisical";
+const DEFAULT_ARGS: [&str; 2] = ["agent-vault", "proxy"];
+/// How long a local proxy gets to start listening.
+const LOCAL_WAIT_ATTEMPTS: u32 = 30;
+const LOCAL_WAIT_PAUSE: Duration = Duration::from_secs(1);
 
 pub(crate) struct Proxy {
     host: String,
@@ -39,6 +50,18 @@ pub(crate) struct Proxy {
     fingerprint: Option<String>,
     token_file: Option<PathBuf>,
     token_user: String,
+    local: Option<LocalProxy>,
+}
+
+/// A proxy hangar starts and stops on the host. The operator enrolls it
+/// once (its `dataDir` holds the enrollment); hangar only runs it.
+struct LocalProxy {
+    dir: PathBuf,
+    domain: String,
+    data_dir: PathBuf,
+    command: String,
+    args: Vec<String>,
+    port: u16,
 }
 
 /// Where the proxy's CA comes from: a local file, or a URL `up` pulls.
@@ -73,7 +96,11 @@ impl CaFormat {
 }
 
 impl Proxy {
-    pub(crate) fn new(tower: &Tower) -> Result<Self> {
+    pub(crate) fn new(
+        tower: &Tower,
+        sandbox: &dyn Sandbox,
+        state: &StateDir,
+    ) -> Result<Self> {
         let path = format!("config.towers.{}", tower.name);
         let settings = Fields::new(&tower.config, &path)?.object("proxy")?;
         settings.only(&[
@@ -85,14 +112,26 @@ impl Proxy {
             "caFingerprint",
             "tokenFile",
             "tokenUser",
+            "local",
         ])?;
+        let port = settings.optional_number("port")?.unwrap_or(DEFAULT_PORT);
+        let local = settings
+            .optional_object("local")?
+            .map(|local| LocalProxy::new(&local, tower, state, port))
+            .transpose()?;
         let ca_format = CaFormat::parse(
             &settings
                 .optional_string("caFormat")?
                 .unwrap_or_else(|| "auto".to_string()),
             settings.optional_string("caField")?,
         )?;
-        let ca_file = settings.string("caFile")?;
+        let ca_file = match settings.optional_string("caFile")? {
+            Some(file) => file,
+            None if local.is_some() => {
+                format!("http://127.0.0.1:{port}/_agent-vault/ca")
+            }
+            None => bail!("{path}.proxy.caFile: missing"),
+        };
         let ca = if ca_file.starts_with("http://")
             || ca_file.starts_with("https://")
         {
@@ -100,9 +139,14 @@ impl Proxy {
         } else {
             CaSource::File(PathBuf::from(ca_file))
         };
+        let host = if local.is_some() {
+            sandbox.host_address().to_string()
+        } else {
+            settings.string("host")?
+        };
         Ok(Self {
-            host: settings.string("host")?,
-            port: settings.optional_number("port")?.unwrap_or(DEFAULT_PORT),
+            host,
+            port,
             ca,
             ca_format,
             fingerprint: settings.optional_string("caFingerprint")?,
@@ -112,6 +156,7 @@ impl Proxy {
             token_user: settings
                 .optional_string("tokenUser")?
                 .unwrap_or_else(|| DEFAULT_TOKEN_USER.to_string()),
+            local,
         })
     }
 
@@ -150,6 +195,155 @@ impl Proxy {
     fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+impl LocalProxy {
+    fn new(
+        local: &Fields,
+        tower: &Tower,
+        state: &StateDir,
+        port: u16,
+    ) -> Result<Self> {
+        local.only(&["domain", "dataDir", "command", "args"])?;
+        let domain = local.string("domain")?;
+        let dir = state.tower_dir(&tower.name);
+        let data_dir = local
+            .optional_string("dataDir")?
+            .map_or_else(|| dir.join("proxy"), PathBuf::from);
+        let command = local
+            .optional_string("command")?
+            .unwrap_or_else(|| DEFAULT_COMMAND.to_string());
+        let args = local.strings("args")?;
+        let args = if args.is_empty() {
+            DEFAULT_ARGS.iter().map(|arg| (*arg).to_string()).collect()
+        } else {
+            args
+        };
+        Ok(Self {
+            dir,
+            domain,
+            data_dir,
+            command,
+            args,
+            port,
+        })
+    }
+
+    fn pid_file(&self) -> PathBuf {
+        self.dir.join("proxy.pid")
+    }
+
+    fn log_file(&self) -> PathBuf {
+        self.dir.join("proxy.log")
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if let Some(pid) = read_pid(&self.pid_file())
+            && process_alive(pid)
+        {
+            return Ok(());
+        }
+        self.start()?;
+        self.wait_healthy()
+    }
+
+    fn start(&self) -> Result<()> {
+        fs::create_dir_all(&self.dir).context(self.dir.display())?;
+        fs::create_dir_all(&self.data_dir).context(self.data_dir.display())?;
+        let mut command = process::command(&self.command);
+        command
+            .args(&self.args)
+            .arg("--domain")
+            .arg(&self.domain)
+            .arg("--port")
+            .arg(self.port.to_string())
+            .arg("--data-dir")
+            .arg(&self.data_dir);
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.log_file())
+            .context(self.log_file().display())?;
+        let stderr = log.try_clone().context("cloning proxy log")?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        // Its own process group: a hangar exit doesn't take it down.
+        command.process_group(0);
+        let mut child = process::spawn(&mut command)?;
+        write_private(&self.pid_file(), child.id().to_string().as_bytes())?;
+        // Reap it in the background so it never lingers as a zombie.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+
+    fn wait_healthy(&self) -> Result<()> {
+        for _ in 0..LOCAL_WAIT_ATTEMPTS {
+            if self.health() {
+                return Ok(());
+            }
+            thread::sleep(LOCAL_WAIT_PAUSE);
+        }
+        bail!("proxy did not start, see {}", self.log_file().display())
+    }
+
+    fn stop(&self) {
+        let pid_file = self.pid_file();
+        let Some(pid) = read_pid(&pid_file) else {
+            return;
+        };
+        if process_alive(pid) {
+            // A negative pid signals the whole process group we gave it.
+            let group = format!("-{pid}");
+            let _ = process::command("kill")
+                .arg("-TERM")
+                .arg("--")
+                .arg(&group)
+                .stderr(Stdio::null())
+                .status();
+            for _ in 0..50 {
+                if !process_alive(pid) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            if process_alive(pid) {
+                let _ = process::command("kill")
+                    .arg("-KILL")
+                    .arg("--")
+                    .arg(&group)
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        fs::remove_file(&pid_file).ok();
+    }
+
+    fn health(&self) -> bool {
+        format!("127.0.0.1:{}", self.port)
+            .to_socket_addrs()
+            .is_ok_and(|mut addresses| {
+                addresses.any(|address| {
+                    TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok()
+                })
+            })
+    }
+}
+
+fn read_pid(file: &Path) -> Option<u32> {
+    fs::read_to_string(file).ok()?.trim().parse().ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The third field is the state; 'Z' means a zombie, which is dead.
+    stat.rsplit_once(')')
+        .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
 }
 
 impl CaSource {
@@ -252,6 +446,9 @@ impl Broker for Proxy {
     }
 
     fn ensure_running(&self, _password: &Secret) -> Result<bool> {
+        if let Some(local) = &self.local {
+            local.ensure_running()?;
+        }
         Ok(false)
     }
 
@@ -305,10 +502,21 @@ impl Broker for Proxy {
     }
 
     fn egress(&self) -> Egress {
-        Egress::Host {
-            host: self.host.clone(),
-            port: self.port,
+        if self.local.is_some() {
+            Egress::OnlyHostPort(self.port)
+        } else {
+            Egress::Host {
+                host: self.host.clone(),
+                port: self.port,
+            }
         }
+    }
+
+    fn stop(&self) -> Result<()> {
+        if let Some(local) = &self.local {
+            local.stop();
+        }
+        Ok(())
     }
 
     fn retain_bays(&self, _bays: &[String]) -> Result<()> {
@@ -316,14 +524,17 @@ impl Broker for Proxy {
     }
 
     fn health(&self) -> BrokerHealth {
-        let reachable = self
-            .address()
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addresses| addresses.next())
-            .is_some_and(|address| {
-                TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok()
-            });
+        let reachable = match &self.local {
+            Some(local) => local.health(),
+            None => self
+                .address()
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addresses| addresses.next())
+                .is_some_and(|address| {
+                    TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok()
+                }),
+        };
         // The proxy's own settings decide what it lets through: unknown.
         BrokerHealth {
             reachable,
@@ -345,25 +556,35 @@ impl Broker for Proxy {
 mod tests {
     use super::{
         CaFormat, Proxy, certificate, fingerprint, normalize_fingerprint,
+        process_alive, read_pid,
     };
     use crate::broker::Broker;
     use crate::config::DEFAULT_TOWER;
     use crate::error::Result;
     use crate::sandbox::Egress;
-    use crate::testing::settings;
+    use crate::sandbox::fake::FakeSandbox;
+    use crate::state::StateDir;
+    use crate::testing::{scratch_dir, settings};
     use sha2::{Digest as _, Sha256};
     use std::fs;
+    use std::rc::Rc;
 
     fn proxy(config: &str) -> Proxy {
         let mut settings = settings(config);
         let tower = settings.towers.remove(DEFAULT_TOWER).unwrap();
-        Proxy::new(&tower).unwrap()
+        let sandbox: Rc<dyn crate::sandbox::Sandbox> =
+            Rc::new(FakeSandbox::default());
+        let state = StateDir::new(scratch_dir("proxy-state"));
+        Proxy::new(&tower, sandbox.as_ref(), &state).unwrap()
     }
 
     fn proxy_error(config: &str) -> String {
         let mut settings = settings(config);
         let tower = settings.towers.remove(DEFAULT_TOWER).unwrap();
-        match Proxy::new(&tower) {
+        let sandbox: Rc<dyn crate::sandbox::Sandbox> =
+            Rc::new(FakeSandbox::default());
+        let state = StateDir::new(scratch_dir("proxy-state"));
+        match Proxy::new(&tower, sandbox.as_ref(), &state) {
             Ok(_) => panic!("expected an error"),
             Err(error) => error.to_string(),
         }
@@ -437,10 +658,8 @@ mod tests {
                 }}}}}}}}"#,
             ca.to_str().unwrap()
         );
-        let mut settings = settings(&config);
-        let tower = settings.towers.remove(DEFAULT_TOWER).unwrap();
         // A file CA ignores the URL format; construction still parses it.
-        assert!(Proxy::new(&tower).is_ok());
+        let _ = proxy(&config);
         assert!(CaFormat::parse("nope", None).is_err());
         assert!(matches!(CaFormat::parse("pem", None), Ok(CaFormat::Pem)));
         assert!(matches!(
@@ -504,5 +723,36 @@ mod tests {
         assert_eq!(proxy.ports(), Vec::new());
         let result: Result<()> = proxy.deny_unlisted();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_local_proxy_is_started_and_stopped() {
+        let dir = crate::testing::scratch_dir("local-proxy");
+        fs::write(dir.join("token"), "token\n").unwrap();
+        let config = format!(
+            r#"{{"sandbox": {{"backend": "msb"}}, "towers": {{"default": {{
+                "backend": "proxy", "proxy": {{
+                    "local": {{
+                        "domain": "https://example.com",
+                        "dataDir": "{}",
+                        "command": "sh",
+                        "args": ["-c", "sleep 100"]
+                    }},
+                    "port": 17323,
+                    "tokenFile": "{}"
+                }}
+            }}}}}}"#,
+            dir.join("data").display(),
+            dir.join("token").display()
+        );
+        let proxy = proxy(&config);
+        assert!(proxy.local.is_some());
+        assert_eq!(proxy.egress(), Egress::OnlyHostPort(17323));
+        let local = proxy.local.as_ref().unwrap();
+        local.start().unwrap();
+        let pid = read_pid(&local.pid_file()).unwrap();
+        assert!(process_alive(pid));
+        local.stop();
+        assert!(!process_alive(pid));
     }
 }

@@ -288,6 +288,11 @@ pub(crate) fn down(hangar: &Hangar, names: &[String]) -> Result<()> {
             hangar.sandbox.stop(vm)?;
         }
     }
+    if names.is_empty() {
+        for tower in hangar.settings.towers.keys() {
+            hangar.broker(tower)?.stop()?;
+        }
+    }
     Ok(())
 }
 
@@ -512,6 +517,11 @@ pub(crate) fn destroy(
     for vm in &vms {
         if hangar.sandbox.state(vm)? != BoxState::Missing {
             hangar.sandbox.remove(vm)?;
+        }
+    }
+    if names.is_empty() {
+        for tower in hangar.settings.towers.keys() {
+            hangar.broker(tower)?.stop()?;
         }
     }
     if !wipe {

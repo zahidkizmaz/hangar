@@ -37,13 +37,14 @@ agent-vault VM.
 | `bays[].home` | `true`: keep the bay's home in `<stateDir>/bays/<name>/home` (`false`: VM disk), see [A bay's home](#a-bays-home) |
 | `bays[].cache` | `true`: the bay's package cache in `$XDG_CACHE_HOME/hangar/bays/<name>` (`false`: off), see [Package cache](#package-cache) |
 | `bays[].cpus`, `.memory`, `.disk` | `4`, `"6G"`, `"40G"` (`disk` twice: the root and Docker's own disk) |
-| `towers.<name>.backend` | `"agent-vault"`: the local vault VM, or `"proxy"`, a remote proxy hangar doesn't drive |
+| `towers.<name>.backend` | `"agent-vault"`: the local vault VM, or `"proxy"`, a forward proxy hangar either drives (`local`) or points at (`host`) |
 | `towers.<name>.routes` | `[]`: your own hosts, see [Allowing another host](#allowing-another-host); agent-vault only |
 | `towers.<name>.credentialFiles` | `{}`: vault credential key → file holding its value, e.g. `{"GITHUB_TOKEN": "/path/to/github-token"}`; agent-vault only |
 | `towers.<name>.masterPasswordFile` | none: generated into the OS keychain, see [The master password](usage.md#the-master-password); agent-vault only |
 | `towers.<name>.agentVault.image` | `infisical/agent-vault:<version>@sha256:…` (pinned) |
 | `towers.<name>.agentVault.adminPort`, `.proxyPort` | `14321`, `14322` |
-| `towers.<name>.proxy.host`, `.port` | a remote proxy's host and port (default `17323`) |
+| `towers.<name>.proxy.host`, `.port` | a remote proxy's host and port (default `17323`); ignored when `local` runs it |
+| `towers.<name>.proxy.local` | none: an object that runs the proxy itself, see [A local proxy tower](#a-local-proxy-tower) |
 | `towers.<name>.proxy.caFile` | the proxy's CA: a file path, or a URL `up` pulls |
 | `towers.<name>.proxy.caFormat` | `"auto"`: how a URL CA answer is read: `auto` (JSON certificate, else raw PEM), `json` (a JSON field), or `pem` (raw PEM) |
 | `towers.<name>.proxy.caField` | `"certificate"`: the JSON field `caFormat: "json"` reads |
@@ -113,6 +114,52 @@ proxy](https://infisical.com/docs/documentation/platform/agent-vault/proxies):
 A remote tower needs one extra egress rule per bay, to `host:port`
 instead of the local proxy port; that is fixed when the VM is created,
 so a tower change needs the usual `hangar destroy`/`hangar up`.
+
+## A local proxy tower
+
+A `"backend": "proxy"` tower with a `local` object runs the proxy itself
+instead of pointing at one. Hangar starts it on `up` and stops it on
+`down`/`destroy`, so the proxy needn't be running in a shell. The proxy
+must already be enrolled once: its `dataDir` holds the enrollment and CA.
+
+```json
+{
+  "towers": {
+    "corp": {
+      "backend": "proxy",
+      "proxy": {
+        "local": {
+          "domain": "https://vault.corp.example",
+          "dataDir": "/home/me/.infisical/agent-vault",
+          "command": "infisical",
+          "args": ["agent-vault", "proxy"]
+        },
+        "port": 17323,
+        "caFile": "http://127.0.0.1:17323/_agent-vault/ca",
+        "caFormat": "json",
+        "caField": "certificate",
+        "caFingerprint": "SHA256:9F:2C:…",
+        "tokenFile": "/run/agenix/corp-proxy-token"
+      }
+    }
+  },
+  "bays": [{ "name": "work", "tower": "corp" }]
+}
+```
+
+- `local.domain` is the Infisical instance the proxy serves; `local.dataDir`
+  defaults to `<stateDir>/towers/<name>/proxy`, and `local.command`/`.args`
+  default to `infisical agent-vault proxy`. Hangar runs it with `--domain`,
+  `--port` and `--data-dir`, in its own process group, and logs to
+  `<stateDir>/towers/<name>/proxy.log`.
+- Hangar starts the proxy in `up` and waits up to 30 seconds for it to
+  listen. A proxy that doesn't start fails the tower's `up` and names the
+  log file.
+- The proxy's login and CA are read as for a remote proxy. `caFile`
+  defaults to `http://127.0.0.1:<port>/_agent-vault/ca`; a local file works
+  too.
+- A local proxy tower manages its own routes and credentials, so the same
+  refusals apply as for a remote one.
 
 ## Where hangar keeps things
 

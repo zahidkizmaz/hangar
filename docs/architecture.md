@@ -11,8 +11,9 @@ none configured means one, `default`).
   publishes its admin API (`towers.<name>.agentVault.adminPort`, default
   14321) and MITM proxy (`towers.<name>.agentVault.proxyPort`, 14322) on
   the host's `127.0.0.1` only; its own egress is the public internet.
-  With `proxy` the tower is remote, run by the operator (e.g. a
-  self-hosted Infisical agent-vault proxy); hangar builds no VM for it.
+  With `proxy` the tower is an HTTP forward proxy hangar either runs
+  itself (`local`) or points at (`host`, e.g. a self-hosted Infisical
+  agent-vault proxy); hangar builds no VM for it.
 - `hangar-bay-<name>` is a bay, where agents run. Its only outbound path
   is its tower's proxy, so traffic flows bay → `host:proxyPort` →
   agent-vault → upstream. The vault swaps placeholders for real
@@ -227,7 +228,8 @@ changed):
    (home is kept)": it's fixed when the VM is created. Other tower port
    changes only warn.
 Steps 3–7 run for each tower hangar drives (`Broker::manages_policy`,
-true for `agent-vault`); a `proxy` tower is remote and skips them.
+true for `agent-vault`); a `proxy` tower manages its own policy and skips
+   them.
 3. Tower (`Broker::ensure_running`): create or start, then unlock it
    with the password on stdin and log in as admin (agent-vault: start the
    server, since starting a sandbox doesn't rerun the image's entrypoint,

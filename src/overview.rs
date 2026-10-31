@@ -311,6 +311,7 @@ pub(crate) struct TowerStatus {
     pub(crate) name: String,
     pub(crate) backend: String,
     pub(crate) managed: bool,
+    pub(crate) used: bool,
     pub(crate) vm: Vm,
     pub(crate) health: BrokerHealth,
     pub(crate) ports: Ports,
@@ -333,10 +334,13 @@ impl StatusReport {
             .map(|(name, tower)| {
                 let broker = hangar.broker(name).ok();
                 let managed = broker.is_some_and(Broker::manages_policy);
+                let used =
+                    hangar.settings.bays.iter().any(|bay| bay.tower == *name);
                 TowerStatus {
                     name: name.clone(),
                     backend: tower.backend.clone(),
                     managed,
+                    used,
                     vm: if managed {
                         Vm::inspect(sandbox, &tower_vm(name))
                     } else {
@@ -375,11 +379,13 @@ impl StatusReport {
         }
     }
 
-    /// Every managed tower running, healthy and denying unlisted hosts,
-    /// and every configured bay healthy; leftovers don't count.
+    /// Every managed tower in use running, healthy and denying unlisted
+    /// hosts, and every configured bay healthy; leftovers and unused
+    /// towers don't count.
     pub(crate) fn healthy(&self) -> bool {
         self.towers.iter().all(|tower| {
-            !tower.managed
+            !tower.used
+                || !tower.managed
                 || (tower.vm.running()
                     && tower.health.healthy
                     && tower.health.unlisted == Some(Policy::Deny))

@@ -816,6 +816,17 @@ impl<'a> Fields<'a> {
         Fields::new(value, &path)
     }
 
+    /// The object at `key`, or `None` when it's absent or null.
+    pub(crate) fn optional_object(
+        &self,
+        key: &str,
+    ) -> Result<Option<Fields<'a>>> {
+        match self.map.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(_) => self.object(key).map(Some),
+        }
+    }
+
     pub(crate) fn string(&self, key: &str) -> Result<String> {
         self.optional_string(key)?
             .context(format!("{}: expected a string", self.at(key)))

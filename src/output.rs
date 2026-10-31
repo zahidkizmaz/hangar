@@ -725,6 +725,7 @@ mod tests {
             name: "default".into(),
             backend: "agent-vault".into(),
             managed: true,
+            used: true,
             vm: vm("hangar-tower", "Running", BoxState::Running),
             health: BrokerHealth {
                 reachable: true,

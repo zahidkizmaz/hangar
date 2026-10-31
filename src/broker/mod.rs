@@ -251,6 +251,10 @@ pub(crate) trait Broker {
     /// stdin), waits until it's healthy and logs in as admin. True when it
     /// created the VM.
     fn ensure_running(&self, password: &Secret) -> Result<bool>;
+    /// Stops whatever it runs outside its VM (a local proxy).
+    fn stop(&self) -> Result<()> {
+        Ok(())
+    }
     fn deny_unlisted(&self) -> Result<()>;
     /// Replaces the whole route set.
     fn set_routes(&self, routes: &[Route]) -> Result<()>;
