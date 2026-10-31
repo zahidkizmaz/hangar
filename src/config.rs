@@ -192,6 +192,9 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
         bail!("built-in defaults must be a JSON object");
     };
     let bay_defaults = merged.remove("bay").context("defaults: no bay")?;
+    // A config that defines towers replaces the defaults' towers, unless a
+    // bay still leaves through the default tower.
+    let user_towers = config.get("towers").cloned();
     let catalog = apps::Catalog::new(config.remove("appDefinitions"))?;
     let bays = config.remove("bays");
     let mut merged = Json::Object(merged);
@@ -219,6 +222,13 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
         .map(BaySettings::from_json)
         .collect::<Result<Vec<_>>>()?;
     let mut towers = towers(&top)?;
+    let uses_default = bays.iter().any(|bay| bay.tower == DEFAULT_TOWER);
+    if !uses_default
+        && let Some(Json::Object(t)) = user_towers.as_ref()
+        && !t.contains_key(DEFAULT_TOWER)
+    {
+        towers.remove(DEFAULT_TOWER);
+    }
 
     // Each tower's routes: the apps of the bays it serves (each app once),
     // then its own. Two towers may route one host independently.
@@ -972,6 +982,17 @@ mod tests {
         }
         let settings = resolve_with("{}");
         assert_eq!(settings.towers[DEFAULT_TOWER].backend, "agent-vault");
+    }
+
+    #[test]
+    fn a_config_with_towers_replaces_the_default_tower() {
+        let settings = resolve_with(
+            r#"{"towers": {"corp": {"backend": "proxy",
+                "proxy": {"host": "h", "caFile": "/x"}}},
+                "bays": [{"name": "work", "tower": "corp"}]}"#,
+        );
+        assert!(!settings.towers.contains_key(DEFAULT_TOWER));
+        assert!(settings.towers.contains_key("corp"));
     }
 
     #[test]
