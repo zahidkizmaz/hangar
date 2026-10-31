@@ -63,11 +63,13 @@ disappears. Key order isn't significant.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "healthy": true,
-  "tower": { "vm": "running", "backend": "agent-vault", "reachable": true,
-             "healthy": true, "unlistedHosts": "deny",
-             "ports": [
+  "towers": [
+    { "name": "default", "vm": "running", "backend": "agent-vault",
+      "managed": true, "reachable": true, "healthy": true,
+      "unlistedHosts": "deny",
+      "ports": [
     { "name": "vault-ui", "app": null, "url": "http://127.0.0.1:14321",
       "purpose": "agent-vault admin UI and API", "reachable": true },
     { "name": "proxy", "app": null, "url": "127.0.0.1:14322",
@@ -76,7 +78,7 @@ disappears. Key order isn't significant.
     { "name": "anthropic", "host": "api.anthropic.com", "auth": "bearer",
       "credentials": ["CLAUDE_CODE_OAUTH_TOKEN"], "app": "claude-code" },
     { "name": "mirror", "host": "mirror.example", "auth": "passthrough",
-      "credentials": [], "app": null } ] },
+      "credentials": [], "app": null } ] } ],
   "bays": [
     { "name": "work", "vm": "hangar-bay-work", "state": "running",
       "healthy": true,
@@ -101,14 +103,15 @@ disappears. Key order isn't significant.
 }
 ```
 
-- `tower`: the VM running the credential broker; `vm` is its state
-  (`running`, `stopped`, `missing` or `unknown`: the sandbox failed),
-  `backend` is `tower.backend` (`agent-vault` is the only one so far),
-  `unlistedHosts` is `deny`, `allow`, or `null` while unreachable,
-  `ports` its ports (`app: null`), and `routes` every route it serves:
-  `auth` is the route's `type`, `credentials` the names it injects (never
-  values), `app` the first enabled app that brings it, `null` for one of
-  `tower.routes`.
+- `towers`: each tower, in config order. `vm` is its state (`running`,
+  `stopped`, `missing` or `unknown`: the sandbox failed), or `remote` for
+  a `proxy` tower hangar doesn't run; `backend` is `towers.<name>.backend`
+  (`agent-vault` or `proxy`); `managed` is whether hangar drives it
+  (false for `proxy`); `unlistedHosts` is `deny`, `allow`, or `null`
+  while unreachable; `ports` its ports (`app: null`), and `routes` every
+  route it serves: `auth` is the route's `type`, `credentials` the names
+  it injects (never values), `app` the first enabled app that brings it,
+  `null` for one of `towers.<name>.routes`.
 - `bays`: each configured bay, in config order. `state` as for the
   tower; `healthy` is the bay running with every `run` entry running.
 - `bays[].apps.<name>.routes`: each enabled app's routes and the credential
@@ -142,7 +145,7 @@ disappears. Key order isn't significant.
     "state": "oauth: connected" } ] }
 ```
 
-`config` entries come from `tower.credentialFiles` and the apps' fixed
+`config` entries come from `towers.<name>.credentialFiles` and the apps' fixed
 `credentials` (e.g. `GITHUB_GIT_USER`); `user` ones from `hangar
 credential set` or an OAuth login. `type` is `static` or `oauth` (other
 kinds the vault holds count as `static`). `state` is `set` for a static
@@ -179,7 +182,7 @@ tab-separated.
   bays get a placeholder automatically. Then `hangar up` if a route needs
   to reference it.
 - **A 403 from the vault**: the message names the host. Add a route for it
-  under `tower.routes` (or the app that brings it to a bay's `apps`),
+  under `towers.<name>.routes` (or the app that brings it to a bay's `apps`),
   then `hangar up`.
 - **Get config files into the VM** (e.g. `~/.claude/CLAUDE.md`): add them
   under `files` (VM path → host path), then `hangar copy` (or `up`).

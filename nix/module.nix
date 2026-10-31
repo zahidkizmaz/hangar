@@ -15,7 +15,7 @@ let
   # Only what's set here; the CLI fills in config/defaults.json for the rest.
   settings = lib.recursiveUpdate cfg.settings (
     {
-      tower = {
+      towers.default = {
         inherit (cfg.tower) credentialFiles;
         routes = map (lib.filterAttrs (_: value: value != null)) cfg.tower.routes;
       }
@@ -35,12 +35,15 @@ let
         "imagePackage"
         "home"
         "cache"
+        "tower"
       ]
       // lib.optionalAttrs (bay.imagePackage != null) {
         image = "${bay.imagePackage.imageName}:${bay.imagePackage.imageTag}";
         imageLoader = "${bay.imagePackage}";
       }
     )
+    # The default tower is the CLI's default; only another is written.
+    // lib.optionalAttrs (bay.tower != "default") { inherit (bay) tower; }
     # On is the CLI's default; only off is written, after the filter.
     // lib.optionalAttrs (!bay.home) { home = false; }
     // lib.optionalAttrs (!bay.cache) { cache = false; };
@@ -96,6 +99,16 @@ let
           Apps to set up in the bay: built-ins (see docs/configuration.md) or
           `appDefinitions` names. Each brings its packages, routes, env,
           run entry and ports.
+        '';
+      };
+
+      tower = mkOption {
+        type = types.str;
+        default = "default";
+        example = "corp";
+        description = ''
+          The tower this bay leaves through (`towers.<name>`, from
+          `services.hangar.tower` or `settings.towers`).
         '';
       };
 
@@ -366,13 +379,14 @@ in
       type = types.attrs;
       default = { };
       example = {
-        tower.agentVault.adminPort = 14421;
+        towers.default.agentVault.adminPort = 14421;
       };
       description = ''
         Any other hangar.json setting (see docs/configuration.md), such as the sandbox
-        and the tower's backend settings (`sandbox`, `tower.backend`,
-        `tower.agentVault`). Lists here replace the generated ones whole,
-        so set bays and routes with the typed options.
+        and each tower's backend settings (`sandbox`,
+        `towers.<name>.backend`, `towers.<name>.agentVault`). Lists here
+        replace the generated ones whole, so set bays and routes with the
+        typed options.
       '';
     };
 

@@ -113,7 +113,7 @@ impl Sandbox for FakeSandbox {
             name: spec.name.into(),
             init: spec.init.map(String::from),
             native_fs: spec.native_fs.iter().map(|&path| path.into()).collect(),
-            egress: spec.egress,
+            egress: spec.egress.clone(),
             publish: spec.publish.to_vec(),
             mounts: spec
                 .mounts

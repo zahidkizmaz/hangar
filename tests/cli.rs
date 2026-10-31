@@ -101,11 +101,38 @@ fn tower_config(vault_port: u16, tower: &str, top: &str, bay: &str) -> String {
     } else {
         format!(r#", "apps": ["nix", "{github}"]"#)
     };
-    format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {vault_port}}}{tower}}},
-            "bays": [{{"name": "default", "image": "example/agent:1"{apps}{bay}}}]{top}}}"#
-    )
+    CONFIG
+        .replace("@VAULT@", &vault_port.to_string())
+        .replace("@TOWER@", tower)
+        .replace(
+            "@BAY@",
+            &format!(
+                r#""name": "default", "image": "example/agent:1"{apps}{bay}"#
+            ),
+        )
+        .replace("@TOP@", top)
 }
+
+/// The shape every CLI test config shares: one `default` tower and one
+/// `default` bay, with the callers' keys spliced in.
+const CONFIG: &str = concat!(
+    r#"{"towers": {"default": {"agentVault": {"adminPort": @VAULT@}@TOWER@}},"#,
+    r#" "bays": [{@BAY@}]@TOP@}"#
+);
+
+/// A one-tower config with the caller's tower keys, top-level keys and
+/// bays spliced in; no apps are added.
+fn bare_config(port: u16, tower: &str, top: &str, bays: &str) -> String {
+    BARE.replace("@PORT@", &port.to_string())
+        .replace("@TOWER@", tower)
+        .replace("@TOP@", top)
+        .replace("@BAYS@", bays)
+}
+
+const BARE: &str = concat!(
+    r#"{"towers": {"default": {"agentVault": {"adminPort": @PORT@}@TOWER@}}@TOP@,"#,
+    r#" "bays": [@BAYS@]}"#
+);
 
 /// A port nothing listens on, so a real agent-vault is never reached.
 fn closed_port() -> u16 {
@@ -210,7 +237,7 @@ fn up_stops_early_without_a_password() {
         &machine,
         &format!(
             r#"{{"bays": [{{"name": "default", "image": "example/agent:1"}}],
-                "tower": {{"masterPasswordFile": "{}"}}}}"#,
+                "towers": {{"default": {{"masterPasswordFile": "{}"}}}}}}"#,
             password.display()
         ),
     );
@@ -345,7 +372,7 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     assert_eq!(
         read(machine.state.join("bays/default/vm")),
         format!(
-            "image\texample/agent:1\negress\t14322\n\
+            "image\texample/agent:1\negress\tonly:14322\n\
              port\tweb\t{web}\t3100\n\
              mount\t/home/pilot\t{home}/state/bays/default/home\trw\n\
              mount\t/var/cache/hangar\t{home}/.cache/hangar/bays/default\trw\n",
@@ -405,6 +432,53 @@ fn up_builds_both_vms_once_and_keeps_secrets_off_the_command_line() {
     assert_eq!(
         machine.fake_file("owner-login"),
         read(machine.state.join("owner-password"))
+    );
+}
+
+#[test]
+fn a_proxy_tower_is_remote_and_a_bay_reaches_its_host() {
+    let machine = Machine::new("proxy-tower");
+    let ca = machine.home.join("proxy-ca.pem");
+    fs::write(&ca, "PROXY-CA\n").unwrap();
+    let config = machine.config(
+        r#"{"bays": [{"name": "default", "tower": "corp",
+              "image": "example/agent:1"}],
+            "towers": {"corp": {"backend": "proxy", "proxy": {
+              "host": "proxy.example", "port": 17323,
+              "caFile": "@CA@"}}}}"#
+            .replace("@CA@", ca.to_str().unwrap())
+            .as_str(),
+    );
+
+    let out = run(&machine, &config, &["up"]);
+    let err = stderr(ok(&out));
+    // No tower VM: the proxy is remote.
+    assert!(!err.contains("creating hangar-tower"), "{err}");
+    assert!(!err.contains("hangar-tower-corp"), "{err}");
+
+    let log = machine.msb_log();
+    let bay =
+        lines_with(&log, "create example/agent:1 --name hangar-bay-default ");
+    assert_eq!(bay.len(), 1, "{log}");
+    assert!(
+        bay[0].contains("--no-net --net-rule allow@proxy.example:tcp:17323"),
+        "{}",
+        bay[0]
+    );
+    assert_eq!(
+        read(machine.state.join("bays/default/vm")),
+        format!(
+            "image\texample/agent:1\negress\thost:proxy.example:17323\n\
+             mount\t/home/pilot\t{home}/state/bays/default/home\trw\n\
+             mount\t/var/cache/hangar\t{home}/.cache/hangar/bays/default\trw\n",
+            home = fs::canonicalize(&machine.home).unwrap().display()
+        ),
+    );
+    // The pulled CA reaches the bay's guest mount under the tower's own
+    // state dir.
+    assert_eq!(
+        read(machine.state.join("towers/corp/guest/ca.pem")),
+        "PROXY-CA\n"
     );
 }
 
@@ -504,10 +578,14 @@ fn a_second_hangar_waits_before_touching_anything() {
 /// Two bays, `work` and `oss`, against the fake vault: no apps, so no
 /// packages and no routes.
 fn two_bays(vault_port: u16, oss: &str) -> String {
-    format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {vault_port}}}}},
-            "bays": [{{"name": "work", "image": "example/agent:1"}},
-                     {{"name": "oss", "image": "example/agent:1"{oss}}}]}}"#
+    bare_config(
+        vault_port,
+        "",
+        "",
+        &format!(
+            r#"{{"name": "work", "image": "example/agent:1"}},
+                     {{"name": "oss", "image": "example/agent:1"{oss}}}"#
+        ),
     )
 }
 
@@ -733,10 +811,7 @@ fn zero_routes_still_deny_and_send_an_empty_set() {
 #[test]
 fn status_reports_missing_vms_and_an_unreachable_vault() {
     let machine = Machine::new("status-missing");
-    let config = machine.config(&format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
-        closed_port()
-    ));
+    let config = machine.config(&bare_config(closed_port(), "", "", ""));
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
         status.starts_with(
@@ -775,11 +850,11 @@ fn status_reports_missing_vms_and_an_unreachable_vault() {
 
     let status =
         json_out(unhealthy(&run(&machine, &config, &["status", "--json"])));
-    assert_eq!(text(at(&status, &["tower", "vm"])), "missing");
+    assert_eq!(text(at(&status, &["towers", "0", "vm"])), "missing");
     assert_eq!(text(at(&status, &["bays", "0", "state"])), "missing");
-    assert!(!flag(at(&status, &["tower", "reachable"])));
+    assert!(!flag(at(&status, &["towers", "0", "reachable"])));
     assert!(matches!(
-        at(&status, &["tower", "unlistedHosts"]),
+        at(&status, &["towers", "0", "unlistedHosts"]),
         miniserde::json::Value::Null
     ));
 }
@@ -788,10 +863,7 @@ fn status_reports_missing_vms_and_an_unreachable_vault() {
 fn status_shows_why_msb_failed() {
     let machine = Machine::new("status-broken");
     machine.fail("inspect", "error: permission denied");
-    let config = machine.config(&format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
-        closed_port()
-    ));
+    let config = machine.config(&bare_config(closed_port(), "", "", ""));
     let status = stdout(unhealthy(&run(&machine, &config, &["status"])));
     assert!(
         status.contains(
@@ -802,7 +874,7 @@ fn status_shows_why_msb_failed() {
     );
     let status =
         json_out(unhealthy(&run(&machine, &config, &["status", "--json"])));
-    assert_eq!(text(at(&status, &["tower", "vm"])), "unknown");
+    assert_eq!(text(at(&status, &["towers", "0", "vm"])), "unknown");
 
     // An msb that can't be executed at all.
     machine.script("msb", "");
@@ -1015,7 +1087,7 @@ fn a_tower_vm_without_a_record_needs_only_destroy_and_up() {
     unrecorded_vms(&machine);
     fs::write(
         machine.state.join("bays/default/vm"),
-        "image\texample/agent:1\negress\t14322\n",
+        "image\texample/agent:1\negress\tonly:14322\n",
     )
     .unwrap();
     let config = machine.config(&vault_config(vault.port, "", ""));
@@ -1059,11 +1131,10 @@ fn a_changed_proxy_port_refuses_until_the_vm_is_recreated() {
     ));
     let before = machine.msb_log();
 
-    let moved = machine.config(&format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {}, "proxyPort": 15000}}}},
-            "bays": [{{"name": "default", "image": "example/agent:1"}}]}}"#,
-        vault.port
-    ));
+    let moved = machine.config(
+        &r#"{"towers": {"default": {"agentVault": {"adminPort": @PORT@, "proxyPort": 15000}}}, "bays": [{"name": "default", "image": "example/agent:1"}]}"#
+            .replace("@PORT@", &vault.port.to_string()),
+    );
     let error = failed(&run(&machine, &moved, &["up"]));
     assert!(
         error.contains(
@@ -2006,6 +2077,10 @@ fn an_app_runs_only_once_its_setup_check_passes() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one test checks the documented schema end to end"
+)]
 fn json_status_and_up_follow_the_documented_schema() {
     let machine = Machine::new("json-status");
     let vault = FakeVault::start(&machine.fake);
@@ -2024,27 +2099,30 @@ fn json_status_and_up_follow_the_documented_schema() {
     assert!(stderr(&up).contains("==> creating hangar"), "progress");
     assert!(matches!(
         at(&report, &["version"]),
-        miniserde::json::Value::Number(miniserde::json::Number::U64(1))
+        miniserde::json::Value::Number(miniserde::json::Number::U64(2))
     ));
     assert!(flag(at(&report, &["healthy"])));
-    assert_eq!(text(at(&report, &["tower", "vm"])), "running");
+    assert_eq!(text(at(&report, &["towers", "0", "vm"])), "running");
     assert_eq!(text(at(&report, &["bays", "0", "state"])), "running");
-    assert_eq!(text(at(&report, &["tower", "backend"])), "agent-vault");
-    assert!(flag(at(&report, &["tower", "reachable"])));
-    assert!(flag(at(&report, &["tower", "healthy"])));
-    assert_eq!(text(at(&report, &["tower", "unlistedHosts"])), "deny");
+    assert_eq!(
+        text(at(&report, &["towers", "0", "backend"])),
+        "agent-vault"
+    );
+    assert!(flag(at(&report, &["towers", "0", "reachable"])));
+    assert!(flag(at(&report, &["towers", "0", "healthy"])));
+    assert_eq!(text(at(&report, &["towers", "0", "unlistedHosts"])), "deny");
     let host = at(&report, &["bays", "0", "apps", "web", "routes", "0"]);
     assert_eq!(text(at(host, &["name"])), "web-api");
     assert_eq!(text(at(host, &["host"])), "api.web.example");
     // The tower's routes: the config's own too, with where each came from.
-    let config_route = at(&report, &["tower", "routes", "0"]);
+    let config_route = at(&report, &["towers", "0", "routes", "0"]);
     assert_eq!(text(at(config_route, &["name"])), "mirror");
     assert_eq!(text(at(config_route, &["auth"])), "passthrough");
     assert!(matches!(
         at(config_route, &["app"]),
         miniserde::json::Value::Null
     ));
-    let app_route = at(&report, &["tower", "routes", "1"]);
+    let app_route = at(&report, &["towers", "0", "routes", "1"]);
     assert_eq!(text(at(app_route, &["name"])), "web-api");
     assert_eq!(text(at(app_route, &["auth"])), "bearer");
     assert_eq!(text(at(app_route, &["credentials", "0"])), "WEB_TOKEN");
@@ -2059,7 +2137,10 @@ fn json_status_and_up_follow_the_documented_schema() {
     assert_eq!(text(at(host, &["credential"])), "WEB_TOKEN");
     assert_eq!(text(at(&report, &["bays", "0", "run", "web"])), "running");
     // Probed for real: the vault answers, nothing listens on the app port.
-    assert!(flag(at(&report, &["tower", "ports", "0", "reachable"])));
+    assert!(flag(at(
+        &report,
+        &["towers", "0", "ports", "0", "reachable"]
+    )));
     assert!(!flag(at(
         &report,
         &["bays", "0", "ports", "0", "reachable"]
@@ -2109,7 +2190,7 @@ fn json_status_and_up_follow_the_documented_schema() {
     ok(&run(&machine, &config, &["--json", "down"]));
     let status =
         json_out(unhealthy(&run(&machine, &config, &["status", "--json"])));
-    assert_eq!(text(at(&status, &["tower", "vm"])), "stopped");
+    assert_eq!(text(at(&status, &["towers", "0", "vm"])), "stopped");
     assert_eq!(text(at(&status, &["bays", "0", "state"])), "stopped");
     assert_eq!(text(at(&status, &["bays", "0", "run", "web"])), "stopped");
 }
@@ -2117,10 +2198,7 @@ fn json_status_and_up_follow_the_documented_schema() {
 #[test]
 fn json_errors_are_one_object_with_a_hint() {
     let machine = Machine::new("json-errors");
-    let config = machine.config(&format!(
-        r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
-        closed_port()
-    ));
+    let config = machine.config(&bare_config(closed_port(), "", "", ""));
 
     let human = failed(&run(&machine, &config, &["credential", "list"]));
     assert_eq!(
@@ -2138,7 +2216,7 @@ fn json_errors_are_one_object_with_a_hint() {
 }
 
 /// What a `--json` command without output of its own prints.
-const ACK: &str = "{\"ok\":true,\"version\":1}\n";
+const ACK: &str = "{\"ok\":true,\"version\":2}\n";
 
 #[test]
 fn json_commands_without_output_acknowledge_success() {
@@ -2346,7 +2424,7 @@ fn copy_applies_declared_files_or_one_source_with_the_same_checks() {
     let copied = json_line(&run(&machine, &config, &["--json", "copy"]));
     assert_eq!(
         copied,
-        r#"{"bay":"default","copied":["/home/pilot/.claude/CLAUDE.md"],"ok":true,"removed":[],"version":1}"#
+        r#"{"bay":"default","copied":["/home/pilot/.claude/CLAUDE.md"],"ok":true,"removed":[],"version":2}"#
     );
     assert_eq!(read(vm("/home/pilot/.claude/CLAUDE.md")), "edited");
     let none = stdout(ok(&run(&machine, &config, &["copy"])));
@@ -2414,7 +2492,7 @@ fn up_never_restarts_and_restart_applies_changed_inputs() {
         json_line(&run(&machine, &config, &["--json", "restart", "web"]));
     assert_eq!(
         restarted,
-        r#"{"bay":"default","ok":true,"restarted":["web"],"version":1}"#
+        r#"{"bay":"default","ok":true,"restarted":["web"],"version":2}"#
     );
     assert_eq!(restarts(&machine), "hangar-run-web.service\n");
     let quiet = stderr(ok(&run(&machine, &config, &["up"])));

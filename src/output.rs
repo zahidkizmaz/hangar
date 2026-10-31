@@ -12,13 +12,13 @@ use crate::json::{self, Json};
 use crate::mounts::{MountKind, MountStatus};
 use crate::overview::{
     AppHosts, BayStatus, PortStatus, Ports, RunState, StatusReport, TowerRoute,
-    UpReport, VaultLogin, Vm,
+    TowerStatus, UpReport, VaultLogin, Vm,
 };
 use crate::sandbox::{BoxState, PublishedPort};
 
 /// Every JSON document's `version`: 1 until the first release, then bumped
 /// when a field changes meaning or goes away.
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 const UNHEALTHY: u8 = 3;
 
@@ -175,18 +175,24 @@ impl StatusReport {
         for bay in &self.bays {
             bay_lines(bay, all, &mut lines);
         }
-        lines.push(format!("{}: {}", self.tower.name, self.tower.shown));
-        lines.push(if self.broker.healthy {
-            format!(
-                "  vault: healthy, unlisted hosts: {}",
-                self.broker.unlisted.map_or("unknown", Policy::as_str)
-            )
-        } else {
-            "  vault: unreachable".into()
-        });
-        lines.extend(port_table(&self.tower_ports));
-        if all {
-            lines.extend(route_table(&self.routes));
+        for tower in &self.towers {
+            lines.push(format!("{}: {}", tower.vm.name, tower.vm.shown));
+            if !tower.managed {
+                lines.push(format!("  {}: unmanaged proxy", tower.backend));
+                continue;
+            }
+            lines.push(if tower.health.healthy {
+                format!(
+                    "  vault: healthy, unlisted hosts: {}",
+                    tower.health.unlisted.map_or("unknown", Policy::as_str)
+                )
+            } else {
+                "  vault: unreachable".into()
+            });
+            lines.extend(port_table(&tower.ports));
+            if all {
+                lines.extend(route_table(&tower.routes));
+            }
         }
         for leftover in &self.leftovers {
             lines.push(format!(
@@ -206,28 +212,11 @@ impl StatusReport {
     }
 
     fn json_with<const N: usize>(&self, extra: [(&str, Json); N]) -> Json {
-        let unlisted = self
-            .broker
-            .unlisted
-            .map_or(Json::Null, |policy| json::string(policy.as_str()));
         let mut doc = document([
             ("healthy", Json::Bool(self.healthy())),
             (
-                "tower",
-                json::object([
-                    ("vm", json::string(self.tower.state_str())),
-                    ("backend", json::string(&self.broker_backend)),
-                    ("reachable", Json::Bool(self.broker.reachable)),
-                    ("healthy", Json::Bool(self.broker.healthy)),
-                    ("unlistedHosts", unlisted),
-                    ("ports", ports_json(&self.tower_ports)),
-                    (
-                        "routes",
-                        Json::Array(
-                            self.routes.iter().map(route_json).collect(),
-                        ),
-                    ),
-                ]),
+                "towers",
+                Json::Array(self.towers.iter().map(tower_json).collect()),
             ),
             (
                 "bays",
@@ -458,6 +447,27 @@ fn route_table(routes: &[TowerRoute]) -> Vec<String> {
     table(&rows)
 }
 
+fn tower_json(tower: &TowerStatus) -> Json {
+    let unlisted = tower
+        .health
+        .unlisted
+        .map_or(Json::Null, |policy| json::string(policy.as_str()));
+    json::object([
+        ("name", json::string(&tower.name)),
+        ("backend", json::string(&tower.backend)),
+        ("managed", Json::Bool(tower.managed)),
+        ("vm", json::string(tower.vm.state_str())),
+        ("reachable", Json::Bool(tower.health.reachable)),
+        ("healthy", Json::Bool(tower.health.healthy)),
+        ("unlistedHosts", unlisted),
+        ("ports", ports_json(&tower.ports)),
+        (
+            "routes",
+            Json::Array(tower.routes.iter().map(route_json).collect()),
+        ),
+    ])
+}
+
 /// Credential names only, never values.
 fn route_json(route: &TowerRoute) -> Json {
     json::object([
@@ -613,7 +623,7 @@ mod tests {
     use crate::mounts::{MountKind, MountStatus};
     use crate::overview::{
         AppHosts, BayStatus, Cache, Leftover, PortStatus, Ports, RunState,
-        StatusReport, TowerRoute, UpReport, VaultLogin, Vm,
+        StatusReport, TowerRoute, TowerStatus, UpReport, VaultLogin, Vm,
     };
     use crate::sandbox::{BoxState, PublishedPort};
 
@@ -661,6 +671,7 @@ mod tests {
             name: name.into(),
             shown: shown.into(),
             state: Some(state),
+            remote: false,
         }
     }
 
@@ -709,21 +720,29 @@ mod tests {
         }
     }
 
-    fn healthy_status() -> StatusReport {
-        StatusReport {
-            tower: vm("hangar-tower", "Running", BoxState::Running),
-            broker_backend: "agent-vault".into(),
-            broker: BrokerHealth {
+    fn healthy_tower() -> TowerStatus {
+        TowerStatus {
+            name: "default".into(),
+            backend: "agent-vault".into(),
+            managed: true,
+            vm: vm("hangar-tower", "Running", BoxState::Running),
+            health: BrokerHealth {
                 reachable: true,
                 healthy: true,
                 unlisted: Some(Policy::Deny),
             },
-            tower_ports: tower_ports(),
+            ports: tower_ports(),
             routes: vec![
                 route("coder-api", "bearer", &["CODER_TOKEN"], Some("coder")),
                 route("coder-cdn", "passthrough", &[], Some("coder")),
                 route("mirror", "passthrough", &[], None),
             ],
+        }
+    }
+
+    fn healthy_status() -> StatusReport {
+        StatusReport {
+            towers: vec![healthy_tower()],
             bays: vec![healthy_bay()],
             leftovers: Vec::new(),
         }
@@ -810,7 +829,7 @@ mod tests {
             "{json}"
         );
         assert!(json.contains(r#""run":{"web-app":"running"},"state":"running","vm":"hangar-bay-default"}],"#), "{json}");
-        assert!(json.contains(r#""healthy":true,"leftovers":[],"tower":{"backend":"agent-vault","healthy":true,"ports":["#), "{json}");
+        assert!(json.contains(r#""healthy":true,"leftovers":[],"towers":[{"backend":"agent-vault","healthy":true,"managed":true,"name":"default","ports":["#), "{json}");
         assert!(json.ends_with(concat!(
             r#""reachable":true,"routes":[{"app":"coder","auth":"bearer","#,
             r#""credentials":["CODER_TOKEN"],"host":"coder-api.example.com","#,
@@ -818,7 +837,7 @@ mod tests {
             r#""credentials":[],"host":"coder-cdn.example.com","#,
             r#""name":"coder-cdn"},{"app":null,"auth":"passthrough","#,
             r#""credentials":[],"host":"mirror.example.com","name":"mirror"}],"#,
-            r#""unlistedHosts":"deny","vm":"running"},"version":1}"#
+            r#""unlistedHosts":"deny","vm":"running"}],"version":2}"#
         )), "{json}");
         assert_eq!(Outcome::Status(status, false).exit_code(), 0);
     }
@@ -986,14 +1005,15 @@ mod tests {
         let mut stopped_run = healthy_status();
         stopped_run.bays[0].run[0].1 = RunState::Stopped;
         let mut allow = healthy_status();
-        allow.broker.unlisted = Some(Policy::Allow);
+        allow.towers[0].health.unlisted = Some(Policy::Allow);
         let mut stopped_vm = healthy_status();
         stopped_vm.bays[0].vm =
             vm("hangar-bay-default", "Stopped", BoxState::Stopped);
         let mut stopped_tower = healthy_status();
-        stopped_tower.tower = vm("hangar-tower", "Stopped", BoxState::Stopped);
+        stopped_tower.towers[0].vm =
+            vm("hangar-tower", "Stopped", BoxState::Stopped);
         let mut no_vault = healthy_status();
-        no_vault.broker.healthy = false;
+        no_vault.towers[0].health.healthy = false;
         for status in [stopped_run, allow, stopped_vm, stopped_tower, no_vault]
         {
             assert!(!status.healthy());
@@ -1004,7 +1024,7 @@ mod tests {
     #[test]
     fn up_exits_0_or_1_and_reports_failed_bays() {
         let mut stopped = healthy_status();
-        stopped.broker.healthy = false;
+        stopped.towers[0].health.healthy = false;
         let up = Outcome::Up(UpReport {
             status: stopped,
             failed: Vec::new(),
@@ -1078,7 +1098,7 @@ mod tests {
                 r#"{"credentials":[{"name":"GITHUB_TOKEN","source":"config","#,
                 r#""state":"set","type":"static"},"#,
                 r#"{"name":"JIRA","source":"user","state":"oauth: connected","#,
-                r#""type":"oauth"}],"version":1}"#,
+                r#""type":"oauth"}],"version":2}"#,
             )
         );
         let empty = CredentialList { entries: vec![] };
@@ -1103,7 +1123,7 @@ mod tests {
             concat!(
                 r#"{"login":"owner@hangar.local","password":"file","#,
                 r#""passwordFile":"/state/owner-password","#,
-                r#""url":"http://127.0.0.1:14321","version":1}"#,
+                r#""url":"http://127.0.0.1:14321","version":2}"#,
             )
         );
         let copied = VaultLogin {
@@ -1132,7 +1152,7 @@ mod tests {
         );
         assert_eq!(
             to_string(&copied.json()),
-            r#"{"bay":"work","copied":["/home/pilot/a"],"ok":true,"removed":["/home/pilot/b"],"version":1}"#
+            r#"{"bay":"work","copied":["/home/pilot/a"],"ok":true,"removed":["/home/pilot/b"],"version":2}"#
         );
         let nothing =
             Outcome::Copied("work".into(), crate::files::Copied::default());
@@ -1142,7 +1162,7 @@ mod tests {
         assert_eq!(restarted.human(), "restarted web\nrestarted db");
         assert_eq!(
             to_string(&restarted.json()),
-            r#"{"bay":"work","ok":true,"restarted":["web","db"],"version":1}"#
+            r#"{"bay":"work","ok":true,"restarted":["web","db"],"version":2}"#
         );
         assert_eq!(restarted.exit_code(), 0);
     }
@@ -1152,7 +1172,7 @@ mod tests {
         assert_eq!(Outcome::Done.human(), "");
         assert_eq!(
             to_string(&Outcome::Done.json()),
-            r#"{"ok":true,"version":1}"#
+            r#"{"ok":true,"version":2}"#
         );
         assert_eq!(Outcome::Streamed.human(), "");
         assert!(matches!(Outcome::Streamed.json(), crate::json::Json::Null));

@@ -60,6 +60,9 @@ struct Cli {
     /// Machine-readable output on stdout, errors as JSON on stderr
     #[arg(long, global = true)]
     json: bool,
+    /// The tower credential commands act on (default: the only one)
+    #[arg(long, global = true, value_name = "NAME")]
+    tower: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -299,7 +302,7 @@ fn main() -> ExitCode {
     } else {
         Format::Human
     };
-    match run(cli.command) {
+    match run(cli.command, cli.tower.as_deref()) {
         Ok(outcome) => {
             output::emit(format, &outcome);
             ExitCode::from(outcome.exit_code())
@@ -311,7 +314,53 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(command: Command) -> Result<Outcome> {
+fn credential_command(
+    hangar: &Hangar,
+    tower: Option<&str>,
+    action: CredentialCommand,
+) -> Result<Outcome> {
+    Ok(match action {
+        CredentialCommand::Set { name } => {
+            let tower = hangar.tower(tower)?.name.clone();
+            let value = credential::read(hangar, &tower, &name)?;
+            let _lock = hold_lock()?;
+            done(credential::store(hangar, &tower, &name, &value))?
+        }
+        CredentialCommand::List => {
+            let tower = hangar.tower(tower)?.name.clone();
+            Outcome::Credentials(credential::list(hangar, &tower)?)
+        }
+        CredentialCommand::Login {
+            name,
+            url,
+            authorization_url,
+            token_url,
+            client_id,
+            client_secret,
+            scopes,
+        } => {
+            let source = credential::ClientSource::from_flags(
+                url,
+                authorization_url,
+                token_url,
+                client_id,
+            );
+            let args = credential::LoginArgs {
+                source,
+                scopes,
+                client_secret,
+            };
+            let tower = hangar.tower(tower)?.name.clone();
+            done(login(hangar, &tower, &name, args))?
+        }
+        CredentialCommand::Rm { name } => {
+            let tower = hangar.tower(tower)?.name.clone();
+            done(credential::remove(hangar, &tower, &name))?
+        }
+    })
+}
+
+fn run(command: Command, tower: Option<&str>) -> Result<Outcome> {
     let paths = Paths::locate(&env_var)?;
     if let Command::Init { force } = command {
         commands::init(&paths, force)?;
@@ -367,42 +416,13 @@ fn run(command: Command) -> Result<Outcome> {
             )?;
             Outcome::Restarted(bay, restarted)
         }
-        Command::VaultUi => Outcome::VaultLogin(commands::vault_ui(&hangar)?),
-        Command::Credential(action) => match action {
-            CredentialCommand::Set { name } => {
-                let value = credential::read(&hangar, &name)?;
-                let _lock = hold_lock()?;
-                done(credential::store(&hangar, &name, &value))?
-            }
-            CredentialCommand::List => {
-                Outcome::Credentials(credential::list(&hangar)?)
-            }
-            CredentialCommand::Login {
-                name,
-                url,
-                authorization_url,
-                token_url,
-                client_id,
-                client_secret,
-                scopes,
-            } => {
-                let source = credential::ClientSource::from_flags(
-                    url,
-                    authorization_url,
-                    token_url,
-                    client_id,
-                );
-                let args = credential::LoginArgs {
-                    source,
-                    scopes,
-                    client_secret,
-                };
-                done(login(&hangar, &name, args))?
-            }
-            CredentialCommand::Rm { name } => {
-                done(credential::remove(&hangar, &name))?
-            }
-        },
+        Command::VaultUi => {
+            let tower = hangar.tower(tower)?.name.clone();
+            Outcome::VaultLogin(commands::vault_ui(&hangar, &tower)?)
+        }
+        Command::Credential(action) => {
+            credential_command(&hangar, tower, action)?
+        }
         Command::Destroy { bays, state, yes } => {
             done(commands::destroy(&hangar, &bays, state, yes))?
         }
@@ -428,16 +448,22 @@ impl Command {
 /// the browser.
 fn login(
     hangar: &Hangar,
+    tower: &str,
     name: &str,
     args: credential::LoginArgs,
 ) -> Result<()> {
     let https = http::https();
-    let login = credential::prepare_login(hangar, &https, name, args)?;
+    let login = credential::prepare_login(hangar, tower, &https, name, args)?;
     let pending = {
         let _lock = hold_lock()?;
-        credential::begin(hangar, &login)?
+        credential::begin(hangar, tower, &login)?
     };
-    credential::finish_login(hangar, &pending, &commands::open_in_browser)
+    credential::finish_login(
+        hangar,
+        tower,
+        &pending,
+        &commands::open_in_browser,
+    )
 }
 
 fn hold_lock() -> Result<lock::Lock> {

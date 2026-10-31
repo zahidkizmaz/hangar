@@ -8,6 +8,7 @@
 mod agent_vault;
 #[cfg(test)]
 pub(crate) mod fake;
+mod proxy;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -18,7 +19,7 @@ use crate::config::{Source, managed_credentials};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::json::{self, Json};
-use crate::sandbox::{BoxState, PublishedPort, TOWER_VM};
+use crate::sandbox::{BoxState, Egress, PublishedPort, tower_vm};
 use crate::secret::{Secret, trim_line_end};
 use crate::state::write_private;
 use crate::vm_record::VmRecord;
@@ -26,6 +27,7 @@ use log::warn;
 use miniserde::json::Object;
 
 pub(crate) use agent_vault::AgentVault;
+pub(crate) use proxy::Proxy;
 
 /// The name of the port the bays' traffic goes to, in `ports()`, the
 /// `tower-vm` record and `status`.
@@ -235,6 +237,11 @@ pub(crate) struct UiLogin {
 }
 
 pub(crate) trait Broker {
+    /// Whether hangar sets this tower's policy: deny mode, routes,
+    /// credentials and per-bay tokens. False for a proxy it doesn't drive.
+    fn manages_policy(&self) -> bool {
+        true
+    }
     /// Encrypted broker data, if any: the core never generates a new
     /// master password over it, and names the path in the error.
     fn has_data(&self) -> Option<PathBuf>;
@@ -275,6 +282,9 @@ pub(crate) trait Broker {
     }
     /// What bay `bay` needs; mints its token the first time.
     fn access(&self, bay: &str) -> Result<Access>;
+    /// The egress a bay of this tower is created with, from the config
+    /// alone.
+    fn egress(&self) -> Egress;
     /// Deletes the tokens it minted for bays not in `bays`; tokens it
     /// didn't mint are never touched.
     fn retain_bays(&self, bays: &[String]) -> Result<()>;
@@ -292,15 +302,6 @@ fn no_oauth() -> Error {
 
 const RECREATE: &str = "run 'hangar destroy && hangar up' (home is kept)";
 
-pub(crate) fn proxy_port(broker: &dyn Broker) -> Result<u16> {
-    broker
-        .ports()
-        .iter()
-        .find(|port| port.name == PROXY)
-        .map(|port| port.host)
-        .context("the broker publishes no proxy port")
-}
-
 fn wanted_record(broker: &dyn Broker) -> VmRecord {
     VmRecord {
         ports: broker
@@ -315,12 +316,14 @@ fn wanted_record(broker: &dyn Broker) -> VmRecord {
 /// `up`, before any VM is touched: an existing tower must have been
 /// created with today's proxy port, which every bay's egress is checked
 /// against. Other port changes only warn.
-pub(crate) fn preflight(hangar: &Hangar) -> Result<()> {
-    if hangar.sandbox.state(TOWER_VM)? == BoxState::Missing {
+pub(crate) fn preflight(hangar: &Hangar, tower: &str) -> Result<()> {
+    let vm = tower_vm(tower);
+    if hangar.sandbox.state(&vm)? == BoxState::Missing {
         return Ok(());
     }
-    let wanted = wanted_record(hangar.broker.as_ref());
-    let Some(recorded) = VmRecord::load(&hangar.state.tower_vm()) else {
+    let (_, broker) = hangar.tower_context(tower)?;
+    let wanted = wanted_record(broker);
+    let Some(recorded) = VmRecord::load(&hangar.state.tower_vm(tower)) else {
         return Err(Error::with_hint(
             "tower has no record of how it was created",
             RECREATE,
@@ -345,8 +348,8 @@ pub(crate) fn preflight(hangar: &Hangar) -> Result<()> {
     }
     if recorded.ports != wanted.ports {
         warn!(
-            "{TOWER_VM} was created with different ports; run 'hangar \
-             destroy && hangar up' to apply"
+            "{vm} was created with different ports; run 'hangar destroy \
+             && hangar up' to apply"
         );
     }
     Ok(())
@@ -356,48 +359,62 @@ pub(crate) fn preflight(hangar: &Hangar) -> Result<()> {
 /// The record follows the VM, not success: a VM that a failing start
 /// still created (slow boot, failed login) is recorded too, so the next
 /// `up` finishes it instead of refusing.
-pub(crate) fn start(hangar: &Hangar, password: &Secret) -> Result<()> {
-    let was_missing = hangar.sandbox.state(TOWER_VM)? == BoxState::Missing;
-    let started = hangar.broker.ensure_running(password);
+pub(crate) fn start(
+    hangar: &Hangar,
+    tower: &str,
+    password: &Secret,
+) -> Result<()> {
+    let vm = tower_vm(tower);
+    let (_, broker) = hangar.tower_context(tower)?;
+    let was_missing = hangar.sandbox.state(&vm)? == BoxState::Missing;
+    let started = broker.ensure_running(password);
     let created = match started {
         Ok(created) => created,
         Err(_) => {
-            was_missing && hangar.sandbox.state(TOWER_VM)? != BoxState::Missing
+            was_missing && hangar.sandbox.state(&vm)? != BoxState::Missing
         }
     };
     if created {
-        let record = wanted_record(hangar.broker.as_ref());
-        write_private(&hangar.state.tower_vm(), record.render().as_bytes())?;
+        let record = wanted_record(broker);
+        write_private(
+            &hangar.state.tower_vm(tower),
+            record.render().as_bytes(),
+        )?;
     }
     started.map(|_| ())
 }
 
 /// Checked, not trusted: routes and credentials only follow a broker
 /// that says it now refuses unlisted hosts.
-pub(crate) fn deny_unlisted(hangar: &Hangar) -> Result<()> {
-    hangar.broker.deny_unlisted()?;
-    if hangar.broker.health().unlisted != Some(Policy::Deny) {
+pub(crate) fn deny_unlisted(hangar: &Hangar, tower: &str) -> Result<()> {
+    let (_, broker) = hangar.tower_context(tower)?;
+    broker.deny_unlisted()?;
+    if broker.health().unlisted != Some(Policy::Deny) {
         bail!("broker does not deny unlisted hosts; refusing to apply routes");
     }
     Ok(())
 }
 
-pub(crate) fn apply_routes(hangar: &Hangar) -> Result<()> {
-    let routes: Vec<Route> = hangar.settings.routes.values().cloned().collect();
-    hangar.broker.set_routes(&routes)
+pub(crate) fn apply_routes(hangar: &Hangar, tower: &str) -> Result<()> {
+    let (tower, broker) = hangar.tower_context(tower)?;
+    let routes: Vec<Route> = tower.routes.values().cloned().collect();
+    broker.set_routes(&routes)
 }
 
 /// Makes the broker hold exactly the configured credentials. Only keys
 /// hangar set itself are ever deleted, so credentials added by hand (e.g.
 /// an OAuth login) survive.
-pub(crate) fn apply_credentials(hangar: &Hangar) -> Result<()> {
-    let wanted = read_values(&managed_credentials(&hangar.settings))?;
-    let managed = hangar.state.credential_keys();
+pub(crate) fn apply_credentials(hangar: &Hangar, tower: &str) -> Result<()> {
+    let (settings, broker) = hangar.tower_context(tower)?;
+    let wanted = read_values(&managed_credentials(
+        settings,
+        &hangar.settings.app_credentials,
+    ))?;
+    let managed = hangar.state.credential_keys(tower);
     let previous = fs::read_to_string(&managed).unwrap_or_default();
     let stale = stale_keys(&previous, &wanted);
     if !stale.is_empty() {
-        hangar
-            .broker
+        broker
             .delete_credentials(&stale)
             .context("deleting credentials no longer in the config")?;
     }
@@ -407,33 +424,43 @@ pub(crate) fn apply_credentials(hangar: &Hangar) -> Result<()> {
     keys.push('\n');
     write_private(&managed, keys.as_bytes())?;
     for (key, value) in &wanted {
-        hangar.broker.put_credential(key, value)?;
+        broker.put_credential(key, value)?;
     }
     Ok(())
 }
 
 /// The broker's access for `bay`, checked against the port bays are
 /// created to reach.
-pub(crate) fn access(hangar: &Hangar, bay: &str) -> Result<Access> {
-    let access = hangar.broker.access(bay)?;
-    let proxy = proxy_port(hangar.broker.as_ref())?;
-    if access.host_port != proxy {
+pub(crate) fn access(
+    hangar: &Hangar,
+    tower: &str,
+    bay: &str,
+) -> Result<Access> {
+    let (_, broker) = hangar.tower_context(tower)?;
+    let access = broker.access(bay)?;
+    let egress = broker.egress().port();
+    if Some(access.host_port) != egress {
         bail!(
             "broker gave port {} for bay {bay}, but its proxy port is \
-             {proxy}",
-            access.host_port
+             {}",
+            access.host_port,
+            egress
+                .map_or_else(|| "unknown".to_string(), |port| port.to_string())
         );
     }
     Ok(access)
 }
 
-pub(crate) fn retain_bays(hangar: &Hangar) -> Result<()> {
+pub(crate) fn retain_bays(hangar: &Hangar, tower: &str) -> Result<()> {
+    let (_, broker) = hangar.tower_context(tower)?;
     let bays: Vec<String> = hangar
-        .bays()
-        .into_iter()
-        .map(|bay| bay.name.to_string())
+        .settings
+        .bays
+        .iter()
+        .filter(|bay| bay.tower == tower)
+        .map(|bay| bay.name.clone())
         .collect();
-    hangar.broker.retain_bays(&bays)
+    broker.retain_bays(&bays)
 }
 
 /// The value of each managed credential: file contents (one trailing
@@ -475,7 +502,7 @@ mod tests {
     use super::{
         Auth, apply_credentials, preflight, read_values, stale_keys, start,
     };
-    use crate::config::Source;
+    use crate::config::{DEFAULT_TOWER, Source};
     use crate::hangar::Hangar;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{BoxState, TOWER_VM};
@@ -579,14 +606,14 @@ mod tests {
         fs::write(&token, "value\n").unwrap();
         fs::write(state.join("credential-keys"), "OLD\nKEPT\n").unwrap();
         let config = format!(
-            r#"{{"tower": {{"credentialFiles": {{"KEPT": "{}"}}}}}}"#,
+            r#"{{"towers": {{"default": {{"credentialFiles": {{"KEPT": "{}"}}}}}}}}"#,
             token.display()
         );
         let broker = FakeBroker::default();
         broker.fail_put.set(true);
         let calls = broker.calls.clone();
         let (hangar, _) = broker_hangar(&state, &config, &[], broker);
-        assert!(apply_credentials(&hangar).is_err());
+        assert!(apply_credentials(&hangar, DEFAULT_TOWER).is_err());
         assert_eq!(*calls.borrow(), ["delete OLD", "put KEPT"]);
         assert_eq!(
             fs::read_to_string(state.join("credential-keys")).unwrap(),
@@ -599,8 +626,8 @@ mod tests {
         let state = scratch_dir("broker-record");
         let (hangar, _) =
             broker_hangar(&state, "{}", &[], FakeBroker::default());
-        preflight(&hangar).unwrap();
-        start(&hangar, &Secret::new("pw".into())).unwrap();
+        preflight(&hangar, DEFAULT_TOWER).unwrap();
+        start(&hangar, DEFAULT_TOWER, &Secret::new("pw".into())).unwrap();
         let record = state.join("tower-vm");
         assert_eq!(
             fs::read_to_string(&record).unwrap(),
@@ -611,7 +638,7 @@ mod tests {
         let broker = FakeBroker::default();
         broker.created.set(false);
         let (hangar, _) = broker_hangar(&state, "{}", &[], broker);
-        start(&hangar, &Secret::new("pw".into())).unwrap();
+        start(&hangar, DEFAULT_TOWER, &Secret::new("pw".into())).unwrap();
         assert!(!record.exists());
     }
 
@@ -626,7 +653,8 @@ mod tests {
             }
             let (hangar, sandbox) =
                 broker_hangar(&state, "{}", &running, FakeBroker::default());
-            let error = preflight(&hangar).unwrap_err().to_string();
+            let error =
+                preflight(&hangar, DEFAULT_TOWER).unwrap_err().to_string();
             assert_eq!(sandbox.changes(), Vec::<String>::new());
             error
         };
@@ -651,6 +679,6 @@ mod tests {
         .unwrap();
         let (hangar, _) =
             broker_hangar(&state, "{}", &running, FakeBroker::default());
-        preflight(&hangar).unwrap();
+        preflight(&hangar, DEFAULT_TOWER).unwrap();
     }
 }

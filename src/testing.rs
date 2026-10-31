@@ -1,5 +1,6 @@
 //! Test-only helpers shared across modules.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -122,13 +123,14 @@ pub(crate) fn hangar_with_broker(
     };
     let host_home = sibling("-home");
     fs::create_dir_all(&host_home).unwrap();
+    let tower = settings.towers.keys().next().cloned().unwrap_or_default();
     Hangar {
         settings,
         state: StateDir::new(state.to_path_buf()),
         cache_root: sibling("-cache"),
         host_home,
         sandbox,
-        broker,
+        brokers: BTreeMap::from([(tower, broker)]),
     }
 }
 

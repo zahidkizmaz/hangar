@@ -18,14 +18,17 @@ services.hangar = {
       ports.paperclip = 3200; }
   ];
   tower.credentialFiles.GITHUB_TOKEN = "/run/agenix/github-token"; # optional
+  # A second tower: bays.*.tower names it, settings.towers.<name> its backend.
+  settings.towers.corp.proxy = { host = "proxy.corp.example"; port = 17323; caFile = "/etc/corp-ca.pem"; }; # optional
 };
 ```
 
 ## Options
 
 `services.hangar` takes the [configuration](configuration.md) keys as
-options (`bays`, `tower.routes`, `tower.credentialFiles`,
-`tower.masterPasswordFile`, `appDefinitions`, `stateDir`; two modules'
+options (`bays` (each with `tower`, default `"default"`), `tower.routes`,
+`tower.credentialFiles`, `tower.masterPasswordFile`, `appDefinitions`,
+`stateDir`; two modules'
 `bays` lists concatenate), plus:
 
 - `enable`: install `hangar`;
@@ -36,7 +39,7 @@ options (`bays`, `tower.routes`, `tower.credentialFiles`,
 - `bays.*.imagePackage`: build the bay image locally (see
   [Local images](#local-images));
 - `settings`: any other `hangar.json` key, e.g.
-  `{ tower.agentVault.adminPort = 14421; }`; its lists replace the
+  `{ towers.default.agentVault.adminPort = 14421; }`; its lists replace the
   generated ones whole.
 
 Each option's description is in `nix/module.nix`. The module renders

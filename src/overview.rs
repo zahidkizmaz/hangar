@@ -1,6 +1,7 @@
 //! What a user can reach on the host: the data behind `status`, the port
 //! summary and `hangar vault-ui` (data only). Rendering lives in `output`.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
@@ -8,12 +9,12 @@ use std::time::Duration;
 use crate::bay;
 use crate::bay::Bay;
 use crate::broker::{Broker, BrokerHealth, Policy};
-use crate::config::{BaySettings, Settings};
+use crate::config::{BaySettings, Settings, Tower};
 use crate::error::{Error, Result};
 use crate::hangar::Hangar;
 use crate::http;
 use crate::mounts::{self, MountStatus};
-use crate::sandbox::{BoxState, PublishedPort, Sandbox, TOWER_VM, bay_vm};
+use crate::sandbox::{BoxState, PublishedPort, Sandbox, bay_vm, tower_vm};
 use crate::vm_record::VmRecord;
 
 pub(crate) struct Vm {
@@ -22,6 +23,8 @@ pub(crate) struct Vm {
     pub(crate) shown: String,
     /// `None` when the sandbox itself failed.
     pub(crate) state: Option<BoxState>,
+    /// True for a tower hangar doesn't run: there is no VM to inspect.
+    pub(crate) remote: bool,
 }
 
 impl Vm {
@@ -34,10 +37,24 @@ impl Vm {
             name: name.to_string(),
             shown,
             state,
+            remote: false,
+        }
+    }
+
+    /// A tower hangar doesn't run: no VM, health comes from the probe.
+    fn remote() -> Self {
+        Self {
+            name: String::new(),
+            shown: "remote".into(),
+            state: None,
+            remote: true,
         }
     }
 
     pub(crate) fn state_str(&self) -> &'static str {
+        if self.remote {
+            return "remote";
+        }
         self.state.map_or("unknown", BoxState::as_str)
     }
 
@@ -65,10 +82,13 @@ impl RunState {
 }
 
 pub(crate) fn published(
-    broker: &dyn Broker,
+    brokers: &BTreeMap<String, Box<dyn Broker>>,
     settings: &Settings,
 ) -> Vec<PublishedPort> {
-    let mut ports = broker.ports();
+    let mut ports: Vec<PublishedPort> = Vec::new();
+    for broker in brokers.values() {
+        ports.extend(broker.ports());
+    }
     ports.extend(settings.bays.iter().flat_map(|bay| bay.ports.clone()));
     ports
 }
@@ -142,6 +162,7 @@ pub(crate) struct AppHosts {
 }
 
 fn app_hosts(settings: &Settings, bay: &BaySettings) -> Vec<AppHosts> {
+    let routes = &settings.towers[&bay.tower].routes;
     bay.apps
         .iter()
         .map(|app| AppHosts {
@@ -149,7 +170,7 @@ fn app_hosts(settings: &Settings, bay: &BaySettings) -> Vec<AppHosts> {
             routes: app
                 .routes
                 .iter()
-                .filter_map(|name| settings.routes.get(name))
+                .filter_map(|name| routes.get(name))
                 .map(|route| {
                     let credentials = route.auth.credentials();
                     let credential = (!credentials.is_empty()).then(|| {
@@ -265,8 +286,8 @@ pub(crate) struct TowerRoute {
     pub(crate) app: Option<String>,
 }
 
-fn tower_routes(settings: &Settings) -> Vec<TowerRoute> {
-    settings
+fn tower_routes(tower: &Tower, settings: &Settings) -> Vec<TowerRoute> {
+    tower
         .routes
         .values()
         .map(|route| TowerRoute {
@@ -277,6 +298,7 @@ fn tower_routes(settings: &Settings) -> Vec<TowerRoute> {
             app: settings
                 .bays
                 .iter()
+                .filter(|bay| bay.tower == tower.name)
                 .flat_map(|bay| &bay.apps)
                 .find(|app| app.routes.contains(&route.name))
                 .map(|app| app.name.clone()),
@@ -284,12 +306,19 @@ fn tower_routes(settings: &Settings) -> Vec<TowerRoute> {
         .collect()
 }
 
-pub(crate) struct StatusReport {
-    pub(crate) tower: Vm,
-    pub(crate) broker_backend: String,
-    pub(crate) broker: BrokerHealth,
-    pub(crate) tower_ports: Ports,
+/// One tower's health, VM, ports and routes.
+pub(crate) struct TowerStatus {
+    pub(crate) name: String,
+    pub(crate) backend: String,
+    pub(crate) managed: bool,
+    pub(crate) vm: Vm,
+    pub(crate) health: BrokerHealth,
+    pub(crate) ports: Ports,
     pub(crate) routes: Vec<TowerRoute>,
+}
+
+pub(crate) struct StatusReport {
+    pub(crate) towers: Vec<TowerStatus>,
     pub(crate) bays: Vec<BayStatus>,
     pub(crate) leftovers: Vec<Leftover>,
 }
@@ -297,12 +326,39 @@ pub(crate) struct StatusReport {
 impl StatusReport {
     pub(crate) fn collect(hangar: &Hangar) -> Self {
         let sandbox = hangar.sandbox.as_ref();
+        let towers = hangar
+            .settings
+            .towers
+            .iter()
+            .map(|(name, tower)| {
+                let broker = hangar.broker(name).ok();
+                let managed = broker.is_some_and(Broker::manages_policy);
+                TowerStatus {
+                    name: name.clone(),
+                    backend: tower.backend.clone(),
+                    managed,
+                    vm: if managed {
+                        Vm::inspect(sandbox, &tower_vm(name))
+                    } else {
+                        Vm::remote()
+                    },
+                    health: broker.map_or(
+                        BrokerHealth {
+                            reachable: false,
+                            healthy: false,
+                            unlisted: None,
+                        },
+                        Broker::health,
+                    ),
+                    ports: Ports::probe(
+                        broker.map(Broker::ports).unwrap_or_default(),
+                    ),
+                    routes: tower_routes(tower, &hangar.settings),
+                }
+            })
+            .collect();
         Self {
-            tower: Vm::inspect(sandbox, TOWER_VM),
-            broker_backend: hangar.settings.broker_backend.clone(),
-            broker: hangar.broker.health(),
-            tower_ports: Ports::probe(hangar.broker.ports()),
-            routes: tower_routes(&hangar.settings),
+            towers,
             bays: hangar
                 .bays()
                 .iter()
@@ -319,13 +375,15 @@ impl StatusReport {
         }
     }
 
-    /// The tower running, healthy and denying unlisted hosts, and every
-    /// configured bay healthy; leftovers don't count.
+    /// Every managed tower running, healthy and denying unlisted hosts,
+    /// and every configured bay healthy; leftovers don't count.
     pub(crate) fn healthy(&self) -> bool {
-        self.tower.running()
-            && self.broker.healthy
-            && self.broker.unlisted == Some(Policy::Deny)
-            && self.bays.iter().all(BayStatus::healthy)
+        self.towers.iter().all(|tower| {
+            !tower.managed
+                || (tower.vm.running()
+                    && tower.health.healthy
+                    && tower.health.unlisted == Some(Policy::Deny))
+        }) && self.bays.iter().all(BayStatus::healthy)
     }
 }
 
@@ -362,9 +420,11 @@ pub(crate) struct VaultLogin {
 #[cfg(test)]
 mod tests {
     use super::{Ports, check_ports, published};
+    use crate::config::DEFAULT_TOWER;
     use crate::hangar::broker;
     use crate::sandbox::PublishedPort;
     use crate::sandbox::fake::FakeSandbox;
+    use crate::state::StateDir;
     use crate::testing::{closed_port, settings};
     use std::net::TcpListener;
     use std::path::Path;
@@ -375,9 +435,17 @@ mod tests {
         let ports = |config: &str| {
             let settings = settings(config);
             let sandbox = Rc::new(FakeSandbox::default());
-            let broker =
-                broker(&settings, sandbox, Path::new("/nonexistent")).unwrap();
-            published(broker.as_ref(), &settings)
+            let broker = broker(
+                &settings.towers[DEFAULT_TOWER],
+                sandbox,
+                &StateDir::new(Path::new("/nonexistent").to_path_buf()),
+            )
+            .unwrap();
+            let brokers = std::collections::BTreeMap::from([(
+                DEFAULT_TOWER.to_string(),
+                broker,
+            )]);
+            published(&brokers, &settings)
         };
         let names = |config: &str| -> Vec<String> {
             ports(config).into_iter().map(|port| port.name).collect()
@@ -391,7 +459,7 @@ mod tests {
         );
         let clash = ports(
             r#"{"bays": [{"name": "default", "apps": ["nix", "github", "paperclip"]}],
-                "tower": {"agentVault": {"adminPort": 3100}}}"#,
+                "towers": {"default": {"agentVault": {"adminPort": 3100}}}}"#,
         );
         assert_eq!(
             check_ports(&clash).unwrap_err().to_string(),

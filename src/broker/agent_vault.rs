@@ -14,16 +14,16 @@ use super::{
     Access, Broker, BrokerHealth, Credential, CredentialKind, OAuthClient,
     OAuthState, PROXY, PendingLogin, Policy, Route, UiLogin, login_timed_out,
 };
-use crate::config::{Fields, valid_bay_name};
+use crate::config::{Fields, Tower, valid_bay_name};
 use crate::error::{Context, Error, Result, bail};
 use crate::http;
 use crate::json::{self, Json};
 use crate::sandbox::{
-    BoxState, Egress, Mount, MountMode, PublishedPort, Sandbox, TOWER_VM,
-    VmSpec,
+    BoxState, Egress, Mount, MountMode, PublishedPort, Sandbox, VmSpec,
+    tower_vm,
 };
 use crate::secret::{Secret, random_hex, trim_line_end};
-use crate::state::write_private;
+use crate::state::{StateDir, write_private};
 use log::info;
 use miniserde::json::{Array, Object};
 
@@ -48,32 +48,35 @@ printf "%s\n" "$password" | AGENT_VAULT_ADDR="$2" setsid agent-vault server \
 
 pub(crate) struct AgentVault {
     sandbox: Rc<dyn Sandbox>,
+    vm: String,
     image: String,
     admin_port: u16,
     proxy_port: u16,
-    state: PathBuf,
+    dir: PathBuf,
 }
 
 impl AgentVault {
     pub(crate) fn new(
-        tower: &Json,
+        tower: &Tower,
         sandbox: Rc<dyn Sandbox>,
-        state: &Path,
+        state: &StateDir,
     ) -> Result<Self> {
+        let path = format!("config.towers.{}", tower.name);
         let settings =
-            Fields::new(tower, "config.tower")?.object("agentVault")?;
+            Fields::new(&tower.config, &path)?.object("agentVault")?;
         settings.only(&["image", "adminPort", "proxyPort"])?;
         Ok(Self {
             sandbox,
+            vm: tower_vm(&tower.name),
             image: settings.string("image")?,
             admin_port: settings.number("adminPort")?,
             proxy_port: settings.number("proxyPort")?,
-            state: state.to_path_buf(),
+            dir: state.tower_dir(&tower.name),
         })
     }
 
     fn data_dir(&self) -> PathBuf {
-        self.state.join("vault")
+        self.dir.join("vault")
     }
 
     /// agent-vault's own data; its presence means the vault already has a
@@ -91,13 +94,13 @@ impl AgentVault {
     }
 
     fn owner_password(&self) -> PathBuf {
-        self.state.join("owner-password")
+        self.dir.join("owner-password")
     }
 
     /// One token file per bay hangar minted an agent for; a file is the
     /// only proof an agent is hangar's.
     fn agent_tokens(&self) -> PathBuf {
-        self.state.join("agent-tokens")
+        self.dir.join("agent-tokens")
     }
 
     /// A bay's proxy login. It reaches the bay only inside the proxy URL,
@@ -146,7 +149,7 @@ impl AgentVault {
             .map(|port| (port.host, port.vm))
             .collect();
         self.sandbox.create(&VmSpec {
-            name: TOWER_VM,
+            name: &self.vm,
             image: &self.image,
             cpus: 1,
             memory: "512M",
@@ -262,7 +265,7 @@ impl Broker for AgentVault {
         for key in ["name", "host", "auth"] {
             if route.extra.contains_key(key) {
                 bail!(
-                    "config.tower.routes.{}.extra.{key}: set by hangar",
+                    "config.towers.*.routes.{}.extra.{key}: set by hangar",
                     route.name
                 );
             }
@@ -271,23 +274,23 @@ impl Broker for AgentVault {
     }
 
     fn ensure_running(&self, password: &Secret) -> Result<bool> {
-        let state = self.sandbox.state(TOWER_VM)?;
+        let state = self.sandbox.state(&self.vm)?;
         match state {
             BoxState::Running => {}
             BoxState::Missing => {
-                info!("creating {TOWER_VM}");
+                info!("creating {}", self.vm);
                 self.create_vm()?;
             }
             BoxState::Stopped => {
-                info!("starting {TOWER_VM}");
-                self.sandbox.start(TOWER_VM)?;
+                info!("starting {}", self.vm);
+                self.sandbox.start(&self.vm)?;
             }
         }
         if !self.healthy() {
             let stdin = format!("{}\n", password.expose()).into_bytes();
             let start = self.start_server_args();
             let start: Vec<&str> = start.iter().map(String::as_str).collect();
-            self.sandbox.exec(TOWER_VM, None, &start, Some(&stdin))?;
+            self.sandbox.exec(&self.vm, None, &start, Some(&stdin))?;
         }
         if !self.wait_healthy(30, Duration::from_secs(1)) {
             bail!(
@@ -383,6 +386,10 @@ impl Broker for AgentVault {
             host_port: self.proxy_port,
             renewed,
         })
+    }
+
+    fn egress(&self) -> Egress {
+        Egress::OnlyHostPort(self.proxy_port)
     }
 
     /// Token files whose names fail the bay rule aren't hangar's to judge,
@@ -749,10 +756,12 @@ mod tests {
         Auth, Broker, Credential, CredentialKind, OAuthClient, OAuthState,
         PendingLogin, Route,
     };
+    use crate::config::DEFAULT_TOWER;
     use crate::json;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{Egress, TOWER_VM};
     use crate::secret::Secret;
+    use crate::state::StateDir;
     use crate::testing::{closed_port, scratch_dir, serve_each, settings};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -764,7 +773,13 @@ mod tests {
         state: &Path,
         sandbox: Rc<FakeSandbox>,
     ) -> AgentVault {
-        AgentVault::new(&settings(config).tower, sandbox, state).unwrap()
+        let settings = settings(config);
+        AgentVault::new(
+            &settings.towers[DEFAULT_TOWER],
+            sandbox,
+            &StateDir::new(state.to_path_buf()),
+        )
+        .unwrap()
     }
 
     /// A vault whose admin API is at `port`, logged in.
@@ -777,7 +792,7 @@ mod tests {
         std::fs::create_dir_all(session.parent().unwrap()).unwrap();
         std::fs::write(&session, r#"{"token": "session-token"}"#).unwrap();
         let config = format!(
-            r#"{{"tower": {{"agentVault": {{"adminPort": {port}}}}}}}"#
+            r#"{{"towers": {{"default": {{"agentVault": {{"adminPort": {port}}}}}}}}}"#
         );
         agent_vault(&config, state, sandbox)
     }
@@ -797,7 +812,8 @@ mod tests {
     fn its_settings_are_read_from_tower_agent_vault() {
         let state = scratch_dir("agent-vault-settings");
         let sandbox = Rc::new(FakeSandbox::default());
-        let config = r#"{"tower": {"agentVault": {"proxyPort": 15000}}}"#;
+        let config =
+            r#"{"towers": {"default": {"agentVault": {"proxyPort": 15000}}}}"#;
         let vault = agent_vault(config, &state, sandbox);
         let ports: Vec<(String, u16, u16)> = vault
             .ports()
@@ -811,23 +827,27 @@ mod tests {
                 ("proxy".into(), 15000, 14322)
             ]
         );
-        let settings = settings(r#"{"tower": {"agentVault": {"port": 1}}}"#);
+        let settings =
+            settings(r#"{"towers": {"default": {"agentVault": {"port": 1}}}}"#);
         let error = AgentVault::new(
-            &settings.tower,
+            &settings.towers[DEFAULT_TOWER],
             Rc::new(FakeSandbox::default()),
-            &state,
+            &StateDir::new(state.clone()),
         )
         .err()
         .unwrap()
         .to_string();
-        assert_eq!(error, "config.tower.agentVault.port: unknown setting");
+        assert_eq!(
+            error,
+            "config.towers.default.agentVault.port: unknown setting"
+        );
     }
 
     #[test]
     fn a_vault_that_never_answers_is_not_healthy() {
         let state = scratch_dir("agent-vault-unhealthy");
         let config = format!(
-            r#"{{"tower": {{"agentVault": {{"adminPort": {}}}}}}}"#,
+            r#"{{"towers": {{"default": {{"agentVault": {{"adminPort": {}}}}}}}}}"#,
             closed_port()
         );
         let vault =
@@ -843,7 +863,7 @@ mod tests {
         let state = scratch_dir("agent-vault-healthy");
         let (port, _) = serve_each(vec![("200 OK", "")]);
         let config = format!(
-            r#"{{"tower": {{"agentVault": {{"adminPort": {port}}}}}}}"#
+            r#"{{"towers": {{"default": {{"agentVault": {{"adminPort": {port}}}}}}}}}"#
         );
         let vault =
             agent_vault(&config, &state, Rc::new(FakeSandbox::default()));
@@ -853,7 +873,8 @@ mod tests {
     #[test]
     fn the_server_learns_the_address_the_host_reaches_it_on() {
         let state = scratch_dir("agent-vault-addr");
-        let config = r#"{"tower": {"agentVault": {"adminPort": 14421}}}"#;
+        let config =
+            r#"{"towers": {"default": {"agentVault": {"adminPort": 14421}}}}"#;
         let vault =
             agent_vault(config, &state, Rc::new(FakeSandbox::default()));
         let args = vault.start_server_args();
@@ -1043,7 +1064,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "config.tower.routes.twilio.extra.{key}: set by hangar"
+                    "config.towers.*.routes.twilio.extra.{key}: set by hangar"
                 )
             );
         }

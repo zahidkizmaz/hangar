@@ -79,6 +79,13 @@ pub(crate) fn get(port: u16, path: &str) -> Result<Response> {
     send(port, "GET", path, None, None, Duration::from_secs(2))
 }
 
+/// A GET of an arbitrary URL, plain http allowed (a remote tower's CA is
+/// served over http, next to its proxy port).
+pub(crate) fn get_url(url: &str, timeout: Duration) -> Result<Response> {
+    log::trace!("get {url}");
+    run(&agent(timeout, false), http::Request::get(url), None).context(url)
+}
+
 /// Like [`send`], but a non-2xx status is an error.
 pub(crate) fn call(
     port: u16,

@@ -12,7 +12,7 @@ use super::{
     OAuthState, PROXY, PendingLogin, Policy, Route, UiLogin, login_timed_out,
 };
 use crate::error::{Result, bail};
-use crate::sandbox::PublishedPort;
+use crate::sandbox::{Egress, PublishedPort};
 use crate::secret::Secret;
 use crate::url::with_param;
 
@@ -39,6 +39,9 @@ pub(crate) struct FakeBroker {
 
 pub(crate) const FAKE_CALLBACK: &str =
     "http://127.0.0.1:14321/v1/oauth/callback";
+/// The tower port `ports()` and `egress()` agree on; `access` may name
+/// another, to test the check.
+const PROXY_PORT: u16 = 14322;
 
 impl Default for FakeBroker {
     fn default() -> Self {
@@ -183,6 +186,10 @@ impl Broker for FakeBroker {
             host_port: self.access_port.get(),
             renewed: false,
         })
+    }
+
+    fn egress(&self) -> Egress {
+        Egress::OnlyHostPort(PROXY_PORT)
     }
 
     fn health(&self) -> BrokerHealth {

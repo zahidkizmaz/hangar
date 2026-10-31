@@ -7,6 +7,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::config::DEFAULT_TOWER;
 use crate::error::{Context, Result};
 
 pub(crate) struct StateDir(PathBuf);
@@ -20,14 +21,24 @@ impl StateDir {
         &self.0
     }
 
-    /// The credentials hangar set, one per line.
-    pub(crate) fn credential_keys(&self) -> PathBuf {
-        self.0.join("credential-keys")
+    /// A tower's files. The `default` tower's sit at the root, so an
+    /// existing vault keeps its paths; the rest are under `towers/<name>`.
+    pub(crate) fn tower_dir(&self, tower: &str) -> PathBuf {
+        if tower == DEFAULT_TOWER {
+            self.0.clone()
+        } else {
+            self.0.join("towers").join(tower)
+        }
     }
 
-    /// What the tower VM was created with (`vm_record`, ports only).
-    pub(crate) fn tower_vm(&self) -> PathBuf {
-        self.0.join("tower-vm")
+    /// The credentials hangar set for `tower`, one per line.
+    pub(crate) fn credential_keys(&self, tower: &str) -> PathBuf {
+        self.tower_dir(tower).join("credential-keys")
+    }
+
+    /// What the tower's VM was created with (`vm_record`, ports only).
+    pub(crate) fn tower_vm(&self, tower: &str) -> PathBuf {
+        self.tower_dir(tower).join("tower-vm")
     }
 
     pub(crate) fn bays(&self) -> PathBuf {
@@ -38,13 +49,13 @@ impl StateDir {
         BayDir(self.bays().join(name))
     }
 
-    /// Mounted read-only at `/run/hangar` in every bay.
-    pub(crate) fn guest(&self) -> PathBuf {
-        self.0.join("guest")
+    /// `tower`'s CA dir, mounted read-only at `/run/hangar` in its bays.
+    pub(crate) fn tower_guest(&self, tower: &str) -> PathBuf {
+        self.tower_dir(tower).join("guest")
     }
 
-    pub(crate) fn ca(&self) -> PathBuf {
-        self.guest().join("ca.pem")
+    pub(crate) fn tower_ca(&self, tower: &str) -> PathBuf {
+        self.tower_guest(tower).join("ca.pem")
     }
 }
 

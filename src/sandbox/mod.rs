@@ -13,7 +13,18 @@ use crate::error::Result;
 
 pub(crate) use msb::Msb;
 
+/// The default tower's VM: it keeps the name an existing install has.
 pub(crate) const TOWER_VM: &str = "hangar-tower";
+
+/// A tower's VM. The default tower keeps [`TOWER_VM`], so its record and
+/// name don't move; named towers get `hangar-tower-<name>`.
+pub(crate) fn tower_vm(tower: &str) -> String {
+    if tower == crate::config::DEFAULT_TOWER {
+        TOWER_VM.to_string()
+    } else {
+        format!("hangar-tower-{tower}")
+    }
+}
 
 /// A bay's VM: the prefix keeps every bay name clear of `TOWER_VM`.
 pub(crate) fn bay_vm(bay: &str) -> String {
@@ -37,12 +48,47 @@ impl BoxState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Egress {
-    /// Only this port on the host: a bay, to the proxy.
+    /// Only this port on the host: a bay, to a local tower's proxy.
     OnlyHostPort(u16),
+    /// One host and port: a bay, to a remote tower's proxy.
+    Host { host: String, port: u16 },
     /// Anything: the tower needs the internet.
     Open,
+}
+
+impl Egress {
+    /// How a `VmRecord` writes this to the state dir; `None` for `Open`,
+    /// which is never recorded.
+    pub(crate) fn record(&self) -> Option<String> {
+        match self {
+            Self::OnlyHostPort(port) => Some(format!("only:{port}")),
+            Self::Host { host, port } => Some(format!("host:{host}:{port}")),
+            Self::Open => None,
+        }
+    }
+
+    /// The inverse of [`Egress::record`]; `None` for an unknown value.
+    pub(crate) fn from_record(value: &str) -> Option<Self> {
+        if let Some(port) = value.strip_prefix("only:") {
+            return Some(Self::OnlyHostPort(port.parse().ok()?));
+        }
+        let rest = value.strip_prefix("host:")?;
+        let (host, port) = rest.rsplit_once(':')?;
+        Some(Self::Host {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
+    }
+
+    /// The host port a bay reaches, for `access` cross-checks.
+    pub(crate) fn port(&self) -> Option<u16> {
+        match self {
+            Self::OnlyHostPort(port) | Self::Host { port, .. } => Some(*port),
+            Self::Open => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

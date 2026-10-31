@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::broker::{
     Credential, CredentialKind, OAuthClient, OAuthState, PendingLogin,
 };
-use crate::config::{Settings, Source, managed_credentials, valid_key};
+use crate::config::{Source, managed_credentials, valid_key};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::http::Https;
@@ -28,10 +28,10 @@ printf '\n' >&2
 printf '%s' "$value""#;
 
 /// `credential set`, first half: the checks and the value.
-pub(crate) fn read(hangar: &Hangar, name: &str) -> Result<Secret> {
-    check_user_key(&hangar.settings, name)?;
-    vault_ready(hangar)?;
-    if matches!(stored(hangar, name)?, Some(CredentialKind::OAuth(_))) {
+pub(crate) fn read(hangar: &Hangar, tower: &str, name: &str) -> Result<Secret> {
+    check_user_key(hangar, tower, name)?;
+    vault_ready(hangar, tower)?;
+    if matches!(stored(hangar, tower, name)?, Some(CredentialKind::OAuth(_))) {
         return Err(Error::with_hint(
             format!("{name} is an OAuth credential"),
             format!("run 'hangar credential login {name}'"),
@@ -45,14 +45,23 @@ pub(crate) fn read(hangar: &Hangar, name: &str) -> Result<Secret> {
 }
 
 /// `credential set`, second half, under the lock.
-pub(crate) fn store(hangar: &Hangar, name: &str, value: &Secret) -> Result<()> {
-    hangar.broker.put_credential(name, value)?;
+pub(crate) fn store(
+    hangar: &Hangar,
+    tower: &str,
+    name: &str,
+    value: &Secret,
+) -> Result<()> {
+    hangar.broker(tower)?.put_credential(name, value)?;
     log::info!("stored {name}");
     Ok(())
 }
 
-fn stored(hangar: &Hangar, name: &str) -> Result<Option<CredentialKind>> {
-    let credentials = hangar.broker.credentials()?;
+fn stored(
+    hangar: &Hangar,
+    tower: &str,
+    name: &str,
+) -> Result<Option<CredentialKind>> {
+    let credentials = hangar.broker(tower)?.credentials()?;
     let stored = credentials.into_iter().find(|stored| stored.key == name);
     Ok(stored.map(|stored| stored.kind))
 }
@@ -76,12 +85,15 @@ impl CredentialEntry {
     }
 }
 
-pub(crate) fn list(hangar: &Hangar) -> Result<CredentialList> {
-    vault_ready(hangar)?;
-    let credentials = hangar.broker.credentials()?;
+pub(crate) fn list(hangar: &Hangar, tower: &str) -> Result<CredentialList> {
+    vault_ready(hangar, tower)?;
+    let credentials = hangar.broker(tower)?.credentials()?;
     Ok(classify(
         credentials,
-        &managed_credentials(&hangar.settings),
+        &managed_credentials(
+            &hangar.settings.towers[tower],
+            &hangar.settings.app_credentials,
+        ),
     ))
 }
 
@@ -125,10 +137,12 @@ fn state(kind: &CredentialKind) -> String {
     }
 }
 
-pub(crate) fn remove(hangar: &Hangar, name: &str) -> Result<()> {
-    check_user_key(&hangar.settings, name)?;
-    vault_ready(hangar)?;
-    hangar.broker.delete_credentials(&[name.to_string()])?;
+pub(crate) fn remove(hangar: &Hangar, tower: &str, name: &str) -> Result<()> {
+    check_user_key(hangar, tower, name)?;
+    vault_ready(hangar, tower)?;
+    hangar
+        .broker(tower)?
+        .delete_credentials(&[name.to_string()])?;
     log::info!("removed {name}");
     Ok(())
 }
@@ -192,13 +206,14 @@ pub(crate) struct Login {
 /// broker.
 pub(crate) fn prepare_login(
     hangar: &Hangar,
+    tower: &str,
     https: &dyn Https,
     name: &str,
     args: LoginArgs,
 ) -> Result<Login> {
-    check_user_key(&hangar.settings, name)?;
-    vault_ready(hangar)?;
-    if stored(hangar, name)? == Some(CredentialKind::Static) {
+    check_user_key(hangar, tower, name)?;
+    vault_ready(hangar, tower)?;
+    if stored(hangar, tower, name)? == Some(CredentialKind::Static) {
         return Err(Error::with_hint(
             format!("{name} holds a static value"),
             format!("run 'hangar credential rm {name}' first"),
@@ -226,7 +241,7 @@ pub(crate) fn prepare_login(
             let client_id = if let Some(id) = client_id {
                 id
             } else {
-                let callback = hangar.broker.oauth_redirect_uri()?;
+                let callback = hangar.broker(tower)?.oauth_redirect_uri()?;
                 let id = oauth::register(https, &provider, &callback)?;
                 log::info!("registered hangar as OAuth client {id}");
                 id
@@ -262,9 +277,13 @@ fn read_client_secret(name: &str) -> Result<Secret> {
 }
 
 /// `credential login`, second part, under the lock.
-pub(crate) fn begin(hangar: &Hangar, login: &Login) -> Result<PendingLogin> {
+pub(crate) fn begin(
+    hangar: &Hangar,
+    tower: &str,
+    login: &Login,
+) -> Result<PendingLogin> {
     hangar
-        .broker
+        .broker(tower)?
         .oauth_begin(&login.name, login.client.as_ref())
 }
 
@@ -276,16 +295,17 @@ const WAIT: Duration = Duration::from_secs(600);
 /// to a log or `--json`.
 pub(crate) fn finish_login(
     hangar: &Hangar,
+    tower: &str,
     login: &PendingLogin,
     open: &dyn Fn(&str),
 ) -> Result<()> {
-    check_consent(&login.url, &hangar.broker.oauth_redirect_uri()?)?;
+    check_consent(&login.url, &hangar.broker(tower)?.oauth_redirect_uri()?)?;
     if io::stderr().is_terminal() {
         eprintln!("Log {} in at:\n  {}", login.key, login.url);
     }
     open(&login.url);
     log::info!("waiting for the login in your browser");
-    hangar.broker.oauth_wait(login, WAIT)?;
+    hangar.broker(tower)?.oauth_wait(login, WAIT)?;
     log::info!("logged in {}", login.key);
     Ok(())
 }
@@ -308,11 +328,15 @@ fn check_consent(consent: &str, callback: &str) -> Result<()> {
     }
 }
 
-fn check_user_key(settings: &Settings, name: &str) -> Result<()> {
+fn check_user_key(hangar: &Hangar, tower: &str, name: &str) -> Result<()> {
     if !valid_key(name) {
         bail!("{name}: expected UPPER_SNAKE_CASE");
     }
-    match managed_credentials(settings).get(name) {
+    let managed = managed_credentials(
+        &hangar.settings.towers[tower],
+        &hangar.settings.app_credentials,
+    );
+    match managed.get(name) {
         Some(Source::File(_)) => Err(Error::with_hint(
             format!("{name} is managed by tower.credentialFiles"),
             "change your config",
@@ -325,8 +349,8 @@ fn check_user_key(settings: &Settings, name: &str) -> Result<()> {
     }
 }
 
-fn vault_ready(hangar: &Hangar) -> Result<()> {
-    if !hangar.broker.health().healthy {
+fn vault_ready(hangar: &Hangar, tower: &str) -> Result<()> {
+    if !hangar.broker(tower)?.health().healthy {
         return Err(Error::with_hint(
             "the vault isn't running",
             "run 'hangar up' first",
@@ -359,17 +383,51 @@ fn read_hidden(name: &str, input: Stdio) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientSource, CredentialEntry, LoginArgs, begin, check_consent,
-        check_user_key, classify, finish_login, list, prepare_login,
-        read_hidden, remove, state,
+        ClientSource, CredentialEntry, CredentialList, Login, LoginArgs,
+        PendingLogin, check_consent, classify, read_hidden, state,
     };
     use crate::broker::fake::{FAKE_CALLBACK, FakeBroker};
     use crate::broker::{Credential, CredentialKind, OAuthState};
-    use crate::config::Source;
+    use crate::config::{DEFAULT_TOWER, Source};
+    use crate::error::Result;
     use crate::hangar::Hangar;
+    use crate::http::Https;
     use crate::http::fake::FakeHttps;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::{hangar_with_broker, scratch_dir, settings};
+    use crate::testing::{hangar_with, hangar_with_broker, scratch_dir};
+
+    fn prepare_login(
+        hangar: &Hangar,
+        https: &dyn Https,
+        name: &str,
+        args: LoginArgs,
+    ) -> Result<Login> {
+        super::prepare_login(hangar, DEFAULT_TOWER, https, name, args)
+    }
+
+    fn begin(hangar: &Hangar, login: &Login) -> Result<PendingLogin> {
+        super::begin(hangar, DEFAULT_TOWER, login)
+    }
+
+    fn finish_login(
+        hangar: &Hangar,
+        login: &PendingLogin,
+        open: &dyn Fn(&str),
+    ) -> Result<()> {
+        super::finish_login(hangar, DEFAULT_TOWER, login, open)
+    }
+
+    fn list(hangar: &Hangar) -> Result<CredentialList> {
+        super::list(hangar, DEFAULT_TOWER)
+    }
+
+    fn remove(hangar: &Hangar, name: &str) -> Result<()> {
+        super::remove(hangar, DEFAULT_TOWER, name)
+    }
+
+    fn check_user_key(hangar: &Hangar, name: &str) -> Result<()> {
+        super::check_user_key(hangar, DEFAULT_TOWER, name)
+    }
     use crate::url::with_param;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -442,8 +500,8 @@ mod tests {
             .borrow_mut()
             .extend(["GITHUB_TOKEN".into(), "MINE".into()]);
         let calls = broker.calls.clone();
-        let config =
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/t"}}}"#;
+        let config = r#"{"towers": {"default":
+            {"credentialFiles": {"GITHUB_TOKEN": "/t"}}}}"#;
         let sandbox = Rc::new(FakeSandbox::default());
         let hangar =
             hangar_with_broker(config, &state, sandbox, Box::new(broker));
@@ -695,9 +753,11 @@ mod tests {
 
     #[test]
     fn managed_and_malformed_names_are_refused() {
-        let with_file = settings(
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/t"}},
+        let with_file = hangar_with(
+            r#"{"towers": {"default": {"credentialFiles": {"GITHUB_TOKEN": "/t"}}},
                 "bays": [{"name": "default", "apps": ["github-token"]}]}"#,
+            &scratch_dir("credential-check-key"),
+            Rc::new(FakeSandbox::default()),
         );
         let error = check_user_key(&with_file, "GITHUB_TOKEN").unwrap_err();
         assert!(
@@ -711,8 +771,10 @@ mod tests {
             "{error}"
         );
         // A token stored by hand: github-token still gets its git username.
-        let by_hand = settings(
+        let by_hand = hangar_with(
             r#"{"bays": [{"name": "default", "apps": ["github-token"]}]}"#,
+            &scratch_dir("credential-by-hand"),
+            Rc::new(FakeSandbox::default()),
         );
         assert!(check_user_key(&by_hand, "GITHUB_TOKEN").is_ok());
         assert!(check_user_key(&by_hand, "GITHUB_GIT_USER").is_err());

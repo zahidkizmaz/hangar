@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::broker;
-use crate::config::{BaySettings, Settings, referenced_credentials};
+use crate::config::{BaySettings, referenced_credentials};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::mounts::{self, Resolved, Roots};
@@ -85,9 +85,9 @@ pub(crate) fn flag(hangar: &Hangar, bay: &Bay) -> String {
 pub(crate) fn preflight(hangar: &Hangar, bay: &Bay) -> Result<()> {
     let state = hangar.sandbox.state(&bay.vm)?;
     let recorded = VmRecord::load(&bay.dir.vm());
-    let proxy = broker::proxy_port(hangar.broker.as_ref())?;
+    let egress = hangar.broker(&bay.settings.tower)?.egress();
     let fix = format!("{} (home is kept)", recreate(bay.name));
-    check_egress(state, recorded.as_ref(), proxy)
+    check_egress(state, recorded.as_ref(), &egress)
         .map_err(|message| Error::with_hint(message, &fix))?;
     if let Some(recorded) = recorded.filter(|_| state != BoxState::Missing) {
         mounts::recheck(&recorded.mounts, &roots(hangar, bay)?)
@@ -111,17 +111,27 @@ pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
 fn check_egress(
     state: BoxState,
     recorded: Option<&VmRecord>,
-    proxy_port: u16,
+    egress: &Egress,
 ) -> std::result::Result<(), String> {
     if state == BoxState::Missing {
         return Ok(());
     }
-    match recorded.and_then(|record| record.egress) {
-        Some(port) if port == proxy_port => Ok(()),
-        Some(port) => {
-            Err(format!("bay was created with egress to port {port}"))
-        }
+    match recorded.and_then(|record| record.egress.as_ref()) {
+        Some(recorded) if recorded == egress => Ok(()),
+        Some(recorded) => Err(format!(
+            "bay was created with egress to {}",
+            describe_egress(recorded)
+        )),
         None => Err("bay has no record of how it was created".into()),
+    }
+}
+
+/// A recorded egress in words, for `check_egress`'s error.
+fn describe_egress(egress: &Egress) -> String {
+    match egress {
+        Egress::OnlyHostPort(port) => format!("port {port}"),
+        Egress::Host { host, port } => format!("{host}:{port}"),
+        Egress::Open => "the internet".into(),
     }
 }
 
@@ -171,7 +181,7 @@ pub(crate) fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<()> {
 fn wanted_record(
     bay: &Bay,
     image: &str,
-    egress: u16,
+    egress: Egress,
     mounts: Vec<String>,
 ) -> VmRecord {
     let ports = &bay.settings.ports;
@@ -192,8 +202,9 @@ fn reconcile_vm(
     resolved: &[Resolved],
 ) -> Result<()> {
     let image = bay.settings.image_ref();
-    let proxy = broker::proxy_port(hangar.broker.as_ref())?;
-    let wanted = wanted_record(bay, &image, proxy, mounts::lines(resolved));
+    let egress = hangar.broker(&bay.settings.tower)?.egress();
+    let wanted =
+        wanted_record(bay, &image, egress.clone(), mounts::lines(resolved));
     let state = hangar.sandbox.state(&bay.vm)?;
     if state != BoxState::Missing
         && let Some(recorded) = VmRecord::load(&bay.dir.vm())
@@ -207,7 +218,7 @@ fn reconcile_vm(
             ensure_image(hangar, bay, &image)?;
             info!("creating {}", bay.vm);
             let created =
-                create_vm(hangar, bay, &image, proxy, &wanted, resolved);
+                create_vm(hangar, bay, &image, &egress, &wanted, resolved);
             // A VM a failing create still left behind is recorded too, so
             // the next `up` can account for it.
             if created.is_err()
@@ -238,8 +249,8 @@ fn reconcile_vm(
 pub(crate) fn start(hangar: &Hangar, bay: &Bay) -> Result<()> {
     let sandbox = hangar.sandbox.as_ref();
     wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)?;
-    let access = broker::access(hangar, bay.name)?;
-    let ca = hangar.state.ca();
+    let access = broker::access(hangar, &bay.settings.tower, bay.name)?;
+    let ca = hangar.state.tower_ca(&bay.settings.tower);
     fs::write(&ca, &access.ca_pem).context(ca.display())?;
     if access.renewed {
         warn!(
@@ -459,17 +470,18 @@ fn proxy_env(url: &str, ca_pem: &[u8]) -> String {
 
 /// A placeholder per injected credential; `env` wins for a name, for
 /// tools that want a specific placeholder format.
-fn vm_env(settings: &Settings, bay: &BaySettings) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = referenced_credentials(settings)
+fn vm_env(hangar: &Hangar, bay: &Bay) -> BTreeMap<String, String> {
+    let tower = &hangar.settings.towers[&bay.settings.tower];
+    let mut env: BTreeMap<String, String> = referenced_credentials(tower)
         .into_iter()
         .map(|name| (name, PLACEHOLDER.to_string()))
         .collect();
-    env.extend(bay.env.clone());
+    env.extend(bay.settings.env.clone());
     env
 }
 
 pub(crate) fn write_env(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    let rendered = render_env(&vm_env(&hangar.settings, bay.settings));
+    let rendered = render_env(&vm_env(hangar, bay));
     replace(
         hangar.sandbox.as_ref(),
         &bay.vm,
@@ -626,7 +638,7 @@ fn description(
     name: &str,
     command: &str,
 ) -> String {
-    let env = render_env(&vm_env(&hangar.settings, bay.settings));
+    let env = render_env(&vm_env(hangar, bay));
     let inputs = [command, &env, &files::record_text(bay)].join("\0");
     format!("hangar run {name} {}", fnv(inputs.into_bytes()))
 }
@@ -702,12 +714,12 @@ fn create_vm(
     hangar: &Hangar,
     bay: &Bay,
     image: &str,
-    proxy: u16,
+    egress: &Egress,
     wanted: &VmRecord,
     user: &[Resolved],
 ) -> Result<()> {
     let settings = bay.settings;
-    let guest = hangar.state.guest();
+    let guest = hangar.state.tower_guest(&settings.tower);
     fs::create_dir_all(&guest).context(guest.display())?;
     let mut mounts = vec![Mount {
         host: &guest,
@@ -737,7 +749,7 @@ fn create_vm(
         disk: Some(&settings.disk),
         native_fs: &[PILOT_DATA],
         init: Some(INIT),
-        egress: Egress::OnlyHostPort(proxy),
+        egress: egress.clone(),
         publish: &publish,
         mounts: &mounts,
         env: &[],
@@ -756,9 +768,7 @@ mod tests {
     use crate::mounts::Resolved;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{BoxState, Egress, Sandbox, TOWER_VM};
-    use crate::testing::{
-        hangar_with, hangar_with_broker, scratch_dir, settings,
-    };
+    use crate::testing::{hangar_with, hangar_with_broker, scratch_dir};
     use crate::vm_record::VmRecord;
     use std::fs;
     use std::path::PathBuf;
@@ -772,7 +782,7 @@ mod tests {
     fn record(egress: u16) -> VmRecord {
         VmRecord {
             image: Some("example/agent:1".into()),
-            egress: Some(egress),
+            egress: Some(Egress::OnlyHostPort(egress)),
             ports: vec![("paperclip".into(), 3100, 3100)],
             mounts: vec![
                 "/home/pilot\t/home/you/.local/share/hangar/home\trw".into(),
@@ -812,11 +822,12 @@ mod tests {
 
     #[test]
     fn an_existing_vm_must_have_been_created_with_egress_to_the_proxy() {
+        let proxy = Egress::OnlyHostPort(14322);
         let error = |state, recorded: Option<&VmRecord>| {
-            check_egress(state, recorded, 14322).unwrap_err()
+            check_egress(state, recorded, &proxy).unwrap_err()
         };
         for state in [BoxState::Running, BoxState::Stopped] {
-            assert!(check_egress(state, Some(&record(14322)), 14322).is_ok());
+            assert!(check_egress(state, Some(&record(14322)), &proxy).is_ok());
             assert_eq!(
                 error(state, Some(&record(15000))),
                 "bay was created with egress to port 15000"
@@ -828,8 +839,15 @@ mod tests {
             assert_eq!(error(state, Some(&no_egress)), unknown);
         }
         // A missing VM is created with the current port.
-        assert!(check_egress(BoxState::Missing, None, 14322).is_ok());
-        assert!(check_egress(BoxState::Missing, Some(&record(1)), 2).is_ok());
+        assert!(check_egress(BoxState::Missing, None, &proxy).is_ok());
+        assert!(
+            check_egress(
+                BoxState::Missing,
+                Some(&record(1)),
+                &Egress::OnlyHostPort(2)
+            )
+            .is_ok()
+        );
     }
 
     fn fake(vms: &[(&str, BoxState)]) -> Rc<FakeSandbox> {
@@ -1296,12 +1314,16 @@ mod tests {
 
     #[test]
     fn placeholders_are_set_and_bay_env_wins() {
-        let settings = settings(
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/t"}},
+        let state = scratch_dir("bay-placeholders");
+        let hangar = hangar_with(
+            r#"{"towers": {"default": {"credentialFiles": {"GITHUB_TOKEN": "/t"}}},
                 "bays": [{"name": "default", "apps": ["github-token"],
                   "env": {"GITHUB_TOKEN": "gh-placeholder", "MODE": "x"}}]}"#,
+            &state,
+            Rc::new(FakeSandbox::default()),
         );
-        let env = vm_env(&settings, &settings.bays[0]);
+        let bay = hangar.bay("default").unwrap();
+        let env = vm_env(&hangar, &bay);
         assert_eq!(env["GITHUB_TOKEN"], "gh-placeholder");
         assert_eq!(env["GITHUB_GIT_USER"], "hangar-placeholder");
         assert_eq!(env["MODE"], "x");

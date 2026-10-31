@@ -1,6 +1,7 @@
 //! What each command does. Commands return data for `output` to render;
 //! `main` only parses arguments and dispatches here.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::fs::PermissionsExt;
@@ -9,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use crate::apps::Setup;
 use crate::bay::{self, Bay, PILOT, VM_HOME};
+use crate::broker::Broker;
 use crate::config::{self, BaySettings, Paths, env_var};
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::keychain::{self, Keychain, OsKeychain};
 use crate::overview::{StatusReport, UpReport, VaultLogin};
-use crate::sandbox::{BoxState, TOWER_VM, bay_vm};
+use crate::sandbox::{BoxState, bay_vm, tower_vm};
 use crate::{broker, files, output, password, process};
 use log::{info, warn};
 
@@ -44,7 +46,7 @@ pub(crate) fn init(paths: &Paths, force: bool) -> Result<()> {
     Ok(())
 }
 
-type Step = fn(&Hangar) -> Result<()>;
+type Step = fn(&Hangar, &str) -> Result<()>;
 type BayStep = fn(&Hangar, &Bay) -> Result<()>;
 
 /// In order, once the tower runs. Deny comes before routes and
@@ -75,23 +77,24 @@ const BAY_STEPS: [(&str, BayStep); 8] = [
 /// logged, reported in `failed` and makes `up` exit 1.
 pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
     let selected = configured(hangar, names)?;
-    // Checked before anything is created: an empty password would start an
-    // unencrypted vault.
-    let file = hangar.settings.master_password_file.as_deref();
-    let password = password::master_password(
-        &env_var,
-        file,
-        &os_keychain()?,
-        hangar.broker.has_data().as_deref(),
-    )?;
+    // The managed towers of the selected bays, in settings order; a proxy
+    // tower hangar doesn't drive has no steps and needs no password.
+    let managed: Vec<&str> = towers_of(hangar, &selected)
+        .into_iter()
+        .filter(|tower| hangar.broker(tower).is_ok_and(Broker::manages_policy))
+        .collect();
+    // Checked before anything is created: an empty password would start
+    // an unencrypted vault.
+    let password = (!managed.is_empty())
+        .then(|| master_password(hangar, &managed))
+        .transpose()?;
     let state = hangar.state.root();
     fs::create_dir_all(state).context(state.display())?;
     fs::set_permissions(state, fs::Permissions::from_mode(0o700))
         .context(state.display())?;
-
-    broker::preflight(hangar)?;
-    broker::start(hangar, &password)?;
-    run_tower_steps(hangar)?;
+    if let Some(password) = &password {
+        start_managed_towers(hangar, &managed, password)?;
+    }
     let mut failed = Vec::new();
     for bay in &selected {
         if let Err(error) = run_bay_steps(hangar, bay) {
@@ -147,6 +150,62 @@ fn configured<'a>(
     Ok(bays)
 }
 
+fn start_managed_towers(
+    hangar: &Hangar,
+    towers: &[&str],
+    password: &crate::secret::Secret,
+) -> Result<()> {
+    for tower in towers {
+        broker::preflight(hangar, tower)?;
+        broker::start(hangar, tower, password)?;
+        run_tower_steps(hangar, tower)?;
+    }
+    Ok(())
+}
+
+/// The towers of `bays`, in settings order, each once.
+fn towers_of<'a>(hangar: &'a Hangar, bays: &[Bay]) -> Vec<&'a str> {
+    hangar
+        .settings
+        .towers
+        .keys()
+        .map(String::as_str)
+        .filter(|name| {
+            bays.iter().any(|bay| bay.settings.tower.as_str() == *name)
+        })
+        .collect()
+}
+
+/// The master password for `towers`: one shared value, resolved once. It
+/// reads the keychain only when a tower may have encrypted data.
+fn master_password(
+    hangar: &Hangar,
+    towers: &[&str],
+) -> Result<crate::secret::Secret> {
+    let mut files: BTreeSet<&str> = BTreeSet::new();
+    let mut data = None;
+    for tower in towers {
+        if let Some(file) = hangar.settings.towers[*tower]
+            .master_password_file
+            .as_deref()
+        {
+            files.insert(file);
+        }
+        if data.is_none() {
+            data = hangar.broker(tower)?.has_data();
+        }
+    }
+    if files.len() > 1 {
+        bail!("towers set different masterPasswordFile; use one");
+    }
+    password::master_password(
+        &env_var,
+        files.into_iter().next(),
+        &os_keychain()?,
+        data.as_deref(),
+    )
+}
+
 fn unknown_bay(hangar: &Hangar, name: &str) -> Error {
     let known: Vec<&str> = hangar
         .settings
@@ -168,7 +227,11 @@ fn vms(hangar: &Hangar, names: &[String]) -> Result<Vec<String>> {
         let mut vms: Vec<String> =
             hangar.bays().into_iter().map(|bay| bay.vm).collect();
         vms.extend(leftovers.iter().map(|name| bay_vm(name)));
-        vms.push(TOWER_VM.to_string());
+        for tower in hangar.settings.towers.keys() {
+            if hangar.broker(tower)?.manages_policy() {
+                vms.push(tower_vm(tower));
+            }
+        }
         return Ok(vms);
     }
     names
@@ -201,10 +264,10 @@ pub(crate) fn pick<'a>(
     )))
 }
 
-fn run_tower_steps(hangar: &Hangar) -> Result<()> {
+fn run_tower_steps(hangar: &Hangar, tower: &str) -> Result<()> {
     for (name, step) in TOWER_STEPS {
-        log::debug!("tower step: {name}");
-        step(hangar)?;
+        log::debug!("tower {tower} step: {name}");
+        step(hangar, tower)?;
     }
     Ok(())
 }
@@ -395,8 +458,8 @@ const CLIPBOARDS: [(&str, &[&str]); 3] = [
 
 /// Copies the broker login's password to the clipboard (over stdin) and
 /// opens the UI.
-pub(crate) fn vault_ui(hangar: &Hangar) -> Result<VaultLogin> {
-    let Some(login) = hangar.broker.ui()? else {
+pub(crate) fn vault_ui(hangar: &Hangar, tower: &str) -> Result<VaultLogin> {
+    let Some(login) = hangar.broker(tower)?.ui()? else {
         return Err(Error::with_hint(
             "no vault login yet",
             "run 'hangar up' first",
@@ -514,6 +577,7 @@ mod tests {
     };
     use crate::bay;
     use crate::broker::fake::FakeBroker;
+    use crate::config::DEFAULT_TOWER;
     use crate::keychain::fake::FakeKeychain;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{BoxState, TOWER_VM};
@@ -583,7 +647,8 @@ mod tests {
         let token = state.join("token");
         fs::write(&token, "value\n").unwrap();
         let config = format!(
-            r#"{{"tower": {{"credentialFiles": {{"GITHUB_TOKEN": "{}"}}}},
+            r#"{{"towers": {{"default": {{
+                    "credentialFiles": {{"GITHUB_TOKEN": "{}"}}}}}},
                 "bays": [{{"name": "default", "apps": ["github-token"]}}]}}"#,
             token.display()
         );
@@ -593,7 +658,7 @@ mod tests {
             Rc::new(FakeSandbox::with(&[(BAY_VM, BoxState::Running)]));
         let hangar =
             hangar_with_broker(&config, &state, sandbox, Box::new(broker));
-        run_tower_steps(&hangar).unwrap();
+        run_tower_steps(&hangar, DEFAULT_TOWER).unwrap();
         bay::start(&hangar, &hangar.bay("default").unwrap()).unwrap();
         let kinds: Vec<String> = calls
             .borrow()
@@ -625,7 +690,7 @@ mod tests {
     fn vault_ui_needs_a_login() {
         let state = scratch_dir("vault-ui");
         let hangar = hangar_with("{}", &state, Rc::new(FakeSandbox::default()));
-        let error = vault_ui(&hangar).err().unwrap();
+        let error = vault_ui(&hangar, DEFAULT_TOWER).err().unwrap();
         assert_eq!(error.message(), "no vault login yet");
     }
 

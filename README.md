@@ -72,7 +72,7 @@ and list your bays in `~/.config/hangar/hangar.json`:
 ```json
 {
   "bays": [{ "name": "default", "apps": ["nix", "github", "claude-code"] }],
-  "tower": { "credentialFiles": {} }
+  "towers": { "default": { "credentialFiles": {} } }
 }
 ```
 
@@ -88,7 +88,7 @@ hangar shell                                  # a shell in the bay
 
 The master password is generated into your OS keychain on the first `up`.
 When an agent hits a host that isn't allowed yet, the `403` names it: add
-a route under `tower.routes`
+a route under `towers.default.routes`
 ([Allowing another host](docs/configuration.md#allowing-another-host)).
 
 ## Docs

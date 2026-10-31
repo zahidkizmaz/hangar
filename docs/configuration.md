@@ -15,12 +15,15 @@ examples below use its syntax; the same keys go in `hangar.json`.
 
 Every setting, with its default. `bays` is a list; each bay is one VM,
 `hangar-bay-<name>`, and `up` and `status` take them in this order.
-Without any there is one bay, `default`. `tower` is everything the bays
-share.
+Without any there is one bay, `default`. `towers` is a map of towers
+(name → one credential egress endpoint); each bay names one with
+`bays[].tower`. Without any there is one tower, `default`, the local
+agent-vault VM.
 
 | Key | Default |
 | --- | --- |
 | `bays[].name` | required: lowercase letters and digits joined by single `-`, at most 32 |
+| `bays[].tower` | `"default"`: the `towers.<name>` this bay leaves through |
 | `bays[].apps` | `[]`: see [Apps](#apps) |
 | `bays[].ports` | `{}`: app port name → host port (two bays with one app) |
 | `bays[].image` | the image released with this hangar (`…:v<version>`), see [The bay image](#the-bay-image) |
@@ -34,12 +37,19 @@ share.
 | `bays[].home` | `true`: keep the bay's home in `<stateDir>/bays/<name>/home` (`false`: VM disk), see [A bay's home](#a-bays-home) |
 | `bays[].cache` | `true`: the bay's package cache in `$XDG_CACHE_HOME/hangar/bays/<name>` (`false`: off), see [Package cache](#package-cache) |
 | `bays[].cpus`, `.memory`, `.disk` | `4`, `"6G"`, `"40G"` (`disk` twice: the root and Docker's own disk) |
-| `tower.routes` | `[]`: your own hosts, see [Allowing another host](#allowing-another-host) |
-| `tower.credentialFiles` | `{}`: vault credential key → file holding its value, e.g. `{"GITHUB_TOKEN": "/path/to/github-token"}` |
-| `tower.masterPasswordFile` | none: generated into the OS keychain, see [The master password](usage.md#the-master-password) |
-| `tower.backend` | `"agent-vault"`, the only broker so far |
-| `tower.agentVault.image` | `infisical/agent-vault:<version>@sha256:…` (pinned) |
-| `tower.agentVault.adminPort`, `.proxyPort` | `14321`, `14322` |
+| `towers.<name>.backend` | `"agent-vault"`: the local vault VM, or `"proxy"`, a remote proxy hangar doesn't drive |
+| `towers.<name>.routes` | `[]`: your own hosts, see [Allowing another host](#allowing-another-host); agent-vault only |
+| `towers.<name>.credentialFiles` | `{}`: vault credential key → file holding its value, e.g. `{"GITHUB_TOKEN": "/path/to/github-token"}`; agent-vault only |
+| `towers.<name>.masterPasswordFile` | none: generated into the OS keychain, see [The master password](usage.md#the-master-password); agent-vault only |
+| `towers.<name>.agentVault.image` | `infisical/agent-vault:<version>@sha256:…` (pinned) |
+| `towers.<name>.agentVault.adminPort`, `.proxyPort` | `14321`, `14322` |
+| `towers.<name>.proxy.host`, `.port` | a remote proxy's host and port (default `17323`) |
+| `towers.<name>.proxy.caFile` | the proxy's CA: a file path, or a URL `up` pulls |
+| `towers.<name>.proxy.caFormat` | `"auto"`: how a URL CA answer is read: `auto` (JSON certificate, else raw PEM), `json` (a JSON field), or `pem` (raw PEM) |
+| `towers.<name>.proxy.caField` | `"certificate"`: the JSON field `caFormat: "json"` reads |
+| `towers.<name>.proxy.caFingerprint` | none: pin the CA's `SHA256:…` fingerprint (recommended for a URL) |
+| `towers.<name>.proxy.tokenFile` | none: a file holding the bay's proxy login (a session token) |
+| `towers.<name>.proxy.tokenUser` | `"x-agent-vault"`: the proxy URL's basic-auth user |
 | `appDefinitions` | `{}`: your own apps, see [Your own apps](#your-own-apps) |
 | `stateDir` | `$XDG_DATA_HOME/hangar` |
 | `sandbox.backend` | `"msb"`: microsandbox, the only backend so far |
@@ -49,10 +59,60 @@ NAME` (see [Where secrets live](usage.md#where-secrets-live)).
 
 A bay's ports, CPUs, memory, disk and mounts are fixed when its VM is
 created: after changing them, run `hangar destroy NAME && hangar up NAME`
-(the home is kept). Its one way out, `tower.agentVault.proxyPort`, is
-checked: until the VMs are recreated, `up` refuses to start with another
-port. It also refuses an existing VM without a record of how it was
-created (`bays/<name>/vm`, `tower-vm` in `stateDir`), with the same fix.
+(the home is kept). Its one way out, the tower's proxy, is checked: until
+the VMs are recreated, `up` refuses to start with another host or port.
+It also refuses an existing VM without a record of how it was created
+(`bays/<name>/vm`, `tower-vm` in `stateDir`), with the same fix.
+
+## A remote proxy tower
+
+A tower with `"backend": "proxy"` is a remote HTTP forward proxy hangar
+doesn't run or drive: bays leave through it and trust the CA it serves,
+and it (not hangar) decides what credentials to inject. Use it, for
+example, with a self-hosted [Infisical agent-vault
+proxy](https://infisical.com/docs/documentation/platform/agent-vault/proxies):
+
+```json
+{
+  "towers": {
+    "corp": {
+      "backend": "proxy",
+      "proxy": {
+        "host": "proxy.corp.example",
+        "port": 17323,
+        "caFile": "http://proxy.corp.example:17323/_agent-vault/ca",
+        "caFingerprint": "SHA256:9F:2C:…",
+        "tokenFile": "/run/agenix/corp-proxy-token"
+      }
+    }
+  },
+  "bays": [{ "name": "work", "tower": "corp" }]
+}
+```
+
+- `caFile` is a local path, or a URL: `up` pulls it and writes it to the
+  bay. For a URL, `caFormat` says how to read the answer: `auto` (the
+  default) takes the `certificate` field of a JSON object, as Infisical
+  serves it, and falls back to the whole body as PEM; `json` reads
+  `caField` from a JSON object and errors when it is missing; `pem` takes
+  the whole body. A local file is always PEM. `caFingerprint` (the
+  `SHA256:…` shown next to a proxy) is checked against the certificate's
+  DER, and a mismatch refuses the bay.
+- `tokenFile` holds the proxy login (an Infisical session token). It is a
+  secret: hangar only ever puts it in the bay's proxy URL, on stdin, and
+  never on a command line or in a log. Without one, the proxy URL carries
+  no login.
+- A proxy tower manages its own routes and credentials, so
+  **`routes`, `credentialFiles` and `masterPasswordFile` are refused**, and
+  a bay on one can't use apps that need hangar's routes or credentials
+  (e.g. `github`, `nix`, `claude-code`)—the failure names the app.
+  `hangar credential` only works on an `agent-vault` tower.
+- Infisical session tokens are time-bound: refresh `tokenFile` when the
+  session expires. (hangar doesn't mint them yet.)
+
+A remote tower needs one extra egress rule per bay, to `host:port`
+instead of the local proxy port; that is fixed when the VM is created,
+so a tower change needs the usual `hangar destroy`/`hangar up`.
 
 ## Where hangar keeps things
 
@@ -85,7 +145,7 @@ services.hangar.bays = [
 ### Built-in apps
 
 **hangar ships no routes.** The tower allows nothing until an app or your
-`tower.routes` names a host. The built-ins are in `config/apps/`:
+`towers.<name>.routes` names a host. The built-ins are in `config/apps/`:
 
 | App | Brings |
 |---|---|
@@ -105,7 +165,7 @@ needs `nix` and `github` (or `github-token`) in some bay: `hangar up` refuses it
 otherwise. Routes are shared, so one bay's apps serve every bay. Use
 `github` or `github-token`, not both; for `github-token`, store the token
 with `hangar credential set GITHUB_TOKEN` or name its file in
-`tower.credentialFiles`. How to set up Claude Code, Codex and Paperclip
+`towers.<name>.credentialFiles`. How to set up Claude Code, Codex and Paperclip
 is in [usage.md](usage.md#claude-code-codex-and-paperclip). `rust` covers
 fetching crates and toolchains, not `cargo search` or `cargo publish`
 (those use `crates.io`; add a route if you need them).
@@ -136,7 +196,7 @@ own:
   moves one to another host port.
 - Routes: every bay's apps' routes go to the one tower. Two apps may bring
   the same route only if it's identical (else enable only one of them), a
-  route in `tower.routes` can't take an app route's name, two sources may
+  route in `towers.<name>.routes` can't take an app route's name, two sources may
   not route one host, and an app's route may not use a credential another
   source's route uses.
 
@@ -169,7 +229,7 @@ services.hangar = {
 | Key | Meaning |
 |---|---|
 | `packages` | flake installables, merged into the bay's `packages` |
-| `routes` | `[{name, host, auth}]`, as in [`tower.routes`](#allowing-another-host); no `extra` |
+| `routes` | `[{name, host, auth}]`, as in [`towers.<name>.routes`](#allowing-another-host); no `extra` |
 | `env` | plain variables (never secrets), checked like a bay's `env` |
 | `credentials` | fixed, non-secret credential values its routes send (e.g. `github-token`'s `GITHUB_GIT_USER = x-access-token`); hangar stores them in the vault while a route uses them, and `credential set`/`rm` refuse them |
 | `setup` | `{command, check}`: a one-time interactive step. `up` runs `check` (in a login shell, after the env file) and skips the app's `run` while it fails; `hangar setup NAME` runs `command` with your terminal, then `check` (`--force` runs it even if `check` passes) |
@@ -183,14 +243,14 @@ stays in a bay's own `files` and `mounts`.
 ## Allowing another host
 
 When an agent hits a host that isn't allowed, the vault answers `403` and
-names it. Add it to `tower.routes`:
+names it. Add it to `towers.<name>.routes`:
 
 ```nix
 services.hangar.tower.routes = [
   # just allow it
   { name = "crates"; host = "index.crates.io"; auth.type = "passthrough"; }
 
-  # or inject a credential (hangar credential set, or tower.credentialFiles)
+  # or inject a credential (hangar credential set, or towers.<name>.credentialFiles)
   {
     name = "jira";
     host = "your-site.atlassian.net";
@@ -204,7 +264,8 @@ services.hangar.tower.routes = [
 ];
 ```
 
-The same entries go under `"tower": {"routes": [...]}` in `hangar.json`.
+The same entries go under `"towers": {"default": {"routes": [...]}}` in
+`hangar.json`.
 Wildcards match one label only (`*.docker.io` doesn't match
 `a.b.docker.io`). See agent-vault's docs for every auth type and for
 path-scoped hosts (`api.example.com/v1/*`).

@@ -23,8 +23,10 @@
       "imageLoader": "/nix/store/00000000000000000000000000000000-bay-image"
     }
   ],
-  "tower": {
-    "credentialFiles": { "GITHUB_TOKEN": "/run/secrets/github-token" },
-    "routes": []
+  "towers": {
+    "default": {
+      "credentialFiles": { "GITHUB_TOKEN": "/run/secrets/github-token" },
+      "routes": []
+    }
   }
 }

@@ -48,6 +48,14 @@ pub(crate) struct AppDef {
     ports: Vec<PublishedPort>,
 }
 
+/// The first app in `apps` that brings routes or fixed credentials: a
+/// tower hangar doesn't drive can't apply them.
+pub(crate) fn needs_managed_policy(apps: &[AppDef]) -> Option<&str> {
+    apps.iter()
+        .find(|app| !app.routes.is_empty() || !app.credentials.is_empty())
+        .map(|app| app.name.as_str())
+}
+
 /// An app's one-time interactive step, and the check that says it's done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Setup {
@@ -189,7 +197,7 @@ fn app_routes(fields: &Fields) -> Result<BTreeMap<String, Route>> {
         .find(|(_, route)| !route.extra.is_empty())
         .map(|(name, _)| name)
     {
-        bail!("routes.{name}.extra: only config.tower.routes may set it");
+        bail!("routes.{name}.extra: only config.towers.*.routes may set it");
     }
     Ok(routes)
 }
@@ -246,6 +254,7 @@ fn ports(app: &str, fields: &Fields) -> Result<Vec<PublishedPort>> {
 pub(crate) fn merge_routes(
     bays: &[Vec<AppDef>],
     user: BTreeMap<String, Route>,
+    path: &str,
 ) -> Result<(BTreeMap<String, Route>, BTreeMap<String, Origin>)> {
     let mut routes: BTreeMap<String, Route> = BTreeMap::new();
     let mut origins: BTreeMap<String, Origin> = BTreeMap::new();
@@ -277,9 +286,7 @@ pub(crate) fn merge_routes(
     for (name, route) in user {
         if let Some(origin) = origins.get(&name) {
             return Err(Error::with_hint(
-                format!(
-                    "config.tower.routes.{name}: {origin} {name} has that name"
-                ),
+                format!("{path}.{name}: {origin} {name} has that name"),
                 "give your route another name; an app's routes come with \
                  the app, so leave the app out to route its host yourself",
             ));
@@ -484,13 +491,18 @@ fn origin<'a>(origins: &'a BTreeMap<String, Origin>, name: &str) -> &'a Origin {
 #[cfg(test)]
 mod tests {
     use super::BUILTINS;
-    use crate::config::{BaySettings, Settings};
+    use crate::config::{BaySettings, DEFAULT_TOWER, Settings};
     use crate::testing::{
         config_error as error, one_bay, resolved as resolve_text,
     };
+    use std::collections::BTreeMap;
 
     fn bay(settings: &Settings) -> &BaySettings {
         &settings.bays[0]
+    }
+
+    fn routes(settings: &Settings) -> &BTreeMap<String, crate::broker::Route> {
+        &settings.towers[DEFAULT_TOWER].routes
     }
 
     /// Package hosts for configs whose apps bring packages.
@@ -519,7 +531,7 @@ mod tests {
                 "host": "m.example", "auth": {"type": "passthrough"}}]}}"#,
         );
         let settings = resolve_text(&only).unwrap();
-        assert_eq!(settings.routes["m"].host, "m.example");
+        assert_eq!(routes(&settings)["m"].host, "m.example");
         assert_eq!(bay(&settings).apps[0].routes, ["m"]);
         assert_eq!(bay(&settings).packages, Vec::<String>::new());
     }
@@ -732,7 +744,7 @@ mod tests {
         assert_eq!(bay.env["A"], "mine");
         assert_eq!(bay.run["a"], "my serve");
         assert_eq!(bay.run["x"], "x");
-        assert!(settings.routes.contains_key("a-api"));
+        assert!(routes(&settings).contains_key("a-api"));
         assert_eq!(bay.apps[1].routes, ["a-api", "shared"]);
         assert_eq!(bay.apps[2].routes, ["shared"]);
     }
@@ -780,8 +792,8 @@ mod tests {
         let app_and_config = one_bay(
             r#""apps": ["nixy", "a"]"#,
             &format!(
-                r#"{TWO_APPS}, "tower": {{"routes": [{{"name": "mine",
-                     "host": "a.example", "auth": {{"type": "passthrough"}}}}]}}"#
+                r#"{TWO_APPS}, "towers": {{"default": {{"routes": [{{"name": "mine",
+                     "host": "a.example", "auth": {{"type": "passthrough"}}}}]}}}}"#
             ),
         );
         assert_eq!(
@@ -790,23 +802,25 @@ mod tests {
         );
         let same_name = one_bay(
             r#""apps": ["node"]"#,
-            r#""tower": {"routes": [{"name": "npm", "host": "npm.example",
-                 "auth": {"type": "passthrough"}}]}"#,
+            r#""towers": {"default": {"routes": [{"name": "npm",
+                 "host": "npm.example",
+                 "auth": {"type": "passthrough"}}]}}"#,
         );
         let error = resolve_text(&same_name).unwrap_err();
         assert_eq!(
             error.message(),
-            "config.tower.routes.npm: app node route npm has that name"
+            "config.towers.default.routes.npm: app node route npm has that name"
         );
         assert!(error.hint().unwrap().contains("another name"));
         // Without the app, the name is the user's.
         let mine = one_bay(
             "",
-            r#""tower": {"routes": [{"name": "npm", "host": "npm.example",
-                 "auth": {"type": "basic", "username": "NPM_USER"}}]}"#,
+            r#""towers": {"default": {"routes": [{"name": "npm",
+                 "host": "npm.example",
+                 "auth": {"type": "basic", "username": "NPM_USER"}}]}}"#,
         );
         assert_eq!(
-            resolve_text(&mine).unwrap().routes["npm"].host,
+            routes(&resolve_text(&mine).unwrap())["npm"].host,
             "npm.example"
         );
     }
@@ -818,19 +832,19 @@ mod tests {
             "extra": {"substitutions": []}}]}}}"#;
         assert_eq!(
             error(app),
-            "app w: routes.w-api.extra: only config.tower.routes may set it"
+            "app w: routes.w-api.extra: only config.towers.*.routes may set it"
         );
-        let config = r#"{"tower": {"routes": [{"name": "w-api",
+        let config = r#"{"towers": {"default": {"routes": [{"name": "w-api",
             "host": "w.example", "auth": {"type": "passthrough"},
-            "extra": {"substitutions": []}}]}}"#;
+            "extra": {"substitutions": []}}]}}}"#;
         assert!(resolve_text(config).is_ok());
     }
 
     #[test]
     fn an_app_cannot_use_a_credential_another_source_uses() {
-        let token_route = r#""tower": {"routes": [{"name": "ghe",
+        let token_route = r#""towers": {"default": {"routes": [{"name": "ghe",
             "host": "ghe.example",
-            "auth": {"type": "bearer", "token": "GITHUB_TOKEN"}}]}"#;
+            "auth": {"type": "bearer", "token": "GITHUB_TOKEN"}}]}}"#;
         // (a) Next to github-token, the user's route can't send its token
         // elsewhere; without it, it can.
         assert_eq!(
@@ -850,9 +864,10 @@ mod tests {
         );
         let user = one_bay(
             &format!(r#""apps": [{NIX}, "claude-code"]"#),
-            r#""tower": {"routes": [{"name": "proxy-ai", "host": "ai.example",
+            r#""towers": {"default": {"routes": [{"name": "proxy-ai",
+              "host": "ai.example",
               "auth": {"type": "bearer",
-                       "token": "CLAUDE_CODE_OAUTH_TOKEN"}}]}"#,
+                       "token": "CLAUDE_CODE_OAUTH_TOKEN"}}]}}"#,
         );
         assert_eq!(
             error(&user),

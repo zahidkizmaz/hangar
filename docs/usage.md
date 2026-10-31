@@ -83,13 +83,13 @@ the built-in defaults, so updates to them reach you:
       "apps": ["nix", "github", "claude-code"],
       "packages": ["nixpkgs#rtk"] }
   ],
-  "tower": { "credentialFiles": {} }
+  "towers": { "default": { "credentialFiles": {} } }
 }
 ```
 
 - `bays`: the bays, in order; each lists its
   [apps](configuration.md#apps). Without any there is one bay, `default`.
-- `tower.credentialFiles`: vault credential key → file holding its value,
+- `towers.<name>.credentialFiles`: vault credential key → file holding its value,
   e.g. `{"GITHUB_TOKEN": "/path/to/github-token"}`, for credentials you
   keep in files. Others you store with `hangar credential set NAME`.
 
@@ -117,7 +117,7 @@ To supply your own instead, hangar uses the first of these that is set:
 
 1. `HANGAR_MASTER_PASSWORD`: the password itself
 2. `HANGAR_MASTER_PASSWORD_FILE`: a file holding it
-3. `tower.masterPasswordFile` in the config: an explicit opt-in, e.g. a
+3. `towers.<name>.masterPasswordFile` in the config: an explicit opt-in, e.g. a
    file a secrets manager provides in CI
 4. the OS keychain (service `hangar`, account `master-password`;
    `HANGAR_KEYCHAIN_SERVICE` picks another service name)
@@ -154,7 +154,7 @@ all ports bind to 127.0.0.1 only
 
 `--all` adds each bay's apps (hosts and credential names), mounts and
 package cache, and every route the tower serves, with its source (`app
-NAME` or `config` for `tower.routes`):
+NAME` or `config` for `towers.<name>.routes`):
 
 ```
   ROUTE      HOST               AUTH                            SOURCE
@@ -189,8 +189,8 @@ each bay shows as its own agent (`hangar-<bay>`), and `403`s.
 
 | Port | What | Reachable from |
 |---|---|---|
-| `127.0.0.1:14321` | vault UI and admin API (`tower.agentVault.adminPort`) | your machine |
-| `127.0.0.1:14322` | vault proxy (`tower.agentVault.proxyPort`) | the bays only |
+| `127.0.0.1:14321` | vault UI and admin API (`towers.<name>.agentVault.adminPort`) | your machine |
+| `127.0.0.1:14322` | vault proxy (`towers.<name>.agentVault.proxyPort`) | the bays only |
 | app ports, e.g. `127.0.0.1:3100` | Paperclip's web UI (the `paperclip` app) | your machine |
 
 Everything binds to `127.0.0.1` only, and two ports can't share a host
@@ -236,7 +236,7 @@ hangar credential login ATLASSIAN https://mcp.atlassian.com/v1/mcp
   client you registered instead.
 - A provider without that registration needs a client you register
   yourself, with `http://127.0.0.1:14321/v1/oauth/callback` as its
-  redirect URL (your `tower.agentVault.adminPort`): the provider sends
+  redirect URL (your `towers.<name>.agentVault.adminPort`): the provider sends
   your browser back to the vault there. Then pass its endpoints:
 
   ```sh
@@ -270,7 +270,7 @@ A remote MCP server is a host like any other: a route, a credential, and
 the server in your tool's own config. hangar never reads or writes that
 config, and it holds no secret.
 
-1. A route in `tower.routes`. Scope it to the server's path, so the bay
+1. A route in `towers.<name>.routes`. Scope it to the server's path, so the bay
    can reach only the MCP endpoint, never the provider's `/register` or
    `/token` (a tool can't log itself in from inside the bay):
 

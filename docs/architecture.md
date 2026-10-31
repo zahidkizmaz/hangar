@@ -5,13 +5,16 @@
 microsandbox VMs: one tower and any number of bays (`bays` in the config;
 none configured means one, `default`).
 
-- `hangar-tower`, the tower, runs the credential broker (`tower.backend`,
-  today only `agent-vault`, digest-pinned image) with the real
-  credentials. It publishes its admin API (`tower.agentVault.adminPort`,
-  default 14321) and MITM proxy (`tower.agentVault.proxyPort`, 14322) on
+- `hangar-tower`, the tower, runs the credential broker
+  (`towers.<name>.backend`) with the real credentials. With
+  `agent-vault` (default, digest-pinned image) it is a local VM that
+  publishes its admin API (`towers.<name>.agentVault.adminPort`, default
+  14321) and MITM proxy (`towers.<name>.agentVault.proxyPort`, 14322) on
   the host's `127.0.0.1` only; its own egress is the public internet.
+  With `proxy` the tower is remote, run by the operator (e.g. a
+  self-hosted Infisical agent-vault proxy); hangar builds no VM for it.
 - `hangar-bay-<name>` is a bay, where agents run. Its only outbound path
-  is the host's proxy port, so traffic flows bay → `host:proxyPort` →
+  is its tower's proxy, so traffic flows bay → `host:proxyPort` →
   agent-vault → upstream. The vault swaps placeholders for real
   credentials and, in deny mode, answers `403` naming any host without a
   route. Each bay has its own vault agent, `hangar-<name>`, and token, so
@@ -38,7 +41,7 @@ checks them through the traits:
 | deny before routes and credentials | `Broker::deny_unlisted`, then `health().unlisted` must be `Deny`, else `up` refuses to apply routes |
 | step order | `TOWER_STEPS`: deny → routes → credentials → tokens; then each bay's `access()` |
 | only managed credentials deleted | `stale_keys` and `credential-keys`; the broker only gets explicit keys |
-| one egress port | bays are created with `Egress::OnlyHostPort(proxy)`, and `access()` must name the same port |
+| one egress | a bay is created with `Egress::OnlyHostPort(proxy)` for a local tower, else `Egress::Host { host, port }`; `access()` must name the same port |
 | egress fixed at create | `bays/<name>/vm` and `tower-vm` record it; an existing VM without a matching record is refused with the recreate hint |
 | secrets never in argv, env or logs | `exec` stdin, `Access` and `UiLogin` hold `Secret`s, `VmSpec.env` is non-secret |
 
@@ -53,6 +56,8 @@ logs to `${XDG_STATE_HOME:-~/.local/state}/hangar/hangar.log`, resolved by
 its shell wrapper.
 
 - `stateDir` (default `$XDG_DATA_HOME/hangar`, mode 0700):
+  - the default tower's files sit at the root; any other tower's under
+    `towers/<name>/` (so `tower-vm`, `guest/`, … below are the default's);
   - shared: the broker's own files (agent-vault: `vault/`, its data,
     mounted at `/data`, and `owner-password`; they never move, so an
     existing vault keeps unlocking), `credential-keys` (credentials hangar
@@ -62,7 +67,8 @@ its shell wrapper.
     its own, inside the proxy URL) and `guest/` (only `ca.pem`, mounted
     read-only at `/run/hangar` in every bay);
   - per bay, `bays/<name>/`: `vm` (what the bay's VM was created with,
-    `key\tvalue` lines: `image\t<ref>`, `egress\t<port>`,
+    `key\tvalue` lines: `image\t<ref>`, `egress\t<only:port>` or
+    `egress\thost:<host>:<port>`,
     `port\t<name>\t<host>\t<vm>`, and `mount\t<vm>\t<host>\t<ro|rw>` per
     mount with its resolved host, the home mount included; no `mount`
     lines means none), `files` (hash and VM path of each file
@@ -212,7 +218,7 @@ entries (the bay restarts its daemons only when their proxy env or CA
 changed):
 
 1. Resolve the master password: `HANGAR_MASTER_PASSWORD`,
-   `HANGAR_MASTER_PASSWORD_FILE`, `tower.masterPasswordFile`, then the keychain.
+   `HANGAR_MASTER_PASSWORD_FILE`, `towers.<name>.masterPasswordFile`, then the keychain.
    Generate one only when the broker has no data (`Broker::has_data`).
    Fails before anything is created; an empty password is refused.
 2. Tower pre-flight, before any VM is touched: an existing tower must have
@@ -220,6 +226,8 @@ changed):
    another port, `up` refuses with "run 'hangar destroy && hangar up'
    (home is kept)": it's fixed when the VM is created. Other tower port
    changes only warn.
+Steps 3–7 run for each tower hangar drives (`Broker::manages_policy`,
+true for `agent-vault`); a `proxy` tower is remote and skips them.
 3. Tower (`Broker::ensure_running`): create or start, then unlock it
    with the password on stdin and log in as admin (agent-vault: start the
    server, since starting a sandbox doesn't rerun the image's entrypoint,
@@ -228,14 +236,14 @@ changed):
 4. Deny mode; the core then reads the policy back (`Broker::health`) and
    refuses to go on unless unlisted hosts are denied.
 5. Routes (the whole set; agent-vault: one `PUT` of its services).
-6. Credentials from `tower.credentialFiles` (values on stdin or in a request
+6. Credentials from `towers.<name>.credentialFiles` (values on stdin or in a request
    body); delete those in `credential-keys` that left the config. The
    broker only ever gets explicit keys.
 7. Bays' tokens (`Broker::retain_bays`): the vault agent and token file
    of every bay that has a token but isn't configured are deleted (a 404
    counts as gone); vault agents without a token file aren't hangar's.
 8. Each bay, in order. Its first step is its own pre-flight: an existing
-   VM needs a `bays/<name>/vm` record whose egress is the proxy port, and
+   VM needs a `bays/<name>/vm` record whose egress is its tower's proxy, and
    its recorded mounts must pass today's mount rules (a root may have
    moved), or the bay is refused with the same recreate hint. Then:
    create or start, wait until its systemd has booted (see "The bay
@@ -247,7 +255,8 @@ changed):
    (the proxy URL on stdin) and the wait for docker. The image is
    `bays[].image`, else `<imageRepository>:v<hangar version>`;
    `imageLoader` (from `imagePackage`) loads it first if missing. The
-   VM's only egress is the tower's proxy port (`Egress::OnlyHostPort`); it
+   VM's only egress is its tower's proxy (`Egress::OnlyHostPort` or
+   `Egress::Host`); it
    publishes the enabled apps' ports. Its image, egress, published ports
    and mounts are recorded in `bays/<name>/vm`, also when a failing create
    left the VM behind; a later `up` with a different image, ports or
@@ -323,7 +332,7 @@ an error. `status` shows a stopped entry of an app with a setup as
 
 ## Credentials
 
-- `tower.credentialFiles`: hangar-managed, recorded in `credential-keys`,
+- `towers.<name>.credentialFiles`: hangar-managed, recorded in `credential-keys`,
   reconciled on every `up`. So is an app's fixed, non-secret
   `credentials` value (e.g. `github-token`'s `GITHUB_GIT_USER`) whenever
   a route references it; two apps may share one only with the same value,
@@ -378,7 +387,7 @@ locally built (unsigned) paths are copied but never used from the cache.
 `hangar.json` is the only config. Lookup: `$HANGAR_CONFIG`, then the
 Nix-rendered file (`HANGAR_NIX_CONFIG`), then
 `$XDG_CONFIG_HOME/hangar/hangar.json`. Its top level is checked first
-(`bays`, `tower`, `appDefinitions`, `sandbox`, `stateDir`; anything else is
+(`bays`, `towers`, `appDefinitions`, `sandbox`, `stateDir`; anything else is
 an unknown setting), then it's merged over `config/defaults.json`, whose
 `bay` object is merged under each entry of `bays` (none: one bay,
 `default`). Bay names are `[a-z0-9]+(-[a-z0-9]+)*`, at most 32 characters,
@@ -390,7 +399,7 @@ Routes are what the tower forwards: a list of `{name, host, auth, extra?}`;
 `extra` holds broker-specific fields, which agent-vault flattens into the
 service (keys clashing with `name`, `host` or `auth` are errors, checked
 by `Broker::validate` when the config loads). hangar ships none: they come
-from the bays' apps and `tower.routes`.
+from the bays' apps and `towers.<name>.routes`.
 
 Apps (`src/apps.rs`) are data: `config/apps/<name>.json` (built in via
 `include_str!`) or `appDefinitions.<name>` (replaces a built-in whole),
@@ -402,7 +411,7 @@ enabled per bay by its `apps` (the built-ins are listed in
 2. Once, for the tower (`apps::merge_routes`): every bay's apps' routes,
    each app once in bay order; two apps may share a route only when it's
    identical ("enable only one of the two apps" otherwise), and a
-   `tower.routes` entry may not take an app route's name, so apps and the
+   `towers.<name>.routes` entry may not take an app route's name, so apps and the
    user never shadow each other. Then `check_routes`: two sources can't
    route one host (`apps::Origin`), and an app's route can't use a
    credential another source uses. No app may set a credential's
@@ -439,7 +448,8 @@ reach them by name.
 - `src/hangar.rs`: `Hangar`, the shared context (settings, state dir, the
   package cache root, sandbox and broker), which builds each `Bay`; the
   only place that picks the backends (`sandbox.backend`,
-  `tower.backend`).
+  `towers.<name>.backend`), and rejects a backend's foreign object
+  (`agentVault` vs `proxy`) or dead policy config on a proxy tower.
 - `src/credential.rs`: `hangar credential`, OAuth logins included.
 - `src/url.rs`: query parameters (the consent URL's, `resource=`).
 - `src/oauth.rs`: provider discovery and client registration.
@@ -453,8 +463,10 @@ reach them by name.
   their merge into the settings and the cross-source checks.
 - `src/broker/mod.rs`: the `Broker` trait, `Route`/`Auth`, and the core
   side: the pre-flight, `tower-vm`, the deny check, the credential
-  reconcile, the bays' tokens and the access check. `src/broker/agent_vault.rs` is the
-  agent-vault backend (its VM, admin API and state files) and
+  reconcile, the bays' tokens and the access check.
+  `src/broker/agent_vault.rs` is the agent-vault backend (its VM, admin
+  API and state files), `src/broker/proxy.rs` the remote `proxy` backend
+  (no VM; it only reads the CA and token and lets bays out) and
   `src/broker/fake.rs` the in-process test double.
 - `src/bay.rs`: `Bay` and its steps (its pre-flight, create or start,
   image loading, placeholders, `run`).

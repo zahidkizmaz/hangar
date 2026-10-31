@@ -170,9 +170,14 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
     if let Some(disk) = spec.disk {
         args.extend(root_disk(spec, disk));
     }
-    if let Egress::OnlyHostPort(port) = spec.egress {
+    let egress = match &spec.egress {
+        Egress::OnlyHostPort(port) => Some(format!("allow@host:tcp:{port}")),
+        Egress::Host { host, port } => Some(format!("allow@{host}:tcp:{port}")),
+        Egress::Open => None,
+    };
+    if let Some(rule) = egress {
         args.push("--no-net".into());
-        args.extend(["--net-rule".into(), format!("allow@host:tcp:{port}")]);
+        args.extend(["--net-rule".into(), rule]);
         // Trap: forwarded connections don't count as `host`, so ingress to
         // published ports must be `any`; they still bind to host loopback.
         for (_, guest) in spec.publish {

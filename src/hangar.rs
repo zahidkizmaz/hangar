@@ -2,19 +2,20 @@
 //! directory, the package cache root and the sandbox and broker backends.
 //! Each bay is built from it on demand ([`Hangar::bay`]).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::bay::Bay;
-use crate::broker::{AgentVault, Broker};
+use crate::broker::{AgentVault, Broker, Proxy};
 use crate::config::{
-    self, BaySettings, Paths, Settings, env_var, valid_bay_name,
+    self, BaySettings, Paths, Settings, Tower, env_var, valid_bay_name,
 };
 use crate::dirs::{self, Base};
-use crate::error::{Context, Error, Result};
+use crate::error::{Context, Error, Result, bail};
 use crate::files;
-use crate::json;
+use crate::json::{self, Json};
 use crate::overview;
 use crate::sandbox::{Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
@@ -27,7 +28,8 @@ pub(crate) struct Hangar {
     /// The user's `$HOME`, which the mount rules protect.
     pub(crate) host_home: PathBuf,
     pub(crate) sandbox: Rc<dyn Sandbox>,
-    pub(crate) broker: Box<dyn Broker>,
+    /// One broker per tower, by name.
+    pub(crate) brokers: BTreeMap<String, Box<dyn Broker>>,
 }
 
 impl Hangar {
@@ -48,10 +50,17 @@ impl Hangar {
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
         let host_home = files::host_home()?;
-        let broker = broker(&settings, sandbox.clone(), state.root())
-            .context(&invalid)?;
-        for route in settings.routes.values() {
-            broker.validate(route).context(&invalid)?;
+        let mut brokers = BTreeMap::new();
+        for (name, tower) in &settings.towers {
+            brokers.insert(
+                name.clone(),
+                broker(tower, sandbox.clone(), &state).context(&invalid)?,
+            );
+        }
+        for (name, tower) in &settings.towers {
+            for route in tower.routes.values() {
+                brokers[name].validate(route).context(&invalid)?;
+            }
         }
         for (scoped, whole) in config::uncovered_path_scopes(&settings) {
             log::warn!(
@@ -62,7 +71,7 @@ impl Hangar {
         for key in config::unused_credential_files(&settings) {
             log::warn!("credentialFiles {key} is used by no route");
         }
-        overview::check_ports(&overview::published(broker.as_ref(), &settings))
+        overview::check_ports(&overview::published(&brokers, &settings))
             .context(&invalid)?;
         Ok(Self {
             settings,
@@ -70,8 +79,52 @@ impl Hangar {
             cache_root,
             host_home,
             sandbox,
-            broker,
+            brokers,
         })
+    }
+
+    /// The broker of the tower named `tower`.
+    pub(crate) fn broker(&self, tower: &str) -> Result<&dyn Broker> {
+        self.brokers
+            .get(tower)
+            .map(Box::as_ref)
+            .context(format!("no broker for tower {tower}"))
+    }
+
+    /// The tower `name` picks; without a name, the only tower, else an
+    /// error listing them.
+    pub(crate) fn tower(&self, name: Option<&str>) -> Result<&Tower> {
+        if let Some(name) = name {
+            return self
+                .settings
+                .towers
+                .get(name)
+                .context(format!("no tower named {name}"));
+        }
+        let mut names = self.settings.towers.keys();
+        if let (Some(only), None) = (names.next(), names.next()) {
+            Ok(&self.settings.towers[only])
+        } else {
+            let names: Vec<&str> =
+                self.settings.towers.keys().map(String::as_str).collect();
+            Err(Error::with_hint(
+                format!("several towers: pass --tower ({})", names.join(", ")),
+                "name one of the towers",
+            ))
+        }
+    }
+
+    /// The tower `name` names and its broker, looked up once.
+    pub(crate) fn tower_context(
+        &self,
+        name: &str,
+    ) -> Result<(&Tower, &dyn Broker)> {
+        let tower = self
+            .settings
+            .towers
+            .get(name)
+            .context(format!("no tower named {name}"))?;
+        Ok((tower, self.broker(name)?))
     }
 
     pub(crate) fn bay(&self, name: &str) -> Option<Bay<'_>> {
@@ -146,25 +199,66 @@ fn sandbox(backend: &str) -> Result<Rc<dyn Sandbox>> {
 }
 
 pub(crate) fn broker(
-    settings: &Settings,
+    tower: &Tower,
     sandbox: Rc<dyn Sandbox>,
-    state: &Path,
+    state: &StateDir,
 ) -> Result<Box<dyn Broker>> {
-    match settings.broker_backend.as_str() {
+    let path = format!("config.towers.{}", tower.name);
+    match tower.backend.as_str() {
         "agent-vault" => {
-            Ok(Box::new(AgentVault::new(&settings.tower, sandbox, state)?))
+            reject(&path, tower, false)?;
+            Ok(Box::new(AgentVault::new(tower, sandbox, state)?))
+        }
+        "proxy" => {
+            reject(&path, tower, true)?;
+            Ok(Box::new(Proxy::new(tower)?))
         }
         other => Err(Error::new(format!(
-            "config.tower.backend: unknown backend {other:?}; known: \
-             agent-vault"
+            "{path}.backend: unknown backend {other:?}; known: \
+             agent-vault, proxy"
         ))),
     }
+}
+
+/// A tower's backend reads one object (`agentVault` or `proxy`) and its
+/// own routes and credentials; the other backend's would be dead config,
+/// refused instead of ignored.
+fn reject(path: &str, tower: &Tower, is_proxy: bool) -> Result<()> {
+    let has = |name: &str| matches!(&tower.config, Json::Object(map) if map.contains_key(name));
+    if is_proxy {
+        if has("agentVault") {
+            bail!("{path}.agentVault: only for an agent-vault tower");
+        }
+        if !tower.routes.is_empty() {
+            bail!(
+                "{path}.routes: a proxy tower manages its own; hangar \
+                 can't set them"
+            );
+        }
+        if !tower.credential_files.is_empty() {
+            bail!(
+                "{path}.credentialFiles: a proxy tower manages its own \
+                 credentials"
+            );
+        }
+        if tower.master_password_file.is_some() {
+            bail!(
+                "{path}.masterPasswordFile: a proxy tower has no local \
+                 vault"
+            );
+        }
+    } else if has("proxy") {
+        bail!("{path}.proxy: only for a proxy tower");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{broker, check_disjoint, sandbox};
+    use crate::config::DEFAULT_TOWER;
     use crate::sandbox::fake::FakeSandbox;
+    use crate::state::StateDir;
     use crate::testing::settings;
     use std::path::Path;
     use std::rc::Rc;
@@ -200,18 +294,23 @@ mod tests {
             error,
             r#"config.sandbox.backend: unknown backend "docker"; known: msb"#
         );
-        let state = Path::new("/nonexistent");
+        let state = StateDir::new(Path::new("/nonexistent").to_path_buf());
         let load = |config: &str| {
-            broker(&settings(config), Rc::new(FakeSandbox::default()), state)
+            let settings = settings(config);
+            broker(
+                &settings.towers[DEFAULT_TOWER],
+                Rc::new(FakeSandbox::default()),
+                &state,
+            )
         };
         assert!(load("{}").is_ok());
-        let error = load(r#"{"tower": {"backend": "vault"}}"#)
+        let error = load(r#"{"towers": {"default": {"backend": "vault"}}}"#)
             .err()
             .unwrap()
             .to_string();
         assert_eq!(
             error,
-            r#"config.tower.backend: unknown backend "vault"; known: agent-vault"#
+            r#"config.towers.default.backend: unknown backend "vault"; known: agent-vault, proxy"#
         );
     }
 }
