@@ -35,6 +35,8 @@ pub(crate) struct FakeBroker {
     pub(crate) consent: RefCell<Option<String>>,
     /// Whether `oauth_wait` sees the user log in, or times out.
     pub(crate) logs_in: Cell<bool>,
+    /// A proxy hangar doesn't drive: no policy steps and no password.
+    pub(crate) unmanaged: Cell<bool>,
 }
 
 pub(crate) const FAKE_CALLBACK: &str =
@@ -55,6 +57,7 @@ impl Default for FakeBroker {
             access_port: Cell::new(14322),
             consent: RefCell::default(),
             logs_in: Cell::new(true),
+            unmanaged: Cell::new(false),
         }
     }
 }
@@ -66,6 +69,10 @@ impl FakeBroker {
 }
 
 impl Broker for FakeBroker {
+    fn manages_policy(&self) -> bool {
+        !self.unmanaged.get()
+    }
+
     fn has_data(&self) -> Option<PathBuf> {
         None
     }

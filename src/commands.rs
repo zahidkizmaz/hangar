@@ -77,10 +77,13 @@ const BAY_STEPS: [(&str, BayStep); 8] = [
 /// logged, reported in `failed` and makes `up` exit 1.
 pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
     let selected = configured(hangar, names)?;
-    // The managed towers of the selected bays, in settings order; a proxy
-    // tower hangar doesn't drive has no steps and needs no password.
-    let managed: Vec<&str> = towers_of(hangar, &selected)
-        .into_iter()
+    // The towers of the selected bays, in settings order. A managed tower
+    // gets policy steps and needs a password; a proxy tower has neither,
+    // but a local one still needs its process started.
+    let towers = towers_of(hangar, &selected);
+    let managed: Vec<&str> = towers
+        .iter()
+        .copied()
         .filter(|tower| hangar.broker(tower).is_ok_and(Broker::manages_policy))
         .collect();
     // Checked before anything is created: an empty password would start
@@ -94,6 +97,12 @@ pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
         .context(state.display())?;
     if let Some(password) = &password {
         start_managed_towers(hangar, &managed, password)?;
+    }
+    // A proxy tower manages its own policy and needs no password, but a
+    // local one runs as hangar's child: start it before any bay reaches it.
+    let no_password = crate::secret::Secret::new(String::new());
+    for tower in towers.iter().filter(|tower| !managed.contains(tower)) {
+        hangar.broker(tower)?.ensure_running(&no_password)?;
     }
     let mut failed = Vec::new();
     for bay in &selected {
@@ -813,5 +822,45 @@ mod tests {
         let error = setup(&hangar, None, "web", false).unwrap_err();
         assert_eq!(error.message(), "hangar-bay-default isn't running");
         assert_eq!(stopped.changes(), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod up_tests {
+    use super::up;
+    use crate::broker::fake::FakeBroker;
+    use crate::sandbox::BoxState;
+    use crate::sandbox::fake::FakeSandbox;
+    use crate::testing::{hangar_with_broker, scratch_dir};
+    use std::rc::Rc;
+
+    #[test]
+    fn up_starts_an_unmanaged_tower_without_a_password() {
+        let state = scratch_dir("up-unmanaged");
+        let sandbox = Rc::new(FakeSandbox::with(&[(
+            "hangar-bay-default",
+            BoxState::Running,
+        )]));
+        let broker = FakeBroker::default();
+        broker.unmanaged.set(true);
+        let calls = broker.calls.clone();
+        let config = r#"{"towers": {"corp": {"backend": "proxy",
+            "proxy": {"host": "127.0.0.1", "port": 17323, "caFile": "/ca"}}},
+            "bays": [{"name": "default", "tower": "corp"}]}"#;
+        let hangar =
+            hangar_with_broker(config, &state, sandbox, Box::new(broker));
+        let report = up(&hangar, &[]).unwrap();
+        let calls = calls.borrow();
+        assert!(
+            calls.iter().any(|call| call == "ensure_running"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call == "deny_unlisted"),
+            "an unmanaged tower has no policy steps: {calls:?}"
+        );
+        // The bay still fails preflight (no VM record), but only after the
+        // tower was started.
+        assert_ne!(report.failed, Vec::new());
     }
 }
