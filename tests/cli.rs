@@ -270,7 +270,7 @@ fn rm_unknown_name_lists_bays_and_proxies() {
 fn ps_lists_bays_with_state_proxy_image() {
     let machine = with_bay("ps", "", "");
     let rows = |machine: &Machine| -> Vec<Vec<String>> {
-        run(machine, &["ps"])
+        stdout(&machine.hangar(&["ps"], &[]))
             .lines()
             .map(|line| line.split_whitespace().map(String::from).collect())
             .collect()
@@ -505,4 +505,78 @@ fn json_on_every_command() {
          \"outcome\":\"created\",\"reasons\":[],\"type\":\"bay\"}],\
          \"version\":1}\n"
     );
+}
+
+fn hangar_log(machine: &Machine) -> String {
+    read(machine.home.join(".local/state/hangar/hangar.log"))
+}
+
+#[test]
+fn log_file_gets_every_line_timestamped() {
+    let machine = with_bay("log-file", "", "");
+    run(&machine, &["up", "-q"]);
+    let log = hangar_log(&machine);
+    assert!(log.lines().count() >= 2, "{log}");
+    for line in log.lines() {
+        let (stamp, rest) = line.split_once(' ').unwrap();
+        assert!(stamp.ends_with('Z') && stamp.len() == 20, "{line}");
+        assert!(rest.starts_with("info ") || rest.starts_with("warn "));
+    }
+    assert!(log.contains("default: vm"), "{log}");
+    assert!(log.contains("default: created"), "{log}");
+}
+
+#[test]
+fn ps_exits_3_on_event_and_logs_it() {
+    let machine = with_bay("ps-event", r#", "apps": ["web"]"#, WEB_APP);
+    fs::write(machine.fake.join("setup-check"), "done").unwrap();
+    run(&machine, &["up"]);
+    assert!(run(&machine, &["ps", "-q"]).contains("running"));
+
+    fs::remove_file(machine.fake.join("hangar-run-web.service")).unwrap();
+    let output = machine.hangar(&["ps", "-q"], &[]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stdout(&output).contains("default  bay   running"));
+    assert!(
+        hangar_log(&machine).contains(
+            "warn bay default: app web isn't running; \
+             see 'hangar logs default web'"
+        ),
+        "{}",
+        hangar_log(&machine)
+    );
+}
+
+#[test]
+fn ps_exits_3_for_a_leftover() {
+    let machine = with_bay("ps-leftover", "", "");
+    fs::create_dir_all(data(&machine).join("bays/old")).unwrap();
+    let output = machine.hangar(&["ps", "--json"], &[]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stdout(&output).contains(r#""leftovers":[{"name":"old""#));
+    assert!(stderr(&output).contains("hangar rm old --data"));
+}
+
+#[test]
+fn logs_without_name_prints_the_log() {
+    let machine = with_bay("logs-own", "", "");
+    run(&machine, &["up"]);
+    let out = run(&machine, &["logs"]);
+    assert!(out.contains(" info default: created\n"), "{out}");
+}
+
+#[test]
+fn secrets_never_in_log() {
+    let machine = with_bay("no-secrets", "", "");
+    run(&machine, &["up"]);
+    let token = machine.home.join("token");
+    fs::write(&token, "tok-SECRET-1").unwrap();
+    let token = token.display().to_string();
+    let output = machine.hangar(&["cp", &token, "default:~/t", "-vv"], &[]);
+    let said = stderr(ok(&output));
+    assert_eq!(machine.fake_file("vmfs/home/pilot/t"), "tok-SECRET-1");
+    assert!(said.contains("run: msb"), "{said}");
+    let log = hangar_log(&machine);
+    assert!(log.contains("run: msb"), "{log}");
+    assert!(!log.contains("SECRET") && !said.contains("SECRET"), "{log}");
 }

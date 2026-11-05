@@ -29,10 +29,12 @@ mod testing;
 mod vm_record;
 
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand};
 use config::{Paths, env_var};
+use dirs::Base;
 use error::Result;
 use hangar::Hangar;
 use output::{Format, Outcome};
@@ -42,7 +44,8 @@ use output::{Format, Outcome};
 #[command(
     version,
     propagate_version = true,
-    after_help = "Exit codes: 0 ok, 1 error, 2 usage.\n\
+    after_help = "Exit codes: 0 ok, 1 error, 2 usage, 3 ps found something \
+                  wrong.\n\
                   Scripts and agents: add --json, see docs/cli.md."
 )]
 #[expect(clippy::doc_markdown, reason = "doc comments are the --help text")]
@@ -181,7 +184,7 @@ fn main() -> ExitCode {
     // Color only on a terminal, and never with NO_COLOR set.
     let color =
         io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    logger::init(level, color);
+    logger::init(level, color, log_file());
     let format = if cli.json {
         Format::Json
     } else {
@@ -197,6 +200,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn log_file() -> Option<PathBuf> {
+    let dir = dirs::hangar_dir(Base::State, &env_var).ok()?;
+    Some(dir.join(commands::LOG_FILE))
 }
 
 fn run(command: Command) -> Result<Outcome> {

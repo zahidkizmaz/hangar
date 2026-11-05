@@ -295,7 +295,11 @@ fn confirm(name: &str, doomed: &Doomed) -> Result<bool> {
 }
 
 pub(crate) fn ps(hangar: &Hangar) -> Overview {
-    status::collect(hangar)
+    let overview = status::collect(hangar);
+    for event in status::events(&overview) {
+        log::warn!("{event}");
+    }
+    overview
 }
 
 pub(crate) fn inspect(hangar: &Hangar, name: &str) -> Result<Detail> {
@@ -558,6 +562,7 @@ mod tests {
         target, up,
     };
     use crate::hangar::Hangar;
+    use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
     use crate::status::Detail;
     use crate::testing::{hangar_with, scratch_dir, settled};
@@ -713,16 +718,16 @@ mod tests {
         let hangar = proxied("cmd-ps", &sandbox);
         up(&hangar, &names(&["p"])).unwrap();
         let overview = ps(&hangar);
-        let proxies: Vec<(String, Option<String>, Option<String>)> = overview
+        let proxies: Vec<_> = overview
             .proxies
             .iter()
-            .map(|p| (p.name.clone(), p.state.clone(), p.image.clone()))
+            .map(|p| (p.name.clone(), p.state, p.image.clone()))
             .collect();
         assert_eq!(
             proxies,
             [
                 ("ext".into(), None, None),
-                ("p".into(), Some("running".into()), Some("fake:1".into()))
+                ("p".into(), Some(BoxState::Running), Some("fake:1".into()))
             ]
         );
         let Detail::Proxy(detail) = inspect(&hangar, "p").unwrap() else {

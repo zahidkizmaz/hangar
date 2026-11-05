@@ -1,7 +1,7 @@
 //! A bay: a locked-down VM that AI coding agents run in. Its only way
 //! out is its proxy, or the open internet without one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -646,15 +646,38 @@ fn sync_apps(
 }
 
 fn unlisted_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
+    Ok(listed_runs(hangar, bay)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !bay.settings.run.contains_key(name))
+        .collect())
+}
+
+/// The names of the entries whose unit is running.
+pub(crate) fn active_runs(
+    hangar: &Hangar,
+    bay: &Bay,
+) -> Result<HashSet<String>> {
+    Ok(listed_runs(hangar, bay)?
+        .into_iter()
+        .filter(|(_, active)| active == "active")
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Every entry's unit systemd knows (a failed one too) with its ACTIVE
+/// column.
+fn listed_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<(String, String)>> {
     let units = user_units(hangar, bay, LIST_RUNS, &["hangar-runs"])?;
     Ok(units
         .lines()
         .filter_map(|line| {
-            let unit = line.split_whitespace().next()?;
-            unit.strip_prefix(RUN_PREFIX)?.strip_suffix(".service")
+            let mut columns = line.split_whitespace();
+            let unit = columns.next()?;
+            let name =
+                unit.strip_prefix(RUN_PREFIX)?.strip_suffix(".service")?;
+            Some((name.to_string(), columns.nth(1)?.to_string()))
         })
-        .filter(|name| !bay.settings.run.contains_key(*name))
-        .map(String::from)
         .collect())
 }
 

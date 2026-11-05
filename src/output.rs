@@ -11,8 +11,11 @@ use crate::error::Error;
 use crate::files::Copied;
 use crate::json::{self, Json};
 use crate::lifecycle::{self, Change};
+use crate::logger;
 use crate::mounts::MountKind;
-use crate::status::{Detail, Overview};
+use crate::proxy::Health;
+use crate::sandbox::BoxState;
+use crate::status::{self, BayStatus, Detail, Overview, ProxyStatus};
 
 /// Every JSON document's `version`: 1 until the first release, then bumped
 /// when a field changes meaning or goes away.
@@ -43,19 +46,34 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    /// 1 when any change failed.
+    /// 1 when any change failed, 3 when `ps` detected an event.
     pub(crate) fn exit_code(&self) -> u8 {
         let failed = |change: &Change| {
             matches!(change.outcome, lifecycle::Outcome::Failed(_))
         };
         match self {
             Self::Changes(report) if report.changes.iter().any(failed) => 1,
+            Self::Overview(overview)
+                if !status::events(overview).is_empty() =>
+            {
+                3
+            }
             _ => 0,
         }
     }
 }
 
+/// What changed goes to the log file too, so it stays a full record.
+fn record(result: &Outcome) {
+    if matches!(result, Outcome::Changes(_) | Outcome::Copied(_)) {
+        for line in result.human().lines() {
+            log::info!(target: logger::REPORT, "{line}");
+        }
+    }
+}
+
 pub(crate) fn emit(format: Format, result: &Outcome) {
+    record(result);
     match format {
         Format::Human => {
             let text = result.human();
@@ -207,11 +225,11 @@ fn overview_rows(overview: &Overview) -> Vec<Vec<String>> {
     let header = cells(["NAME", "TYPE", "STATE", "PROXY", "IMAGE"]);
     let bays = overview.bays.iter().map(|bay| {
         let proxy = bay.proxy.as_deref().unwrap_or("direct");
-        cells([&bay.name, "bay", &bay.state, proxy, &bay.image])
+        cells([&bay.name, "bay", state_word(bay.state), proxy, &bay.image])
     });
     let proxies = overview.proxies.iter().map(|proxy| {
-        let state = proxy.state.as_deref().unwrap_or("external");
         let image = proxy.image.as_deref().unwrap_or("-");
+        let state = proxy_state(proxy).unwrap_or("external");
         cells([&proxy.name, "proxy", state, "-", image])
     });
     let leftovers = overview.leftovers.iter().map(|(resource, name)| {
@@ -228,17 +246,19 @@ fn overview_json(overview: &Overview) -> Json {
     let bays = overview.bays.iter().map(|bay| {
         json::object([
             ("name", json::string(&bay.name)),
-            ("state", json::string(&bay.state)),
+            ("state", json::string(state_word(bay.state))),
             ("proxy", optional(bay.proxy.as_deref())),
             ("image", json::string(&bay.image)),
+            ("apps", apps_json(bay)),
         ])
     });
     let proxies = overview.proxies.iter().map(|proxy| {
         json::object([
             ("name", json::string(&proxy.name)),
             ("kind", json::string(proxy.kind)),
-            ("state", optional(proxy.state.as_deref())),
+            ("state", optional(proxy_state(proxy))),
             ("image", optional(proxy.image.as_deref())),
+            ("health", optional(health_word(proxy))),
         ])
     });
     let leftovers = overview.leftovers.iter().map(|(resource, name)| {
@@ -252,6 +272,38 @@ fn overview_json(overview: &Overview) -> Json {
         ("proxies", Json::Array(proxies.collect())),
         ("leftovers", Json::Array(leftovers.collect())),
     ])
+}
+
+/// `unknown` when the sandbox couldn't tell.
+fn state_word(state: Option<BoxState>) -> &'static str {
+    state.map_or("unknown", BoxState::as_str)
+}
+
+/// `None` for a proxy that runs elsewhere.
+fn proxy_state(proxy: &ProxyStatus) -> Option<&'static str> {
+    proxy.managed.then(|| state_word(proxy.state))
+}
+
+fn health_word(proxy: &ProxyStatus) -> Option<&'static str> {
+    match proxy.health {
+        None => None,
+        Some(Health::Up) => Some("up"),
+        Some(Health::Down(_)) => Some("unreachable"),
+    }
+}
+
+fn apps_json(bay: &BayStatus) -> Json {
+    Json::Array(
+        bay.apps
+            .iter()
+            .map(|(name, state)| {
+                json::object([
+                    ("name", json::string(name)),
+                    ("state", json::string(state.as_str())),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn mode(writable: bool) -> &'static str {
@@ -273,7 +325,7 @@ fn detail_text(detail: &Detail) -> String {
             let status = &bay.status;
             text.push(format!("name: {}", status.name));
             text.push("type: bay".into());
-            text.push(format!("state: {}", status.state));
+            text.push(format!("state: {}", state_word(status.state)));
             let proxy = status.proxy.as_deref().unwrap_or("direct");
             text.push(format!("proxy: {proxy}"));
             text.push(format!("image: {}", status.image));
@@ -298,7 +350,7 @@ fn detail_text(detail: &Detail) -> String {
             text.push(format!("name: {}", status.name));
             text.push("type: proxy".into());
             text.push(format!("kind: {}", status.kind));
-            let state = status.state.as_deref().unwrap_or("external");
+            let state = proxy_state(status).unwrap_or("external");
             text.push(format!("state: {state}"));
             if let (Some(vm), Some(image)) = (&proxy.vm, &status.image) {
                 text.push(format!("vm: {vm}"));
@@ -329,7 +381,7 @@ fn detail_json(detail: &Detail) -> Json {
             document([
                 ("name", json::string(&status.name)),
                 ("type", json::string("bay")),
-                ("state", json::string(&status.state)),
+                ("state", json::string(state_word(status.state))),
                 ("proxy", optional(status.proxy.as_deref())),
                 ("image", json::string(&status.image)),
                 ("vm", json::string(&bay.vm)),
@@ -347,7 +399,7 @@ fn detail_json(detail: &Detail) -> Json {
                 ("name", json::string(&status.name)),
                 ("type", json::string("proxy")),
                 ("kind", json::string(status.kind)),
-                ("state", optional(status.state.as_deref())),
+                ("state", optional(proxy_state(status))),
                 ("image", optional(status.image.as_deref())),
                 ("vm", optional(proxy.vm.as_deref())),
                 ("data", path(&proxy.data)),
@@ -412,8 +464,9 @@ mod tests {
     use crate::commands::UpReport;
     use crate::error::Error;
     use crate::lifecycle::{self, Change, Resource};
+    use crate::sandbox::BoxState;
     use crate::status::{
-        BayStatus, Detail, Overview, ProxyDetail, ProxyStatus,
+        BayStatus, Detail, Overview, ProxyDetail, ProxyStatus, RunState,
     };
     use std::path::PathBuf;
 
@@ -488,12 +541,14 @@ mod tests {
         assert!(json.ends_with(r#""version":1}"#), "{json}");
     }
 
-    fn proxy_status(state: Option<&str>) -> ProxyStatus {
+    fn proxy_status(state: Option<BoxState>) -> ProxyStatus {
         ProxyStatus {
             name: "p".into(),
             kind: "fake",
-            state: state.map(String::from),
+            managed: state.is_some(),
+            state,
             image: state.map(|_| "fake:1".into()),
+            health: None,
         }
     }
 
@@ -502,12 +557,13 @@ mod tests {
         let overview = Outcome::Overview(Overview {
             bays: vec![BayStatus {
                 name: "work".into(),
-                state: "running".into(),
+                state: Some(BoxState::Running),
                 proxy: Some("p".into()),
                 image: "img:1".into(),
+                apps: vec![("web".into(), RunState::Exited)],
             }],
             proxies: vec![
-                proxy_status(Some("stopped")),
+                proxy_status(Some(BoxState::Stopped)),
                 ProxyStatus {
                     name: "ext".into(),
                     ..proxy_status(None)
@@ -525,7 +581,7 @@ mod tests {
         );
         assert_eq!(
             to_string(&overview.json()),
-            r#"{"bays":[{"image":"img:1","name":"work","proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"image":"fake:1","kind":"fake","name":"p","state":"stopped"},{"image":null,"kind":"fake","name":"ext","state":null}],"version":1}"#
+            r#"{"bays":[{"apps":[{"name":"web","state":"exited"}],"image":"img:1","name":"work","proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"health":null,"image":"fake:1","kind":"fake","name":"p","state":"stopped"},{"health":null,"image":null,"kind":"fake","name":"ext","state":null}],"version":1}"#
         );
     }
 
@@ -539,7 +595,7 @@ mod tests {
                 log: vm.map(|_| PathBuf::from("/d/p.log")),
             }))
         };
-        let managed = detail(Some("running"), Some("hangar-proxy-p"));
+        let managed = detail(Some(BoxState::Running), Some("hangar-proxy-p"));
         assert_eq!(
             managed.human(),
             "name: p\ntype: proxy\nkind: fake\nstate: running\n\
