@@ -103,6 +103,7 @@ impl Managed for FakeManaged {
 /// and `managed` (a flag).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
+    super::only(fields, &["port", "ca", "login", "managed"])?;
     let port = if fields.map.contains_key("port") {
         fields.number("port")?
     } else {

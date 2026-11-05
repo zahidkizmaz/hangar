@@ -1,5 +1,5 @@
-//! The files hangar keeps in `stateDir`, the layout docs/architecture.md
-//! describes under "State". The broker backend names its own files.
+//! The files hangar keeps in its data dir (`$XDG_DATA_HOME/hangar`): one
+//! folder per bay and per proxy.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions, Permissions};
@@ -20,22 +20,20 @@ impl StateDir {
         &self.0
     }
 
-    /// The credentials hangar set, one per line.
-    pub(crate) fn credential_keys(&self) -> PathBuf {
-        self.0.join("credential-keys")
-    }
-
-    /// What the tower VM was created with (`vm_record`, ports only).
-    pub(crate) fn tower_vm(&self) -> PathBuf {
-        self.0.join("tower-vm")
-    }
-
     pub(crate) fn bays(&self) -> PathBuf {
         self.0.join("bays")
     }
 
     pub(crate) fn bay(&self, name: &str) -> BayDir {
         BayDir(self.bays().join(name))
+    }
+
+    pub(crate) fn proxies(&self) -> PathBuf {
+        self.0.join("proxies")
+    }
+
+    pub(crate) fn proxy(&self, name: &str) -> ProxyDir {
+        ProxyDir(self.proxies().join(name))
     }
 
     /// Mounted read-only at `/run/hangar` in every bay.
@@ -56,13 +54,27 @@ impl BayDir {
         self.0.join("vm")
     }
 
-    pub(crate) fn files(&self) -> PathBuf {
-        self.0.join("files")
+    pub(crate) fn copies(&self) -> PathBuf {
+        self.0.join("copies")
     }
 
     /// The bay's home, mounted at pilot's home, `/home/pilot` (`home`).
     pub(crate) fn home(&self) -> PathBuf {
         self.0.join("home")
+    }
+}
+
+pub(crate) struct ProxyDir(PathBuf);
+
+impl ProxyDir {
+    /// What a managed proxy's VM was created with (`vm_record`).
+    pub(crate) fn vm(&self) -> PathBuf {
+        self.0.join("vm")
+    }
+
+    /// The proxy's own files; a managed proxy mounts it.
+    pub(crate) fn data(&self) -> PathBuf {
+        self.0.join("data")
     }
 }
 

@@ -12,6 +12,7 @@ mod files;
 mod hangar;
 mod http;
 mod json;
+mod lifecycle;
 mod lock;
 mod logger;
 mod mounts;

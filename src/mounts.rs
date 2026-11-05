@@ -12,10 +12,17 @@ use crate::files::{host_path, is_credentials_file};
 
 const HINT: &str = "see docs/configuration.md, \"Mounting folders\"";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Ro,
+    Rw,
+    Copy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountSpec {
     pub(crate) host: String,
-    pub(crate) writable: bool,
+    pub(crate) mode: Mode,
 }
 
 /// A checked mount: its source resolved, so symlinks can't hide where it
@@ -56,7 +63,7 @@ pub(crate) fn with_hangar(
         if let Some(host) = host {
             let spec = MountSpec {
                 host: host.clone(),
-                writable: true,
+                mode: Mode::Rw,
             };
             all.insert(vm.to_string(), spec);
         }
@@ -155,6 +162,7 @@ pub(crate) fn resolve(
 ) -> Result<Vec<Resolved>> {
     let checked = mounts
         .iter()
+        .filter(|(_, spec)| spec.mode != Mode::Copy)
         .map(|(vm, spec)| check(vm, spec, roots))
         .collect::<Result<Vec<_>>>()?;
     checked
@@ -189,12 +197,12 @@ fn check(
         }
         host
     };
-    check_source(&host, spec.writable, roots)
+    check_source(&host, spec.mode == Mode::Rw, roots)
         .map_err(|why| refuse(&context, &host, why))?;
     let resolved = Resolved {
         vm: vm.to_string(),
         host,
-        writable: spec.writable,
+        writable: spec.mode == Mode::Rw,
     };
     Ok((resolved, missing))
 }
@@ -377,14 +385,15 @@ pub(crate) fn status(
 ) -> Vec<MountStatus> {
     with_hangar(mounts, bay_home, bay_cache)
         .iter()
+        .filter(|(_, spec)| spec.mode != Mode::Copy)
         .map(|(vm, spec)| {
             let host = expanded(spec, home);
-            let wanted = line(vm, &resolved_host(&host), spec.writable);
+            let wanted = line(vm, &resolved_host(&host), spec.mode == Mode::Rw);
             let applied = recorded.map(|lines| lines.contains(&wanted));
             MountStatus {
                 vm: vm.clone(),
                 host,
-                writable: spec.writable,
+                writable: spec.mode == Mode::Rw,
                 kind: if bay_home.is_some() && vm == VM_HOME {
                     MountKind::Home
                 } else if bay_cache.is_some() && vm == VM_CACHE {
@@ -401,8 +410,8 @@ pub(crate) fn status(
 #[cfg(test)]
 mod tests {
     use super::{
-        MountKind, MountSpec, MountStatus, check_source, check_targets, lines,
-        overlaps, recheck, status, with_hangar,
+        Mode, MountKind, MountSpec, MountStatus, check_source, check_targets,
+        lines, overlaps, recheck, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
     use crate::testing::{roots, scratch_dir};
@@ -437,7 +446,7 @@ mod tests {
                     (*vm).to_string(),
                     MountSpec {
                         host: (*host).to_string(),
-                        writable: *writable,
+                        mode: if *writable { Mode::Rw } else { Mode::Ro },
                     },
                 )
             })
@@ -710,7 +719,7 @@ mod tests {
             all["/home/pilot"],
             MountSpec {
                 host: home.clone(),
-                writable: true,
+                mode: Mode::Rw,
             }
         );
         assert_eq!(all.len(), 2);
@@ -862,7 +871,7 @@ mod tests {
             all["/var/cache/hangar"],
             MountSpec {
                 host: cache.clone(),
-                writable: true,
+                mode: Mode::Rw,
             }
         );
         let shown =

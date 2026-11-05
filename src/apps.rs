@@ -1,16 +1,16 @@
 //! Apps as data: what an app needs in a bay (packages, env, a run entry,
-//! ports), from `config/apps/*.json` or `appDefinitions`, enabled
+//! ports), from `config/apps/*.json` or `apps`, enabled
 //! per bay by its `apps`. No code here knows an app by name.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::config::{BaySettings, Fields, checked_vars, valid_name};
+use crate::config::{BaySettings, Fields, checked_vars, valid_app_name};
 use crate::error::{Context, Result, bail};
 use crate::json::{self, Json};
 use crate::sandbox::PublishedPort;
 use miniserde::json::Object;
 
-/// The built-in definitions; `appDefinitions` replaces one whole.
+/// The built-in definitions; `apps` replaces one whole.
 const BUILTINS: [(&str, &str); 3] = [
     (
         "claude-code",
@@ -43,7 +43,7 @@ pub(crate) struct App {
     pub(crate) setup: Option<Setup>,
 }
 
-/// `appDefinitions`, every entry checked, enabled or not, so a typo fails
+/// `apps`, every entry checked, enabled or not, so a typo fails
 /// loudly; the built-ins are read when a bay names them.
 pub(crate) struct Catalog {
     defined: BTreeMap<String, AppDef>,
@@ -54,13 +54,13 @@ impl Catalog {
         let definitions = match definitions {
             None | Some(Json::Null) => Object::new(),
             Some(Json::Object(definitions)) => definitions,
-            Some(_) => bail!("config.appDefinitions: expected an object"),
+            Some(_) => bail!("apps: expected an object"),
         };
         let mut defined = BTreeMap::new();
         for (name, value) in &definitions {
-            if !valid_name(name) {
+            if !valid_app_name(name) {
                 bail!(
-                    "config.appDefinitions.{name}: names are lowercase, \
+                    "apps.{name}: names are lowercase, \
                      digits and -"
                 );
             }
@@ -160,7 +160,7 @@ fn ports(app: &str, fields: &Fields) -> Result<Vec<PublishedPort>> {
             let port = Fields::new(item, &format!("ports.{index}"))?;
             port.only(&["name", "vm", "host", "purpose", "http"])?;
             let name = port.string("name")?;
-            if !valid_name(&name) {
+            if !valid_app_name(&name) {
                 bail!("{}: names are lowercase, digits and -", port.at("name"));
             }
             let vm = port.number("vm")?;
@@ -236,9 +236,7 @@ fn bay_ports(
     for (name, host) in host_ports {
         let Some(port) = ports.iter_mut().find(|port| port.name == *name)
         else {
-            bail!(
-                "config.bays.{bay}.ports.{name}: no app of this bay publishes it"
-            );
+            bail!("bays.{bay}.ports.{name}: no app of this bay publishes it");
         };
         port.host = *host;
     }
@@ -294,35 +292,29 @@ mod tests {
             format!("unknown app hermes; known: {known}")
         );
         assert_eq!(
-            error(&one_bay(
-                r#""apps": ["hermes"]"#,
-                r#""appDefinitions": {"web": {}}"#
-            )),
+            error(&one_bay(r#""apps": ["hermes"]"#, r#""apps": {"web": {}}"#)),
             format!("unknown app hermes; known: {known}, web")
         );
         assert_eq!(
             error(&one_bay(r#""apps": ["codex", "codex"]"#, "")),
-            "config.bays.default.apps: codex is listed twice"
+            "bays.default.apps: codex is listed twice"
         );
         assert_eq!(
             error(&one_bay(r#""apps": "web""#, "")),
-            "config.bays.default.apps: expected strings"
+            "bays.default.apps: expected strings"
         );
+        assert_eq!(error(r#"{"apps": []}"#), "apps: expected an object");
         assert_eq!(
-            error(r#"{"appDefinitions": []}"#),
-            "config.appDefinitions: expected an object"
-        );
-        assert_eq!(
-            error(r#"{"appDefinitions": {"Web": {}}}"#),
-            "config.appDefinitions.Web: names are lowercase, digits and -"
+            error(r#"{"apps": {"Web": {}}}"#),
+            "apps.Web: names are lowercase, digits and -"
         );
         // Checked even when not enabled.
         assert_eq!(
-            error(r#"{"appDefinitions": {"web": {"files": {}}}}"#),
+            error(r#"{"apps": {"web": {"files": {}}}}"#),
             "app web: files: unknown setting"
         );
         assert_eq!(
-            error(r#"{"appDefinitions": {"web": []}}"#),
+            error(r#"{"apps": {"web": []}}"#),
             "app web: expected an object"
         );
     }
@@ -331,7 +323,7 @@ mod tests {
     fn a_definition_replaces_a_builtin_whole() {
         let settings = resolve_text(&one_bay(
             r#""apps": ["paperclip"]"#,
-            r#""appDefinitions": {"paperclip": {
+            r#""apps": {"paperclip": {
                   "ports": [{"name": "ui", "vm": 3100, "host": 3200,
                              "purpose": "UI", "http": false}]}}"#,
         ))
@@ -347,7 +339,7 @@ mod tests {
     #[test]
     fn definitions_are_checked_key_by_key() {
         let app = |definition: &str| {
-            error(&format!(r#"{{"appDefinitions": {{"web": {definition}}}}}"#))
+            error(&format!(r#"{{"apps": {{"web": {definition}}}}}"#))
         };
         assert_eq!(
             app(r#"{"setup": {"command": "x"}}"#),
@@ -377,9 +369,7 @@ mod tests {
     #[test]
     fn reserved_names_are_refused_in_app_env_and_bay_env() {
         let app = |env: &str| {
-            error(&format!(
-                r#"{{"appDefinitions": {{"web": {{"env": {env}}}}}}}"#
-            ))
+            error(&format!(r#"{{"apps": {{"web": {{"env": {env}}}}}}}"#))
         };
         assert_eq!(
             app(r#"{"PATH": "/x"}"#),
@@ -391,25 +381,25 @@ mod tests {
         );
         assert_eq!(
             error(&one_bay(r#""env": {"PATH": "/x"}"#, "")),
-            "config.bays.default.env.PATH: reserved for hangar"
+            "bays.default.env.PATH: reserved for hangar"
         );
         assert_eq!(
             error(&one_bay(r#""env": {"HANGAR_X": "x"}"#, "")),
-            "config.bays.default.env.HANGAR_X: reserved for hangar"
+            "bays.default.env.HANGAR_X: reserved for hangar"
         );
     }
 
-    const TWO_APPS: &str = r#""appDefinitions": {
+    const TWO_APPS: &str = r#""apps": {
         "a": {"packages": ["path:/p1", "path:/p2"],
               "env": {"MODE": "one", "A": "a"},
               "run": "a serve"},
         "b": {"packages": ["path:/p2", "path:/p3"], "env": {"MODE": "one"}}}"#;
 
     #[test]
-    fn packages_env_and_run_merge_key_by_key() {
+    fn packages_and_env_merge_key_by_key() {
         let settings = resolve_text(&one_bay(
             r#""apps": ["a", "b"], "packages": ["path:/p3", "path:/p4"],
-               "env": {"A": "mine"}, "run": {"a": "my serve", "x": "x"}"#,
+               "env": {"A": "mine"}"#,
             TWO_APPS,
         ))
         .unwrap();
@@ -420,8 +410,8 @@ mod tests {
         );
         assert_eq!(bay.env["MODE"], "one");
         assert_eq!(bay.env["A"], "mine");
-        assert_eq!(bay.run["a"], "my serve");
-        assert_eq!(bay.run["x"], "x");
+        assert_eq!(bay.run["a"], "a serve");
+        assert_eq!(bay.run.len(), 1);
     }
 
     #[test]
@@ -433,8 +423,9 @@ mod tests {
             "app b: env.MODE differs from app a's"
         );
         let apart = format!(
-            r#"{{"bays": [{{"name": "x", "apps": ["a"]}},
-                          {{"name": "y", "apps": ["b"]}}], {differing}}}"#
+            r#"{{"bays": [{{"name": "x", "proxy": null, "apps": ["a"]}},
+                          {{"name": "y", "proxy": null, "apps": ["b"]}}],
+                {differing}}}"#
         );
         let settings = resolve_text(&apart).unwrap();
         assert_eq!(settings.bays[0].env["MODE"], "one");
@@ -443,7 +434,7 @@ mod tests {
 
     #[test]
     fn ports_are_unique_per_bay_and_can_move() {
-        let web = r#""appDefinitions": {
+        let web = r#""apps": {
             "web": {"ports": [{"name": "ui", "vm": 3000, "purpose": "UI"}]},
             "admin": {"ports": [{"name": "ui", "vm": 4000, "purpose": "UI"}]}}"#;
         assert_eq!(
@@ -461,7 +452,7 @@ mod tests {
         );
         assert_eq!(
             error(&one_bay(r#""apps": ["web"], "ports": {"api": 1}"#, web)),
-            "config.bays.default.ports.api: no app of this bay publishes it"
+            "bays.default.ports.api: no app of this bay publishes it"
         );
     }
 }

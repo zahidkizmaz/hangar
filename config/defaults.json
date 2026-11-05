@@ -10,10 +10,6 @@
     "disk": "40G",
     "packages": [],
     "env": {},
-    "run": {},
-    "files": {},
-    "mounts": {},
-    "home": true,
-    "cache": true
+    "mounts": {}
   }
 }

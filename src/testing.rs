@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::config::{Settings, defaults, resolve};
 use crate::error::Result;
-use crate::hangar::Hangar;
+use crate::hangar::{Hangar, build_proxies};
 use crate::json;
 use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
@@ -46,13 +46,23 @@ pub(crate) fn config_error(config: &str) -> String {
     resolved(config).unwrap_err().to_string()
 }
 
+/// One bay `default` on the open internet.
+pub(crate) const DIRECT: &str =
+    r#"{"bays": [{"name": "default", "proxy": null}]}"#;
+
 /// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
-/// `"apps": ["web"]`), plus top-level `rest`.
+/// `"apps": ["web"]`), plus top-level `rest`. The bay is direct unless
+/// `bay` sets its own `proxy`.
 pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
-    let bay = if bay.is_empty() {
-        String::new()
+    let proxy = if bay.contains(r#""proxy""#) {
+        ""
     } else {
-        format!(", {bay}")
+        r#", "proxy": null"#
+    };
+    let bay = if bay.is_empty() {
+        proxy.to_string()
+    } else {
+        format!("{proxy}, {bay}")
     };
     let rest = if rest.is_empty() {
         String::new()
@@ -110,12 +120,16 @@ pub(crate) fn hangar_with(
     };
     let host_home = sibling("-home");
     fs::create_dir_all(&host_home).unwrap();
+    let state_dir = StateDir::new(state.to_path_buf());
+    let proxies = build_proxies(&settings, &state_dir, &host_home).unwrap();
     Hangar {
         settings,
-        state: StateDir::new(state.to_path_buf()),
+        state: state_dir,
         cache_root: sibling("-cache"),
+        state_root: sibling("-state"),
         host_home,
         sandbox,
+        proxies,
     }
 }
 

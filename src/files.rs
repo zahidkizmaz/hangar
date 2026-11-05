@@ -89,9 +89,9 @@ pub(crate) fn copy(
     bay: &Bay,
     request: &Request,
 ) -> Result<Copied> {
-    let record_path = bay.dir.files();
+    let record_path = bay.dir.copies();
     let recorded = read_hashes(&record_path);
-    let declared = &bay.settings.files;
+    let declared = &BTreeMap::<String, String>::new();
     if matches!(request, Request::Declared)
         && declared.is_empty()
         && recorded.is_empty()
@@ -149,7 +149,7 @@ fn ad_hoc_entry(
 /// The record's text: part of a `run` entry's fingerprint, so a
 /// changed config file shows up as a changed input.
 pub(crate) fn record_text(bay: &Bay) -> String {
-    fs::read_to_string(bay.dir.files()).unwrap_or_default()
+    fs::read_to_string(bay.dir.copies()).unwrap_or_default()
 }
 
 pub(crate) fn host_home() -> Result<PathBuf> {

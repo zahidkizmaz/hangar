@@ -26,15 +26,10 @@ pub(crate) struct Bay<'a> {
 }
 
 impl Bay<'_> {
-    /// The bay's own home and package cache folders, each only when it
-    /// mounts it (`home`, `cache`).
+    /// The bay's own home and package cache folders.
     pub(crate) fn own_mounts(&self) -> (Option<String>, Option<String>) {
-        let mounted =
-            |on: bool, path: &Path| on.then(|| path.display().to_string());
-        (
-            mounted(self.settings.home, &self.dir.home()),
-            mounted(self.settings.cache, &self.cache),
-        )
+        let shown = |path: &Path| Some(path.display().to_string());
+        (shown(&self.dir.home()), shown(&self.cache))
     }
 }
 
@@ -180,7 +175,7 @@ pub(crate) fn reconcile_packages(hangar: &Hangar, bay: &Bay) -> Result<()> {
         hangar.sandbox.as_ref(),
         &bay.vm,
         &bay.settings.packages,
-        bay.settings.cache,
+        true,
     )
 }
 
@@ -486,7 +481,7 @@ mod tests {
     use crate::error::Error;
     use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::{hangar_with, scratch_dir};
+    use crate::testing::{DIRECT, hangar_with, scratch_dir};
     use std::fs;
     use std::rc::Rc;
     use std::time::Duration;
@@ -522,7 +517,7 @@ mod tests {
         let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
         sandbox.reply("hangar-booted", "starting\n");
         let state = scratch_dir("bay-booting");
-        let hangar = hangar_with("{}", &state, sandbox.clone());
+        let hangar = hangar_with(DIRECT, &state, sandbox.clone());
         let bay = hangar.bay("default").unwrap();
         let error =
             wait_booted(sandbox.as_ref(), &bay, Duration::ZERO, Duration::ZERO)
@@ -543,7 +538,7 @@ mod tests {
         sandbox.reply_once("hangar-booted", Some("offline\n"));
         sandbox.reply_once("hangar-booted", Some("running\n"));
         let state = scratch_dir("bay-boot-retry");
-        let hangar = hangar_with("{}", &state, sandbox.clone());
+        let hangar = hangar_with(DIRECT, &state, sandbox.clone());
         let bay = hangar.bay("default").unwrap();
         wait_booted(sandbox.as_ref(), &bay, WAIT_TIMEOUT, Duration::ZERO)
             .unwrap();
@@ -556,7 +551,7 @@ mod tests {
             let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
             sandbox.reply("hangar-booted", said);
             let state = scratch_dir("bay-boot-fails");
-            let hangar = hangar_with("{}", &state, sandbox.clone());
+            let hangar = hangar_with(DIRECT, &state, sandbox.clone());
             let bay = hangar.bay("default").unwrap();
             let error = wait_booted(
                 sandbox.as_ref(),
@@ -580,7 +575,7 @@ mod tests {
     #[test]
     fn a_built_image_is_loaded_once() {
         let state = scratch_dir("bay-image-loader");
-        let config = r#"{"bays": [{"name": "default",
+        let config = r#"{"bays": [{"name": "default", "proxy": null,
             "image": "hangar-bay:dev", "imageLoader": "true"}]}"#;
         let sandbox = fake(&[]);
         let hangar = hangar_with(config, &state, sandbox.clone());
@@ -669,7 +664,7 @@ mod tests {
         let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
         sandbox.reply_once("hangar-docker", None);
         let state = scratch_dir("bay-docker");
-        let hangar = hangar_with("{}", &state, sandbox.clone());
+        let hangar = hangar_with(DIRECT, &state, sandbox.clone());
         let bay = hangar.bay("default").unwrap();
         wait_for_docker(sandbox.as_ref(), &bay, WAIT_TIMEOUT, Duration::ZERO)
             .unwrap();
@@ -710,37 +705,30 @@ mod tests {
     }
 
     #[test]
-    fn up_skips_the_run_of_an_app_that_needs_setup_even_if_overridden() {
+    fn up_skips_the_run_of_an_app_that_needs_setup() {
         let state = scratch_dir("setup-gate");
-        let config = r#"{"appDefinitions": {"web": {
+        let config = r#"{"apps": {"web": {
             "setup": {"command": "web init", "check": "test -f ~/.web"},
             "run": "web serve"}},
-            "bays": [{"name": "default", "apps": ["web"],
-                      "run": {"web": "web serve --dev", "db": "db serve"}}]}"#;
+            "bays": [{"name": "default", "proxy": null, "apps": ["web"]}]}"#;
         let sandbox = Rc::new(FakeSandbox::default());
         sandbox.reply("hangar-setup-check", "needed");
         let hangar = hangar_with(config, &state, sandbox.clone());
         start_runs(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        assert_eq!(started(&sandbox), ["hangar-run-db.service db serve"]);
+        assert_eq!(started(&sandbox), Vec::<String>::new());
 
         let sandbox = Rc::new(FakeSandbox::default());
         sandbox.reply("hangar-setup-check", "done");
         let hangar = hangar_with(config, &state, sandbox.clone());
         start_runs(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        assert_eq!(
-            started(&sandbox),
-            [
-                "hangar-run-db.service db serve",
-                "hangar-run-web.service web serve --dev"
-            ]
-        );
+        assert_eq!(started(&sandbox), ["hangar-run-web.service web serve"]);
     }
 
     #[test]
     fn the_env_file_is_replaced_whole_by_root() {
         let state = scratch_dir("bay-env-atomic");
         let sandbox = Rc::new(FakeSandbox::default());
-        let hangar = hangar_with("{}", &state, sandbox.clone());
+        let hangar = hangar_with(DIRECT, &state, sandbox.clone());
         write_env(&hangar, &hangar.bay("default").unwrap()).unwrap();
         assert_eq!(
             sandbox.changes(),

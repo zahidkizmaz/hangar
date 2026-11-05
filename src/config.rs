@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::apps::{self, App};
 use crate::dirs::{self, Base};
 use crate::error::{Context, Result, bail};
 use crate::files;
-use crate::mounts::{self, MountSpec};
+use crate::mounts::{self, Mode, MountSpec};
+use crate::proxy::{self, Location, Spec};
 use crate::sandbox::PublishedPort;
 use crate::secret::{SECRET_PREFIXES, find_secret};
 use miniserde::json::Object;
@@ -17,13 +18,16 @@ use crate::json::{self, Json};
 const DEFAULTS: &str = include_str!("../config/defaults.json");
 
 pub(crate) const INITIAL_CONFIG: &str = r#"{
-  "bays": [{ "name": "default", "apps": [], "packages": [] }]
+  "proxies": {},
+  "bays": [{ "name": "default", "proxy": null, "apps": [] }]
 }
 "#;
 
-const TOP_LEVEL: [&str; 4] = ["bays", "appDefinitions", "sandbox", "stateDir"];
-const BAY_KEYS: [&str; 16] = [
+const TOP_LEVEL: [&str; 5] = ["proxies", "defaults", "bays", "apps", "sandbox"];
+const DEFAULTS_KEYS: [&str; 1] = ["proxy"];
+const BAY_KEYS: [&str; 13] = [
     "name",
+    "proxy",
     "apps",
     "ports",
     "image",
@@ -34,11 +38,7 @@ const BAY_KEYS: [&str; 16] = [
     "disk",
     "packages",
     "env",
-    "run",
-    "files",
     "mounts",
-    "home",
-    "cache",
 ];
 
 /// Reads a non-empty environment variable; tests pass their own lookup.
@@ -51,13 +51,24 @@ pub(crate) fn env_var(name: &str) -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct Settings {
     pub(crate) sandbox_backend: String,
+    pub(crate) proxies: BTreeMap<String, ProxySettings>,
     pub(crate) bays: Vec<BaySettings>,
-    pub(crate) state_dir: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProxySettings {
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) location: Location,
+    /// The entry as written; the kind reads its own options from it.
+    pub(crate) raw: Json,
 }
 
 #[derive(Debug)]
 pub(crate) struct BaySettings {
     pub(crate) name: String,
+    /// `None`: the open internet.
+    pub(crate) proxy: Option<String>,
     pub(crate) apps: Vec<App>,
     pub(crate) ports: Vec<PublishedPort>,
     /// The config's `ports`: app port name -> host port.
@@ -70,13 +81,9 @@ pub(crate) struct BaySettings {
     pub(crate) disk: String,
     pub(crate) packages: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
+    /// The apps' run entries: app name -> command.
     pub(crate) run: BTreeMap<String, String>,
-    /// Config files copied into the VM on every `up`: VM path (`~`
-    /// expanded) -> host path.
-    pub(crate) files: BTreeMap<String, String>,
     pub(crate) mounts: BTreeMap<String, MountSpec>,
-    pub(crate) home: bool,
-    pub(crate) cache: bool,
 }
 
 impl BaySettings {
@@ -120,16 +127,18 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     let Json::Object(mut config) = config else {
         bail!("config must be a JSON object");
     };
-    Fields::new(&Json::Object(config.clone()), "config")?.only(&TOP_LEVEL)?;
+    Fields::new(&Json::Object(config.clone()), "")?.only(&TOP_LEVEL)?;
     let Json::Object(mut merged) = defaults else {
         bail!("built-in defaults must be a JSON object");
     };
     let bay_defaults = merged.remove("bay").context("defaults: no bay")?;
-    let catalog = apps::Catalog::new(config.remove("appDefinitions"))?;
+    let catalog = apps::Catalog::new(config.remove("apps"))?;
+    let proxies = proxy_settings(config.remove("proxies"))?;
+    let default_proxy = default_proxy(config.remove("defaults"), &proxies)?;
     let bays = config.remove("bays");
     let mut merged = Json::Object(merged);
     merge(&mut merged, Json::Object(config));
-    let top = Fields::new(&merged, "config")?;
+    let top = Fields::new(&merged, "")?;
 
     let bays = bay_entries(bays)?
         .into_iter()
@@ -147,18 +156,124 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    top.object("sandbox")?.only(&["backend"])?;
     let mut settings = Settings {
         sandbox_backend: top.object("sandbox")?.string("backend")?,
+        proxies,
         bays: Vec::new(),
-        state_dir: top.optional_string("stateDir")?,
     };
-    top.object("sandbox")?.only(&["backend"])?;
     for (bay, apps) in bays.iter().zip(&enabled) {
-        let mut bay = BaySettings::from_json(bay)?;
+        let proxy =
+            bay_proxy(bay, default_proxy.as_deref(), &settings.proxies)?;
+        let mut bay = BaySettings::from_json(bay, proxy)?;
         apps::apply(&mut bay, apps)?;
         settings.bays.push(bay);
     }
+    one_namespace(&settings)?;
     Ok(settings)
+}
+
+/// Each entry: its kind and location read, its options checked by the kind.
+fn proxy_settings(
+    proxies: Option<Json>,
+) -> Result<BTreeMap<String, ProxySettings>> {
+    let entries = match proxies {
+        None | Some(Json::Null) => Object::new(),
+        Some(Json::Object(entries)) => entries,
+        Some(_) => bail!("proxies: expected an object"),
+    };
+    let mut settings = BTreeMap::new();
+    for (name, raw) in entries {
+        let path = format!("proxies.{name}");
+        if !valid_name(&name) {
+            bail!("{path}: {}", NAME_RULE);
+        }
+        let fields = Fields::new(&raw, &path)?;
+        let kind = fields.string("kind")?;
+        let location = proxy::location(&fields)?;
+        let spec = Spec {
+            name: &name,
+            fields,
+            location: location.clone(),
+            home: Path::new(""),
+            data: PathBuf::new(),
+        };
+        proxy::build(&spec).map(drop)?;
+        let entry = ProxySettings {
+            name: name.clone(),
+            kind,
+            location,
+            raw,
+        };
+        settings.insert(name, entry);
+    }
+    Ok(settings)
+}
+
+fn default_proxy(
+    defaults: Option<Json>,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<Option<String>> {
+    let Some(defaults) = defaults else {
+        return Ok(None);
+    };
+    let fields = Fields::new(&defaults, "defaults")?;
+    fields.only(&DEFAULTS_KEYS)?;
+    let name = fields.optional_string("proxy")?;
+    if let Some(name) = &name {
+        known_proxy(&fields.at("proxy"), name, proxies)?;
+    }
+    Ok(name)
+}
+
+fn known_proxy(
+    path: &str,
+    name: &str,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<()> {
+    if proxies.contains_key(name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = proxies.keys().map(String::as_str).collect();
+    let known = if known.is_empty() {
+        "none".to_string()
+    } else {
+        known.join(", ")
+    };
+    bail!("{path}: no proxy \"{name}\"; known: {known}")
+}
+
+/// The bay's `proxy`: a name, `null` for direct, or the default's.
+fn bay_proxy(
+    bay: &Json,
+    default: Option<&str>,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<Option<String>> {
+    let bay = Fields::new(bay, &bay_path(bay))?;
+    bay.only(&BAY_KEYS)?;
+    let name = match bay.map.get("proxy") {
+        Some(Json::Null) => return Ok(None),
+        Some(Json::String(name)) => name.as_str(),
+        Some(_) => bail!("{}: expected a proxy name or null", bay.at("proxy")),
+        None => default.context(format!(
+            "{}: no proxy; set \"proxy\", defaults.proxy, or \
+             \"proxy\": null for direct internet",
+            bay.path()
+        ))?,
+    };
+    known_proxy(&bay.at("proxy"), name, proxies)?;
+    Ok(Some(name.to_string()))
+}
+
+fn one_namespace(settings: &Settings) -> Result<()> {
+    let shared = settings
+        .bays
+        .iter()
+        .find(|bay| settings.proxies.contains_key(&bay.name));
+    if let Some(bay) = shared {
+        bail!("name \"{}\" is used by a bay and a proxy", bay.name);
+    }
+    Ok(())
 }
 
 /// `bays` as given; none (absent, `null` or `[]`) is one bay, `default`.
@@ -166,23 +281,20 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
     let items = match bays {
         None | Some(Json::Null) => Vec::new(),
         Some(Json::Array(items)) => items.into_iter().collect(),
-        Some(_) => bail!("config.bays: expected a list"),
+        Some(_) => bail!("bays: expected a list"),
     };
     if items.is_empty() {
         return Ok(vec![json::object([("name", json::string("default"))])]);
     }
     let mut names = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
-        let entry = Fields::new(item, &format!("config.bays.{index}"))?;
+        let entry = Fields::new(item, &format!("bays.{index}"))?;
         let name = entry.string("name")?;
-        if !valid_bay_name(&name) {
-            bail!(
-                "config.bays.{index}.name: {name:?}: lowercase letters and \
-                 digits, joined by single -, at most 32 characters"
-            );
+        if !valid_name(&name) {
+            bail!("bays.{index}.name: {name:?}: {NAME_RULE}");
         }
         if !names.insert(name.clone()) {
-            bail!("config.bays: two bays named {name}");
+            bail!("bays: two bays named {name}");
         }
     }
     Ok(items)
@@ -191,28 +303,18 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
 fn bay_path(bay: &Json) -> String {
     match bay {
         Json::Object(bay) if let Some(Json::String(name)) = bay.get("name") => {
-            format!("config.bays.{name}")
+            format!("bays.{name}")
         }
-        _ => "config.bays".to_string(),
+        _ => "bays".to_string(),
     }
-}
-
-pub(crate) fn state_dir(settings: &Settings, var: Var) -> Result<PathBuf> {
-    if let Some(dir) = var("HANGAR_STATE_DIR") {
-        return Ok(dir.into());
-    }
-    if let Some(dir) = settings.state_dir.as_ref().filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    dirs::hangar_dir(Base::Data, var)
 }
 
 impl BaySettings {
-    fn from_json(value: &Json) -> Result<Self> {
+    fn from_json(value: &Json, proxy: Option<String>) -> Result<Self> {
         let bay = Fields::new(value, &bay_path(value))?;
-        bay.only(&BAY_KEYS)?;
         let settings = Self {
             name: bay.string("name")?,
+            proxy,
             apps: Vec::new(),
             ports: Vec::new(),
             host_ports: host_ports(&bay)?,
@@ -224,17 +326,10 @@ impl BaySettings {
             disk: bay.string("disk")?,
             packages: bay.strings("packages")?,
             env: checked_vars(&bay, "env")?,
-            run: bay_run(&bay)?,
-            files: bay_files(&bay)?,
+            run: BTreeMap::new(),
             mounts: bay_mounts(&bay)?,
-            home: bay.boolean("home")?,
-            cache: bay.boolean("cache")?,
         };
-        mounts::check_targets(
-            &settings.mounts,
-            settings.home,
-            settings.files.keys(),
-        )?;
+        mounts::check_targets(&settings.mounts, true, std::iter::empty())?;
         Ok(settings)
     }
 }
@@ -306,10 +401,20 @@ pub(crate) fn checked_vars(
     Ok(vars)
 }
 
-/// A bay name: `[a-z0-9]+(-[a-z0-9]+)*`, at most 32 characters. It ends up
-/// in VM and file names and the vault agent `hangar-<name>`, whose rule
-/// (3–64 characters, no leading, trailing or doubled `-`) it always meets.
-pub(crate) fn valid_bay_name(name: &str) -> bool {
+/// `[a-z0-9-]+`: app names.
+pub(crate) fn valid_app_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+const NAME_RULE: &str = "lowercase letters and digits, joined by single -, \
+                         at most 32 characters";
+
+/// A bay or proxy name, one namespace: `[a-z0-9]+(-[a-z0-9]+)*`, at most
+/// 32 characters. It ends up in VM and file names.
+pub(crate) fn valid_name(name: &str) -> bool {
     name.len() <= 32
         && name.split('-').all(|part| {
             !part.is_empty()
@@ -317,13 +422,6 @@ pub(crate) fn valid_bay_name(name: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         })
-}
-
-pub(crate) fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn host_ports(bay: &Fields) -> Result<BTreeMap<String, u16>> {
@@ -338,26 +436,13 @@ fn host_ports(bay: &Fields) -> Result<BTreeMap<String, u16>> {
         .collect()
 }
 
-fn bay_run(bay: &Fields) -> Result<BTreeMap<String, String>> {
-    let run = bay.string_map("run")?;
-    if let Some(name) = run.keys().find(|name| !valid_name(name)) {
-        bail!(
-            "{}.{name}: names are lowercase, digits and -",
-            bay.at("run")
-        );
+fn mount_mode(entry: &Fields) -> Result<Mode> {
+    match entry.map.get("mode") {
+        Some(Json::String(mode)) if mode == "ro" => Ok(Mode::Ro),
+        Some(Json::String(mode)) if mode == "rw" => Ok(Mode::Rw),
+        Some(Json::String(mode)) if mode == "copy" => Ok(Mode::Copy),
+        _ => bail!("{}: expected ro, rw or copy", entry.at("mode")),
     }
-    Ok(run)
-}
-
-fn bay_files(bay: &Fields) -> Result<BTreeMap<String, String>> {
-    bay.string_map("files")?
-        .into_iter()
-        .map(|(vm, host)| {
-            let expanded = files::vm_path(&vm)
-                .context(format!("{}.{vm}", bay.at("files")))?;
-            Ok((expanded, host))
-        })
-        .collect()
 }
 
 fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
@@ -370,11 +455,11 @@ fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
         .keys()
         .map(|vm| {
             let entry = entries.object(vm)?;
-            entry.only(&["host", "writable"])?;
+            entry.only(&["host", "mode"])?;
             let expanded = files::vm_path(vm).context(entries.at(vm))?;
             let spec = MountSpec {
                 host: entry.string("host")?,
-                writable: entry.flag_or("writable", false)?,
+                mode: mount_mode(&entry)?,
             };
             Ok((expanded, spec))
         })
@@ -423,14 +508,6 @@ impl<'a> Fields<'a> {
     pub(crate) fn string(&self, key: &str) -> Result<String> {
         self.optional_string(key)?
             .context(format!("{}: expected a string", self.at(key)))
-    }
-
-    /// Strict: `null` is refused, never read as absent.
-    fn boolean(&self, key: &str) -> Result<bool> {
-        match self.map.get(key) {
-            Some(Json::Bool(value)) => Ok(*value),
-            _ => bail!("{}: expected true or false", self.at(key)),
-        }
     }
 
     pub(crate) fn optional_string(&self, key: &str) -> Result<Option<String>> {
@@ -510,8 +587,18 @@ mod tests {
     use super::*;
 
     use crate::testing::{
-        config_error as error, one_bay, settings as resolve_with, vars,
+        DIRECT, config_error as error, one_bay, settings as resolve_with, vars,
     };
+
+    const FAKE: &str = r#"{"kind": "fake", "run": "managed"}"#;
+
+    /// `bays` (a JSON fragment) with a proxy `p` and `defaults.proxy`.
+    fn with_default_proxy(bays: &str) -> String {
+        format!(
+            r#"{{"proxies": {{"p": {FAKE}}}, "defaults": {{"proxy": "p"}},
+                 {bays}}}"#
+        )
+    }
 
     fn names(settings: &Settings) -> Vec<&str> {
         settings.bays.iter().map(|bay| bay.name.as_str()).collect()
@@ -529,8 +616,8 @@ mod tests {
 
     #[test]
     fn no_bays_is_one_bay_named_default() {
-        for config in ["{}", r#"{"bays": null}"#, r#"{"bays": []}"#] {
-            let settings = resolve_with(config);
+        for bays in [r#""apps": {}"#, r#""bays": null"#, r#""bays": []"#] {
+            let settings = resolve_with(&with_default_proxy(bays));
             assert_eq!(names(&settings), ["default"]);
             assert_eq!(settings.bays[0].cpus, 4);
         }
@@ -538,10 +625,10 @@ mod tests {
 
     #[test]
     fn bays_keep_their_order_and_each_gets_the_defaults() {
-        let settings = resolve_with(
-            r#"{"bays": [{"name": "work", "cpus": 8}, {"name": "oss"},
-                         {"name": "a-1"}]}"#,
-        );
+        let settings = resolve_with(&with_default_proxy(
+            r#""bays": [{"name": "work", "cpus": 8}, {"name": "oss"},
+                        {"name": "a-1"}]"#,
+        ));
         assert_eq!(names(&settings), ["work", "oss", "a-1"]);
         assert_eq!(settings.bays[0].cpus, 8);
         assert_eq!(settings.bays[0].memory, "6G");
@@ -552,18 +639,18 @@ mod tests {
     fn bay_names_are_required_unique_and_well_formed() {
         assert_eq!(
             error(r#"{"bays": [{"cpus": 2}]}"#),
-            "config.bays.0.name: expected a string"
+            "bays.0.name: expected a string"
         );
         assert_eq!(
             error(r#"{"bays": [{"name": "a"}, {"name": "a"}]}"#),
-            "config.bays: two bays named a"
+            "bays: two bays named a"
         );
-        assert_eq!(error(r#"{"bays": {}}"#), "config.bays: expected a list");
+        assert_eq!(error(r#"{"bays": {}}"#), "bays: expected a list");
         for good in ["a", "a-b-1", &"a".repeat(32)] {
-            assert!(valid_bay_name(good), "{good}");
+            assert!(valid_name(good), "{good}");
         }
         for bad in ["", "A", "x-", "-x", "a--b", "a_b", &"a".repeat(33)] {
-            assert!(!valid_bay_name(bad), "{bad}");
+            assert!(!valid_name(bad), "{bad}");
             let config = format!(r#"{{"bays": [{{"name": "{bad}"}}]}}"#);
             assert!(error(&config).contains("lowercase letters and digits"));
         }
@@ -573,10 +660,7 @@ mod tests {
     fn misplaced_keys_are_refused() {
         for key in ["bay", "credentialFiles", "tower"] {
             let config = format!(r#"{{"{key}": {{}}}}"#);
-            assert_eq!(
-                error(&config),
-                format!("config.{key}: unknown setting")
-            );
+            assert_eq!(error(&config), format!("{key}: unknown setting"));
         }
     }
 
@@ -584,15 +668,15 @@ mod tests {
     fn bad_bay_values_name_the_bay() {
         assert_eq!(
             error(&one_bay(r#""packages": ["a", 1]"#, "")),
-            "config.bays.default.packages: expected strings"
+            "bays.default.packages: expected strings"
         );
         assert_eq!(
             error(&one_bay(r#""cpus": 8.5"#, "")),
-            "config.bays.default.cpus: expected a whole number"
+            "bays.default.cpus: expected a whole number"
         );
         assert_eq!(
             error(&one_bay(r#""cpu": 8"#, "")),
-            "config.bays.default.cpu: unknown setting"
+            "bays.default.cpu: unknown setting"
         );
     }
 
@@ -624,82 +708,28 @@ mod tests {
     }
 
     #[test]
-    fn home_and_cache_are_on_or_off_never_a_path() {
-        let bay = |config: &str| resolve_with(config).bays.remove(0);
-        let unset = bay("{}");
-        assert_eq!((unset.home, unset.cache), (true, true));
-        let off = bay(&one_bay(r#""home": false, "cache": false"#, ""));
-        assert_eq!((off.home, off.cache), (false, false));
-        for value in ["null", r#""~/h""#, "1"] {
-            let message = error(&one_bay(&format!(r#""cache": {value}"#), ""));
-            assert_eq!(
-                message,
-                "config.bays.default.cache: expected true or false"
-            );
-        }
-        let mount = one_bay(
-            r#""mounts": {"~/data": {"host": "~/d", "writable": null}}"#,
-            "",
-        );
-        assert!(!bay(&mount).mounts["/home/pilot/data"].writable);
-    }
-
-    #[test]
-    fn state_dir_order() {
-        let settings = resolve_with(r#"{"stateDir": "/from/config"}"#);
-        let env = vars(&[("HOME", "/h"), ("HANGAR_STATE_DIR", "/from/env")]);
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/from/env")
-        );
-        let env = vars(&[("HOME", "/h")]);
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/from/config")
-        );
-        let settings = resolve_with("{}");
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/h/.local/share/hangar")
-        );
-    }
-
-    #[test]
-    fn module_fixture_is_a_valid_config() {
-        let settings = resolve_with(include_str!("../tests/module.json"));
-        let bay = &settings.bays[0];
-        assert_eq!(
-            bay.packages,
-            [
-                "github:numtide/llm-agents.nix#claude-code",
-                "github:numtide/llm-agents.nix#codex"
-            ]
-        );
-        assert_eq!(bay.ports[0].name, "web");
-        let mount = &bay.mounts["/home/pilot/.app-data"];
-        assert_eq!(
-            (mount.host.as_str(), mount.writable),
-            ("~/work/app-data", true)
-        );
-    }
-
-    #[test]
     fn mounts_are_validated_when_the_config_loads() {
         for (mounts, why) in [
             (
-                r#"{"~/a": {"host": "~/a", "rw": true}}"#,
+                r#"{"~/a": {"host": "~/a", "mode": "ro", "rw": true}}"#,
                 "rw: unknown setting",
             ),
-            (r#"{"~/a": {"writable": true}}"#, "host: expected a string"),
+            (r#"{"~/a": {"mode": "rw"}}"#, "host: expected a string"),
             (
-                r#"{"~/a": {"host": "~/a", "writable": "yes"}}"#,
-                "expected true or false",
+                r#"{"/run/hangar/x": {"host": "~/a", "mode": "ro"}}"#,
+                "must be in ~",
             ),
-            (r#"{"/run/hangar/x": {"host": "~/a"}}"#, "must be in ~"),
-            (r#"{"/etc/profile.d": {"host": "~/a"}}"#, "must be in ~"),
-            (r#"{"~/../etc": {"host": "~/a"}}"#, "'..' isn't allowed"),
             (
-                r#"{"~/a": {"host": "~/a"}, "~/a/b": {"host": "~/b"}}"#,
+                r#"{"/etc/profile.d": {"host": "~/a", "mode": "ro"}}"#,
+                "must be in ~",
+            ),
+            (
+                r#"{"~/../etc": {"host": "~/a", "mode": "ro"}}"#,
+                "'..' isn't allowed",
+            ),
+            (
+                r#"{"~/a": {"host": "~/a", "mode": "ro"},
+                    "~/a/b": {"host": "~/b", "mode": "ro"}}"#,
                 "overlap",
             ),
         ] {
@@ -714,7 +744,7 @@ mod tests {
         let image = |config: &str| resolve_with(config).bays[0].image_ref();
         let version = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            image("{}"),
+            image(DIRECT),
             format!("ghcr.io/zahidkizmaz/hangar-bay:v{version}")
         );
         assert_eq!(
@@ -734,9 +764,10 @@ mod tests {
             panic!("not an object")
         };
         let keys: Vec<&String> = top.keys().collect();
-        assert_eq!(keys, ["bays"]);
+        assert_eq!(keys, ["bays", "proxies"]);
         let settings = resolve_with(INITIAL_CONFIG);
         assert_eq!(names(&settings), ["default"]);
+        assert_eq!(settings.bays[0].proxy, None);
         assert_eq!(settings.bays[0].packages, Vec::<String>::new());
     }
 
@@ -749,16 +780,140 @@ mod tests {
                 error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#), ""));
             assert!(message.contains("looks like a real secret"), "{message}");
         }
-        let ok = resolve_with(&one_bay(
-            r#""env": {"T": "placeholder value"}, "run": {"paper-clip2": "x"}"#,
-            "",
-        ));
+        let ok =
+            resolve_with(&one_bay(r#""env": {"T": "placeholder value"}"#, ""));
         assert_eq!(ok.bays[0].env["T"], "placeholder value");
-        assert_eq!(ok.bays[0].run["paper-clip2"], "x");
-        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#, ""));
+    }
+
+    #[test]
+    fn bay_proxy_absent_uses_the_default() {
+        let config = with_default_proxy(r#""bays": [{"name": "work"}]"#);
+        let settings = resolve_with(&config);
+        assert_eq!(settings.bays[0].proxy.as_deref(), Some("p"));
+        assert_eq!(settings.proxies["p"].kind, "fake");
+    }
+
+    #[test]
+    fn bay_proxy_null_means_direct() {
+        let config =
+            with_default_proxy(r#""bays": [{"name": "work", "proxy": null}]"#);
+        assert_eq!(resolve_with(&config).bays[0].proxy, None);
+    }
+
+    #[test]
+    fn bay_without_any_proxy_choice_is_an_error() {
         assert_eq!(
-            name,
-            "config.bays.default.run.Bad Name: names are lowercase, digits and -"
+            error(r#"{"bays": [{"name": "work"}]}"#),
+            "bays.work: no proxy; set \"proxy\", defaults.proxy, or \
+             \"proxy\": null for direct internet"
         );
+    }
+
+    #[test]
+    fn unknown_proxy_name_is_an_error() {
+        let config = r#"{"proxies": {"infi": {"kind": "fake", "run": "managed"}},
+            "bays": [{"name": "work", "proxy": "nope"}]}"#;
+        assert_eq!(
+            error(config),
+            "bays.work.proxy: no proxy \"nope\"; known: infi"
+        );
+        let config = r#"{"defaults": {"proxy": "nope"}}"#;
+        assert_eq!(
+            error(config),
+            "defaults.proxy: no proxy \"nope\"; known: none"
+        );
+        assert_eq!(
+            error(&one_bay(r#""proxy": 3"#, "")),
+            "bays.default.proxy: expected a proxy name or null"
+        );
+    }
+
+    #[test]
+    fn names_are_one_namespace() {
+        let config = format!(
+            r#"{{"proxies": {{"work": {FAKE}}},
+                 "bays": [{{"name": "work", "proxy": null}}]}}"#
+        );
+        assert_eq!(
+            error(&config),
+            "name \"work\" is used by a bay and a proxy"
+        );
+    }
+
+    #[test]
+    fn proxy_names_follow_the_bay_name_rule() {
+        let config = format!(r#"{{"proxies": {{"Bad": {FAKE}}}}}"#);
+        assert!(error(&config).starts_with("proxies.Bad: lowercase"));
+        assert_eq!(error(r#"{"proxies": []}"#), "proxies: expected an object");
+    }
+
+    #[test]
+    fn mount_mode_must_be_ro_rw_or_copy() {
+        let mount = |entry: &str| {
+            one_bay(&format!(r#""mounts": {{"~/code": {entry}}}"#), "")
+        };
+        let expected =
+            "bays.default.mounts.~/code.mode: expected ro, rw or copy";
+        for entry in [
+            r#"{"host": "~/c", "mode": "writable"}"#,
+            r#"{"host": "~/c"}"#,
+            r#"{"host": "~/c", "mode": 1}"#,
+        ] {
+            assert_eq!(error(&mount(entry)), expected, "{entry}");
+        }
+        for (mode, want) in
+            [("ro", Mode::Ro), ("rw", Mode::Rw), ("copy", Mode::Copy)]
+        {
+            let entry = format!(r#"{{"host": "~/c", "mode": "{mode}"}}"#);
+            let bay = resolve_with(&mount(&entry)).bays.remove(0);
+            assert_eq!(bay.mounts["/home/pilot/code"].mode, want);
+        }
+    }
+
+    #[test]
+    fn old_keys_are_unknown() {
+        for (key, config) in [
+            ("files", one_bay(r#""files": {}"#, "")),
+            ("tower", r#"{"tower": {}}"#.to_string()),
+            ("appDefinitions", r#"{"appDefinitions": {}}"#.to_string()),
+            ("stateDir", r#"{"stateDir": "/x"}"#.to_string()),
+            ("home", one_bay(r#""home": false"#, "")),
+            ("cache", one_bay(r#""cache": false"#, "")),
+            ("run", one_bay(r#""run": {}"#, "")),
+        ] {
+            let path = if config.contains("bays") {
+                format!("bays.default.{key}")
+            } else {
+                key.to_string()
+            };
+            assert_eq!(
+                error(&config),
+                format!("{path}: unknown setting"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_kind_options_are_checked_by_the_kind() {
+        let config = r#"{"proxies": {"p":
+            {"kind": "fake", "run": "managed", "zzz": 1}}}"#;
+        assert_eq!(error(config), "proxies.p.zzz: unknown setting");
+        let config =
+            r#"{"proxies": {"p": {"kind": "nope", "run": "managed"}}}"#;
+        assert_eq!(
+            error(config),
+            "proxies.p.kind: unknown kind \"nope\"; known: fake"
+        );
+    }
+
+    #[test]
+    fn apps_key_replaces_app_definitions() {
+        let config = one_bay(
+            r#""apps": ["paperclip"]"#,
+            r#""apps": {"paperclip": {"packages": ["x"]}}"#,
+        );
+        let bay = resolve_with(&config).bays.remove(0);
+        assert_eq!(bay.packages, ["x"]);
     }
 }

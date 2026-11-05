@@ -42,9 +42,11 @@ fn init_writes_a_minimal_config_once() {
     let machine = Machine::new("init");
     ok(&machine.hangar(&["init"], &[]));
     let config = read(default_config(&machine));
-    assert!(config.contains(r#""packages": []"#), "{config}");
-    assert!(!config.contains("image"), "{config}");
-    assert!(!config.contains("vault"), "{config}");
+    assert_eq!(
+        config,
+        "{\n  \"proxies\": {},\n  \"bays\": \
+         [{ \"name\": \"default\", \"proxy\": null, \"apps\": [] }]\n}\n"
+    );
 
     let error = failed(&machine.hangar(&["init"], &[]));
     assert!(error.contains("exists"), "{error}");

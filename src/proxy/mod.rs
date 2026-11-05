@@ -55,6 +55,7 @@ pub(crate) struct ManagedVm {
     pub(crate) entrypoint: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) enum Location {
     Managed,
     External(String),
@@ -66,6 +67,14 @@ pub(crate) struct Spec<'a> {
     pub(crate) location: Location,
     pub(crate) home: &'a Path,
     pub(crate) data: PathBuf,
+}
+
+/// The keys every kind accepts; a kind adds its own to [`only`].
+pub(crate) const CORE_KEYS: [&str; 3] = ["kind", "run", "url"];
+
+/// Refuses any key that is neither a core key nor one of `own`.
+pub(crate) fn only(fields: &Fields, own: &[&str]) -> Result<()> {
+    fields.only(&[&CORE_KEYS[..], own].concat())
 }
 
 pub(crate) type Build = fn(&Spec) -> Result<Box<dyn Proxy>>;
