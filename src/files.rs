@@ -77,8 +77,8 @@ pub(crate) enum Request<'a> {
     },
 }
 
-pub(crate) fn copy_declared(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    copy(hangar, bay, &Request::Declared).map(drop)
+pub(crate) fn copy_declared(hangar: &Hangar, bay: &Bay) -> Result<Copied> {
+    copy(hangar, bay, &Request::Declared)
 }
 
 /// The one way files reach the VM: every caller (`up`, `copy`, `restart`)

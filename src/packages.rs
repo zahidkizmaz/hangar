@@ -47,7 +47,7 @@ pub(crate) fn reconcile(
     vm: &str,
     desired: &[String],
     cache: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let vm = Vm { sandbox, name: vm };
     let record = tracked_path();
     let read = ["/bin/sh", "-c", READ_TRACKED, "hangar-packages", &record];
@@ -60,16 +60,18 @@ pub(crate) fn reconcile(
         remove.extend(plan.remove.iter().map(String::as_str));
         exec(vm, &remove)?;
     }
-    let installs = !plan.install.is_empty();
-    apply(
+    let removed = plan.remove.iter().map(|element| format!("-{element}"));
+    let removed: Vec<String> = removed.collect();
+    let added = apply(
         plan,
         |installable| install(vm, installable, cache),
         |tracked| save(vm, tracked),
     )?;
-    if cache && installs {
+    if cache && !added.is_empty() {
         fill_cache(vm);
     }
-    Ok(())
+    let added = added.into_iter().map(|element| format!("+{element}"));
+    Ok(added.chain(removed).collect())
 }
 
 /// The cache only saves time: a failed copy never fails `up`.
@@ -83,21 +85,23 @@ fn fill_cache(vm: Vm) {
 }
 
 /// Saves the record after every step, so a failed install can't orphan the
-/// ones before it.
+/// ones before it; the elements it added.
 fn apply(
     plan: Plan,
     mut install: impl FnMut(&str) -> Result<Option<String>>,
     mut save: impl FnMut(&Tracked) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut tracked = plan.keep;
     save(&tracked)?;
+    let mut added = Vec::new();
     for installable in &plan.install {
         if let Some(element) = install(installable)? {
-            tracked.insert(installable.clone(), element);
+            tracked.insert(installable.clone(), element.clone());
             save(&tracked)?;
+            added.push(element);
         }
     }
-    Ok(())
+    Ok(added)
 }
 
 /// The new profile element, or none when it was already installed by hand
@@ -322,7 +326,7 @@ mod tests {
             keep: Tracked::new(),
         };
         let mut saved = Vec::new();
-        apply(
+        let added = apply(
             plan,
             |_| Ok(None),
             |record| {
@@ -332,5 +336,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(saved, [Tracked::new()]);
+        assert_eq!(added, Vec::<String>::new());
     }
 }

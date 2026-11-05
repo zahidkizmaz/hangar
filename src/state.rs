@@ -35,15 +35,6 @@ impl StateDir {
     pub(crate) fn proxy(&self, name: &str) -> ProxyDir {
         ProxyDir(self.proxies().join(name))
     }
-
-    /// Mounted read-only at `/run/hangar` in every bay.
-    pub(crate) fn guest(&self) -> PathBuf {
-        self.0.join("guest")
-    }
-
-    pub(crate) fn ca(&self) -> PathBuf {
-        self.guest().join("ca.pem")
-    }
 }
 
 pub(crate) struct BayDir(PathBuf);
