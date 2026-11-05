@@ -61,6 +61,7 @@ let
       {
         name = "oss";
         proxy = null;
+        imageRepository = "ghcr.io/example/hangar-bay";
         disk = "60G";
         # A stub: the test checks the rendering, not the image.
         imagePackage = {

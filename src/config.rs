@@ -622,6 +622,7 @@ mod tests {
         };
         assert_eq!(default.proxy.as_deref(), Some("vault"));
         assert_eq!(oss.proxy, None);
+        assert_eq!(oss.image_repository, "ghcr.io/example/hangar-bay");
         let modes: Vec<Mode> =
             default.mounts.values().map(|mount| mount.mode).collect();
         assert_eq!(modes, [Mode::Copy, Mode::Ro, Mode::Rw]);

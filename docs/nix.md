@@ -34,11 +34,13 @@ options and renders them 1:1 into `hangar.json`:
 - `proxies`: free-form per kind (see [proxy-kinds.md](proxy-kinds.md));
 - `defaults.proxy`;
 - `bays`: `name`, `proxy`, `apps`, `packages`, `env`, `mounts` (`host`
-  and `mode`, `ro` by default), `ports`, `image`, `imagePackage`, `cpus`,
-  `memory`, `disk`. Two modules' `bays` lists concatenate. A bay's
-  `proxy` is written only when you set it: unset means `defaults.proxy`,
-  `null` the open internet;
-- `apps`: your own apps;
+  and `mode`, `ro` by default), `ports`, `image`, `imageRepository`,
+  `imageLoader`, `cpus`, `memory`, `disk`, plus the Nix-only
+  `imagePackage`, which sets `image` and `imageLoader`. Null options are
+  left out. Two modules' `bays` lists concatenate. A bay's `proxy` is
+  written only when you set it: unset means `defaults.proxy`, `null` the
+  open internet;
+- `apps`: your own apps, free-form (every app key);
 - `sandbox.backend`;
 
 plus:

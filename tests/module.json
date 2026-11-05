@@ -33,6 +33,7 @@
     {
       "name": "oss",
       "proxy": null,
+      "imageRepository": "ghcr.io/example/hangar-bay",
       "disk": "60G",
       "image": "example/bay:dev",
       "imageLoader": "/nix/store/00000000000000000000000000000000-bay-image"

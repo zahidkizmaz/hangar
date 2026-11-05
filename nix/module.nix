@@ -139,6 +139,25 @@ let
           '';
         };
 
+        imageRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "ghcr.io/example/hangar-bay";
+          description = ''
+            Where the release image is, when `image` is null. Null: the
+            CLI's default (`ghcr.io/zahidkizmaz/hangar-bay`).
+          '';
+        };
+
+        imageLoader = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = ''
+            A program that streams an image archive, loaded before the VM
+            is created when `image` is missing. `imagePackage` sets it.
+          '';
+        };
+
         imagePackage = mkOption {
           type = types.nullOr types.package;
           default = null;
@@ -187,6 +206,8 @@ let
               env
               ports
               image
+              imageRepository
+              imageLoader
               cpus
               memory
               disk
