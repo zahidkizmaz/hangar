@@ -248,6 +248,7 @@ fn plan(
             roots,
             copies: &mut copies,
             total: &mut total,
+            entries: 0,
             visiting: BTreeSet::new(),
         };
         walk.collect(&host, vm)?;
@@ -272,6 +273,9 @@ struct Walk<'a> {
     roots: &'a Roots,
     copies: &'a mut Vec<FileCopy>,
     total: &'a mut u64,
+    /// Every entry visited, directories included: a web of directory
+    /// links can't make the walk exponential.
+    entries: usize,
     /// The canonical directories above the current one: meeting one again
     /// is a loop, while the same target linked twice is fine.
     visiting: BTreeSet<PathBuf>,
@@ -283,7 +287,10 @@ impl Walk<'_> {
         let host = &fs::canonicalize(link).context(link.display())?;
         mounts::check_hangar_dirs(host, self.roots)
             .map_err(|why| refuse(host, why))?;
-        if is_credentials_file(host) || is_credentials_file(Path::new(vm)) {
+        if [host, link, Path::new(vm)]
+            .into_iter()
+            .any(is_credentials_file)
+        {
             return Err(refuse(host, "looks like a credentials file"));
         }
         let meta = fs::metadata(host).context(host.display())?;
@@ -309,6 +316,10 @@ impl Walk<'_> {
         names.sort();
         for name in names {
             let child = host.join(&name);
+            self.entries += 1;
+            if self.entries > MAX_FILES {
+                return Err(refuse(&child, "takes files past 1000 files"));
+            }
             let Some(name) =
                 name.to_str().filter(|n| !n.contains(['\n', '\t']))
             else {
@@ -638,6 +649,31 @@ mod tests {
             error.contains("looks like a credential (sk-ant-)"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn copy_refuses_links_by_their_own_name_and_dir_webs() {
+        let home = fs::canonicalize(scratch_dir("files-names")).unwrap();
+        fs::create_dir_all(home.join("dotfiles/kube")).unwrap();
+        fs::write(home.join("dotfiles/kube/config"), "x").unwrap();
+        link(&home.join("dotfiles/kube"), &home.join(".kube"));
+        let error = planned(&home, "~/.kube").unwrap_err().to_string();
+        assert!(error.contains("credentials file"), "{error}");
+
+        fs::create_dir_all(home.join("web/l12")).unwrap();
+        fs::write(home.join("web/l12/f"), "x").unwrap();
+        for level in (0..12).rev() {
+            let dir = home.join(format!("web/l{level}"));
+            fs::create_dir_all(&dir).unwrap();
+            for name in ["a", "b"] {
+                link(
+                    &home.join(format!("web/l{}", level + 1)),
+                    &dir.join(name),
+                );
+            }
+        }
+        let error = planned(&home, "~/web/l0").unwrap_err().to_string();
+        assert!(error.contains("past 1000 files"), "{error}");
     }
 
     #[test]

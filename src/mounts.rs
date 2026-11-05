@@ -216,8 +216,32 @@ fn check(
             .context(format!("{context}: {}", configured.display()))?
     };
     let file = host.is_file();
-    check_source(&host, spec.mode == Mode::Rw, roots)
+    if !missing && !file && !host.is_dir() {
+        return Err(refuse(
+            &context,
+            &host,
+            "isn't a regular file or directory",
+        ));
+    }
+    let writable = spec.mode == Mode::Rw;
+    check_source(&host, writable, roots)
         .map_err(|why| refuse(&context, &host, why))?;
+    // A stow link's own name counts too: `~/.bashrc` is host config
+    // wherever it points. Hangar's own folders are exempt, as in
+    // `check_source`.
+    let own =
+        host.starts_with(&roots.bay_home) || host.starts_with(&roots.bay_cache);
+    if !own {
+        check_source(&configured, writable, roots)
+            .map_err(|why| refuse(&context, &configured, why))?;
+    }
+    if file && is_credentials_file(Path::new(vm)) {
+        return Err(refuse(
+            &context,
+            Path::new(vm),
+            "holds credentials or keys",
+        ));
+    }
     let resolved = Resolved {
         vm: vm.to_string(),
         host,
@@ -657,6 +681,75 @@ mod tests {
         let shown = status(&set, None, None, &home, Some(&recorded));
         assert_eq!(shown[0].applied, Some(true));
         assert!(recheck(&recorded, &roots).is_ok());
+    }
+
+    fn stowed(home: &Path, link_name: &str, target: &str, dir: bool) {
+        let target = home.join(target);
+        if dir {
+            fs::create_dir_all(&target).unwrap();
+        } else {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, "x").unwrap();
+        }
+        std::os::unix::fs::symlink(&target, home.join(link_name)).unwrap();
+    }
+
+    #[test]
+    fn stowed_dot_paths_are_judged_by_their_name_when_writable() {
+        let home = fs::canonicalize(scratch_dir("mount-stow-dot")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        stowed(&home, ".bashrc", "dotfiles/bash/.bashrc", false);
+        stowed(&home, ".config", "dotfiles/config", true);
+        for host in ["~/.bashrc", "~/.config"] {
+            let rw = BTreeMap::from([(
+                "/home/pilot/x".into(),
+                spec(host, Mode::Rw),
+            )]);
+            let error = resolve(&rw, &roots).unwrap_err().to_string();
+            assert!(error.contains("keep config"), "{host}: {error}");
+            let ro = BTreeMap::from([(
+                "/home/pilot/x".into(),
+                spec(host, Mode::Ro),
+            )]);
+            assert!(resolve(&ro, &roots).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn stowed_credentials_are_refused_by_their_link_name() {
+        let home = fs::canonicalize(scratch_dir("mount-stow-cred")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        stowed(&home, ".git-credentials", "dotfiles/git-creds", false);
+        let set = BTreeMap::from([(
+            "/home/pilot/x".into(),
+            spec("~/.git-credentials", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("credentials"), "{error}");
+        stowed(&home, "innocent", "dotfiles/plain", false);
+        let set = BTreeMap::from([(
+            "/home/pilot/.netrc".into(),
+            spec("~/innocent", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn sockets_are_neither_files_nor_directories() {
+        let home = fs::canonicalize(scratch_dir("mount-socket")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(home.join("sock")).unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/s".into(),
+            spec("~/sock", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(
+            error.contains("isn't a regular file or directory"),
+            "{error}"
+        );
     }
 
     #[test]
