@@ -14,8 +14,12 @@ services.hangar = {
   proxies.vault = {
     kind = "infisical";
     run = "managed";
+    # NixOS with agenix (owner = your user, see below):
     proxyTokenFile = "/run/agenix/infisical-proxy-token";
     sessionTokenFile = "/run/agenix/infisical-session-token";
+    # nix-darwin: plain files only you can read (chmod 600):
+    # proxyTokenFile = "~/.secrets/infisical-proxy-token";
+    # sessionTokenFile = "~/.secrets/infisical-session-token";
   };
   defaults.proxy = "vault";
   bays = [
@@ -25,6 +29,19 @@ services.hangar = {
   ];
 };
 ```
+
+hangar runs as your user (a user service or agent), so it must be able
+to read the token files. agenix's default files are root-owned 0400,
+which it can't: on NixOS set `age.secrets.<name>.owner` to your user. On
+nix-darwin, keep plain files instead:
+
+```sh
+mkdir -p ~/.secrets && chmod 700 ~/.secrets
+# paste each token into its file, then:
+chmod 600 ~/.secrets/infisical-proxy-token ~/.secrets/infisical-session-token
+```
+
+hangar never mounts or copies these files into a bay.
 
 ## Options
 
