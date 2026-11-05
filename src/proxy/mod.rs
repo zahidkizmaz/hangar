@@ -12,6 +12,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::config::Fields;
 use crate::error::{Context, Error, Result, bail};
+use crate::http;
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
 
@@ -127,24 +128,23 @@ pub(crate) fn proxy_vm(name: &str) -> String {
 
 pub(crate) fn loopback_port(url: &str) -> Result<u16> {
     let expected = || format!("{url}: expected http://127.0.0.1:<port>");
-    let rest = url.strip_prefix("http://").context(expected())?;
-    let (host, port) = rest.split_once(':').context(expected())?;
-    if !matches!(host, "127.0.0.1" | "localhost") {
+    let (host, port) = http::http_authority(url).context(expected())?;
+    if !http::is_loopback_host(&host) {
         return Err(Error::with_hint(
             format!("{url}: remote proxies aren't supported yet"),
             "see docs/proxy-kinds.md",
         ));
     }
-    port.trim_end_matches('/').parse().ok().context(expected())
+    port.context(expected())
 }
 
 /// What a bay needs of `proxy` (none: the open internet).
 pub(crate) fn access(
-    proxy: Option<&dyn Proxy>,
+    proxy: Option<(&str, &dyn Proxy)>,
     bay: &str,
     host_alias: &str,
 ) -> Result<Access> {
-    let Some(proxy) = proxy else {
+    let Some((name, proxy)) = proxy else {
         return Ok(Access {
             url: None,
             ca_pem: None,
@@ -153,7 +153,7 @@ pub(crate) fn access(
     };
     let ca_pem = proxy.ca()?;
     if let Some(pem) = &ca_pem {
-        ca::verify(pem, None).context(format!("proxy {}", proxy.kind()))?;
+        ca::verify(pem, None).context(format!("proxy {name}"))?;
     }
     let egress = proxy.egress();
     let login = proxy.login(bay)?;
@@ -309,7 +309,13 @@ mod tests {
              supported yet: see docs/proxy-kinds.md"
         );
         assert_eq!(error.hint(), Some("see docs/proxy-kinds.md"));
-        for url in ["https://127.0.0.1:1", "http://127.0.0.1", "ftp://x"] {
+        assert!(loopback_port("http://127.0.0.1.evil.com:1").is_err());
+        for url in [
+            "https://127.0.0.1:1",
+            "http://127.0.0.1",
+            "ftp://x",
+            "http://127.0.0.1:80@evil.com:1",
+        ] {
             let error = error_of(loopback_port(url));
             assert!(error.contains("expected http://"), "{error}");
         }
@@ -347,7 +353,7 @@ mod tests {
             login: Some(("u".into(), "pw".into())),
             ..FakeProxy::at(5)
         };
-        let access = access(Some(&proxy), "w", "host").unwrap();
+        let access = access(Some(("p", &proxy)), "w", "host").unwrap();
         assert_eq!(access.url.unwrap().expose(), "http://u:pw@host:5");
         assert_eq!(access.ca_pem, Some(pem));
         assert_eq!(access.egress, Egress::HostPort(5));
@@ -359,8 +365,23 @@ mod tests {
             ca: Some(b"nope".to_vec()),
             ..FakeProxy::at(5)
         };
-        let error = error_of(access(Some(&proxy), "w", "host"));
-        assert_eq!(error, "proxy fake: CA isn't a PEM certificate");
+        let error = error_of(access(Some(("p", &proxy)), "w", "host"));
+        assert_eq!(error, "proxy p: CA isn't a PEM certificate");
+    }
+
+    #[test]
+    fn access_refuses_a_ca_that_is_not_exactly_one_certificate() {
+        let cert = include_str!("testdata/ca.pem");
+        let key = "-----BEGIN PRIVATE KEY-----\nAAAA\n\
+                   -----END PRIVATE KEY-----\n";
+        for pem in [format!("{cert}{cert}"), format!("{cert}{key}")] {
+            let proxy = FakeProxy {
+                ca: Some(pem.into_bytes()),
+                ..FakeProxy::at(5)
+            };
+            let error = error_of(access(Some(("p", &proxy)), "w", "host"));
+            assert_eq!(error, "proxy p: CA must be exactly one certificate");
+        }
     }
 
     #[test]
@@ -369,7 +390,7 @@ mod tests {
             login: Some(("u".into(), "hunter2".into())),
             ..FakeProxy::at(5)
         };
-        let access = access(Some(&proxy), "w", "host").unwrap();
+        let access = access(Some(("p", &proxy)), "w", "host").unwrap();
         let shown = format!("{:?}", access.url);
         assert!(!shown.contains("hunter2"), "{shown}");
     }
@@ -390,7 +411,8 @@ mod tests {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         rust_files(&src, &mut files);
-        let forbidden = ["infisical", "agent-vault", "agent_vault", "kind == "];
+        let forbidden =
+            ["infisical", "agent-vault", "agent_vault", "kind() == "];
         let offenders: Vec<String> = files
             .iter()
             .filter(|path| !path.starts_with(src.join("proxy")))

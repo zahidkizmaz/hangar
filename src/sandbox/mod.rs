@@ -55,7 +55,11 @@ impl Egress {
     pub(crate) fn from_record(text: &str) -> Option<Self> {
         match text.split_once(':') {
             None if text == "open" => Some(Self::Open),
-            Some(("host", port)) => port.parse().ok().map(Self::HostPort),
+            Some(("host", port))
+                if port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                port.parse().ok().map(Self::HostPort)
+            }
             _ => None,
         }
     }
@@ -189,7 +193,7 @@ mod tests {
         for egress in [Egress::Open, Egress::HostPort(5)] {
             assert_eq!(Egress::from_record(&egress.record()), Some(egress));
         }
-        for text in ["host:x", "remote:a:1", "", "host"] {
+        for text in ["host:x", "host:+5", "host:", "remote:a:1", "", "host"] {
             assert_eq!(Egress::from_record(text), None, "{text}");
         }
     }

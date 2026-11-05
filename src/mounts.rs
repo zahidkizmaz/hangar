@@ -719,12 +719,12 @@ mod tests {
         assert!(
             shown
                 .iter()
-                .any(|m| m.vm == "/home/pilot" && MountKind::Home == m.kind)
+                .any(|m| m.vm == "/home/pilot" && m.kind == MountKind::Home)
         );
         assert!(
             shown
                 .iter()
-                .any(|m| m.vm != "/home/pilot" && MountKind::User == m.kind)
+                .any(|m| m.vm != "/home/pilot" && m.kind == MountKind::User)
         );
     }
 
@@ -867,6 +867,6 @@ mod tests {
         );
         let shown =
             status(&BTreeMap::new(), None, Some(&cache), Path::new(HOME), None);
-        assert!(shown.iter().all(|m| MountKind::Cache == m.kind));
+        assert!(shown.iter().all(|m| m.kind == MountKind::Cache));
     }
 }

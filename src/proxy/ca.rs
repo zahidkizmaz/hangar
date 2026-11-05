@@ -89,7 +89,7 @@ fn der(pem: &[u8]) -> Result<CertificateDer<'static>> {
         .context("CA isn't a PEM certificate")
 }
 
-/// Lowercase hex of the SHA-256 of the first certificate's DER.
+/// Lowercase hex of the SHA-256 of the certificate's DER.
 pub(crate) fn fingerprint(pem: &[u8]) -> Result<String> {
     let hash = digest(&SHA256, der(pem)?.as_ref());
     Ok(hash.as_ref().iter().fold(String::new(), |mut hex, byte| {
@@ -103,8 +103,19 @@ fn normalized(pin: &str) -> String {
     hex.replace(':', "").to_lowercase()
 }
 
+/// Everything in the PEM reaches a bay, so the pin must cover all of it.
+fn only_one_certificate(pem: &[u8]) -> Result<()> {
+    let blocks = String::from_utf8_lossy(pem).matches("-----BEGIN ").count();
+    let certificates = CertificateDer::pem_slice_iter(pem).count();
+    if blocks != 1 || certificates != 1 {
+        bail!("CA must be exactly one certificate");
+    }
+    Ok(())
+}
+
 pub(crate) fn verify(pem: &[u8], sha256: Option<&str>) -> Result<()> {
     let actual = fingerprint(pem)?;
+    only_one_certificate(pem)?;
     match sha256.map(normalized) {
         Some(pinned) if pinned != actual => {
             bail!("CA sha256 {actual} doesn't match pinned {pinned}")
@@ -152,6 +163,19 @@ mod tests {
             error,
             format!("CA sha256 {FINGERPRINT} doesn't match pinned abcd")
         );
+    }
+
+    #[test]
+    fn a_bundle_or_a_key_is_not_a_ca() {
+        let key =
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        for pem in [format!("{PEM}{PEM}"), format!("{PEM}{key}")] {
+            for pin in [None, Some(FINGERPRINT)] {
+                let error =
+                    verify(pem.as_bytes(), pin).err().unwrap().to_string();
+                assert_eq!(error, "CA must be exactly one certificate");
+            }
+        }
     }
 
     #[test]

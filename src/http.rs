@@ -99,11 +99,24 @@ pub(crate) fn call(
     Ok(response.body)
 }
 
+/// The host and port of a plain-http URL without userinfo or a bare path.
+pub(crate) fn http_authority(url: &str) -> Option<(String, Option<u16>)> {
+    let uri: http::Uri = url.parse().ok()?;
+    let authority = uri.authority()?;
+    let plain = uri.scheme_str() == Some("http")
+        && !authority.as_str().contains('@')
+        && uri.query().is_none();
+    plain.then(|| (authority.host().to_string(), authority.port_u16()))
+}
+
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost")
+}
+
 /// A GET for a CA: https, or http to this machine.
 pub(crate) fn fetch(url: &str, timeout: Duration) -> Result<Response> {
-    let loopback = url
-        .strip_prefix("http://127.0.0.1")
-        .is_some_and(|rest| rest.starts_with([':', '/']) || rest.is_empty());
+    let loopback =
+        http_authority(url).is_some_and(|(host, _)| is_loopback_host(&host));
     if !loopback && !url.starts_with("https://") {
         bail!("CA URL must be https, or http on 127.0.0.1");
     }
@@ -186,7 +199,9 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::{Https, MAX_BODY, agent, https};
+    use super::{
+        Https, MAX_BODY, agent, fetch, http_authority, https, is_loopback_host,
+    };
     use crate::testing::{closed_port, serve_each};
     use std::net::TcpListener;
     use std::time::Duration;
@@ -202,6 +217,24 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", closed_port());
         let error = Https::get(&client, &url).err().unwrap().to_string();
         assert!(error.contains("https only"), "{error}");
+    }
+
+    #[test]
+    fn fetch_refuses_urls_that_only_look_like_loopback() {
+        for url in [
+            "http://127.0.0.1:80@evil.com/ca",
+            "http://127.0.0.1.evil.com/ca",
+            "http://user@127.0.0.1/ca",
+            "http://example.com/ca",
+        ] {
+            let error = fetch(url, Duration::from_secs(1)).err().unwrap();
+            assert!(error.to_string().starts_with("CA URL must be"), "{url}");
+        }
+        for url in ["http://127.0.0.1:8080/ca", "http://localhost:8080/ca"] {
+            assert!(http_authority(url).is_some_and(|(host, port)| {
+                is_loopback_host(&host) && port == Some(8080)
+            }));
+        }
     }
 
     #[test]

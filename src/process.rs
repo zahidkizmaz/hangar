@@ -61,7 +61,7 @@ pub(crate) fn describe(command: &Command) -> String {
 
 pub(crate) fn spawn_error(command: &Command, error: &std::io::Error) -> Error {
     let program = command.get_program().to_string_lossy();
-    if error.kind() == ErrorKind::NotFound {
+    if matches!(error.kind(), ErrorKind::NotFound) {
         Error::new(format!("{program} not found on PATH"))
     } else {
         Error::new(format!("could not run {program}: {error}"))
