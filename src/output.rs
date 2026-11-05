@@ -628,10 +628,10 @@ mod tests {
 
     #[test]
     fn errors_as_json_keep_the_hint_apart() {
-        let hinted = Error::with_hint("the vault isn't running", "run up");
+        let hinted = Error::with_hint("the proxy isn't running", "run up");
         assert_eq!(
             to_string(&error_json(&hinted)),
-            r#"{"error":"the vault isn't running","hint":"run up"}"#
+            r#"{"error":"the proxy isn't running","hint":"run up"}"#
         );
         assert_eq!(
             to_string(&error_json(&Error::new("plain"))),

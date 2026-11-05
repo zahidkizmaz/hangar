@@ -369,8 +369,8 @@ mod tests {
     #[test]
     fn create_args_open_egress_has_no_net_flags() {
         let spec = VmSpec {
-            name: "hangar-tower",
-            image: "vault",
+            name: "hangar-proxy-p",
+            image: "proxy",
             cpus: 1,
             memory: "512M",
             disk: None,
@@ -380,7 +380,7 @@ mod tests {
             egress: Egress::Open,
             publish: &[(14321, 14321), (14322, 14322)],
             mounts: &[Mount {
-                host: Path::new("/state/vault"),
+                host: Path::new("/state/p"),
                 guest: "/data",
                 mode: MountMode::ReadWrite,
                 owner: Some((65532, 65532)),
@@ -392,9 +392,9 @@ mod tests {
             create_args(&spec),
             [
                 "create",
-                "vault",
+                "proxy",
                 "--name",
-                "hangar-tower",
+                "hangar-proxy-p",
                 "-q",
                 "--replace",
                 "--cpus",
@@ -406,7 +406,7 @@ mod tests {
                 "-p",
                 "127.0.0.1:14322:14322",
                 "--mount-dir",
-                "/state/vault:/data:uid=65532,gid=65532",
+                "/state/p:/data:uid=65532,gid=65532",
                 "-e",
                 "HOME=/data",
             ]
@@ -530,8 +530,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            exec_args("hangar-tower", None, "--no-tty"),
-            ["exec", "--no-tty", "hangar-tower", "--"]
+            exec_args("hangar-proxy-p", None, "--no-tty"),
+            ["exec", "--no-tty", "hangar-proxy-p", "--"]
         );
     }
 

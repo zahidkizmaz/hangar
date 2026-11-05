@@ -334,7 +334,7 @@ pub(crate) fn valid_key(key: &str) -> bool {
 
 /// Real-looking secrets don't belong in `env`: the VM sees them. A
 /// placeholder is one short value, so this is stricter than the scan of
-/// `files`: any credential prefix counts, and so does a long token.
+/// copied files: any secret prefix counts, and so does a long token.
 fn looks_like_a_secret(value: &str) -> bool {
     SECRET_PREFIXES
         .iter()

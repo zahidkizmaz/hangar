@@ -1,6 +1,5 @@
 //! One hangar at a time: commands that change state hold an exclusive
-//! lock on `$XDG_STATE_HOME/hangar/lock`, outside `stateDir`, which
-//! `destroy --state` deletes.
+//! lock on `$XDG_STATE_HOME/hangar/lock`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;

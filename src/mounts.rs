@@ -121,8 +121,7 @@ pub(crate) fn check_targets(
 }
 
 /// What the rules check a source against, all resolved: the user's home,
-/// the two roots (`stateDir`, the package cache root) and this bay's own
-/// home and cache.
+/// hangar's data and cache dirs, and this bay's own home and cache.
 #[derive(Debug)]
 pub(crate) struct Roots {
     pub(crate) home: PathBuf,
@@ -493,7 +492,7 @@ mod tests {
             ("/home/you", false, "your home or above"),
             ("/home/you/.local/share/hangar", false, "hangar's own state"),
             (
-                "/home/you/.local/share/hangar/vault",
+                "/home/you/.local/share/hangar/proxies/p",
                 true,
                 "hangar's own state",
             ),
@@ -962,7 +961,10 @@ mod tests {
                 ("/home/you/.cache/hangar/bays/default-2", "package caches"),
                 ("/home/you/.local/share", "hangar's own state"),
                 ("/home/you/.local/share/hangar", "hangar's own state"),
-                ("/home/you/.local/share/hangar/vault", "hangar's own state"),
+                (
+                    "/home/you/.local/share/hangar/proxies/p",
+                    "hangar's own state",
+                ),
                 ("/home/you/.local/share/hangar/guest", "hangar's own state"),
                 ("/home/you/.local/share/hangar/bays", "hangar's own state"),
                 (

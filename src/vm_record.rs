@@ -1,7 +1,6 @@
-//! What a VM was created with, as `key\tvalue` lines in `stateDir`
-//! (`bays/<name>/vm`, `tower-vm`): its image, egress, ports and mounts are
-//! fixed at create, so later `up`s compare against this instead of asking
-//! the sandbox.
+//! What a VM was created with, as `key\tvalue` lines in its `vm` file:
+//! its image, egress, ports and mounts are fixed at create, so later `up`s
+//! compare against this instead of asking the sandbox.
 
 use std::fmt::Write as _;
 use std::fs;
