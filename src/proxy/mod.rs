@@ -9,6 +9,7 @@ mod fake;
 mod http;
 pub(crate) mod managed;
 
+use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,10 +20,10 @@ use crate::config::Fields;
 use crate::error::{Context, Error, Result, bail};
 use crate::http::{http_authority, is_loopback_host};
 use crate::sandbox::{Egress, MountMode, Sandbox};
-use crate::secret::Secret;
+use crate::secret::{Secret, trim_line_end};
 
 pub(crate) struct Login {
-    pub(crate) user: String,
+    pub(crate) user: Secret,
     pub(crate) password: Secret,
 }
 
@@ -166,6 +167,16 @@ pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
     }
 }
 
+/// A token file without its line end; an empty one is an error.
+pub(crate) fn read_token(path: &Path) -> Result<Secret> {
+    let text = fs::read_to_string(path).context(path.display())?;
+    let token = trim_line_end(&text);
+    if token.trim().is_empty() {
+        bail!("{} is empty", path.display());
+    }
+    Ok(Secret::new(token.to_string()))
+}
+
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Up when something accepts connections on the loopback `port`.
@@ -231,7 +242,7 @@ pub(crate) fn proxy_url(
         return None;
     };
     let userinfo = login.map_or_else(String::new, |login| {
-        let user = utf8_percent_encode(&login.user, USERINFO);
+        let user = utf8_percent_encode(login.user.expose(), USERINFO);
         let password = utf8_percent_encode(login.password.expose(), USERINFO);
         format!("{user}:{password}@")
     });
@@ -268,7 +279,7 @@ mod tests {
 
     fn login(user: &str, password: &str) -> Login {
         Login {
-            user: user.into(),
+            user: Secret::new(user.into()),
             password: Secret::new(password.into()),
         }
     }
@@ -299,7 +310,7 @@ mod tests {
         assert_eq!(proxy.ca().unwrap(), Some(b"pem".to_vec()));
         let login = proxy.login("w").unwrap().unwrap();
         assert_eq!(
-            (login.user.as_str(), login.password.expose()),
+            (login.user.expose(), login.password.expose()),
             ("u", "p:q")
         );
         assert!(matches!(proxy.health(), Health::Up));

@@ -66,7 +66,7 @@ impl Proxy for FakeProxy {
 
     fn login(&self, _bay: &str) -> Result<Option<Login>> {
         Ok(self.login.as_ref().map(|(user, password)| Login {
-            user: user.clone(),
+            user: Secret::new(user.clone()),
             password: Secret::new(password.clone()),
         }))
     }

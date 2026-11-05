@@ -1,15 +1,16 @@
 //! An Agent Vault that already runs on the host. A bay logs in with a
 //! token the user minted and a vault name: `http://<token>:<vault>@host`.
 
-use std::fs;
 use std::path::PathBuf;
 
 use super::ca::CaSpec;
-use super::{Health, Login, Proxy, Spec, external_url, loopback_port, only};
-use crate::error::{Context, Result};
+use super::{
+    Health, Login, Proxy, Spec, external_url, loopback_port, only, read_token,
+};
+use crate::error::Result;
 use crate::files;
 use crate::sandbox::Egress;
-use crate::secret::{Secret, trim_line_end};
+use crate::secret::Secret;
 
 struct AgentVault {
     port: u16,
@@ -32,10 +33,8 @@ impl Proxy for AgentVault {
     }
 
     fn login(&self, _bay: &str) -> Result<Option<Login>> {
-        let path = &self.token_file;
-        let text = fs::read_to_string(path).context(path.display())?;
         Ok(Some(Login {
-            user: trim_line_end(&text).to_string(),
+            user: read_token(&self.token_file)?,
             password: Secret::new(self.vault.clone()),
         }))
     }
@@ -108,7 +107,8 @@ mod tests {
         assert_eq!(proxy.kind(), "agent-vault");
         assert_eq!(proxy.egress(), Egress::HostPort(14322));
         let login = proxy.login("work").unwrap().unwrap();
-        assert_eq!(login.user, "av_tok-1");
+        assert_eq!(login.user.expose(), "av_tok-1");
+        assert!(!format!("{:?}", login.user).contains("av_tok"));
         assert_eq!(login.password.expose(), "default");
         assert!(format!("{:?}", login.password).find("default").is_none());
         let named = with_token("t", r#", "vault": "ops""#).unwrap();
@@ -151,6 +151,15 @@ mod tests {
         .unwrap();
         let error = proxy.login("work").err().unwrap();
         assert!(error.to_string().starts_with("/nope/token: "), "{error}");
+    }
+
+    #[test]
+    fn agent_vault_empty_token_file_is_an_error() {
+        for empty in ["", "\n", " \r\n"] {
+            let proxy = with_token(empty, "").unwrap();
+            let error = proxy.login("work").err().unwrap().to_string();
+            assert!(error.ends_with("/token is empty"), "{error}");
+        }
     }
 
     #[test]
