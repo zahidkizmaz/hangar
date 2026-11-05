@@ -91,11 +91,15 @@ fn der(pem: &[u8]) -> Result<CertificateDer<'static>> {
 
 /// Lowercase hex of the SHA-256 of the certificate's DER.
 pub(crate) fn fingerprint(pem: &[u8]) -> Result<String> {
-    let hash = digest(&SHA256, der(pem)?.as_ref());
-    Ok(hash.as_ref().iter().fold(String::new(), |mut hex, byte| {
+    Ok(sha256_hex(der(pem)?.as_ref()))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let hash = digest(&SHA256, bytes);
+    hash.as_ref().iter().fold(String::new(), |mut hex, byte| {
         let _ = write!(hex, "{byte:02x}");
         hex
-    }))
+    })
 }
 
 fn normalized(pin: &str) -> String {

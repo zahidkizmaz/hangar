@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::ca::{CaSource, CaSpec};
+use super::ca::{CaSource, CaSpec, sha256_hex};
 use super::{
     Health, Location, Login, Managed, ManagedVm, Proxy, Spec, only, read_token,
 };
@@ -13,7 +13,6 @@ use crate::files;
 use crate::http;
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
-use crate::state::fnv;
 
 /// One line, so Renovate can bump it.
 const IMAGE: &str = "infisical/cli:0.44.15@sha256:846fabd4c4a27e116fc8138f147d3029dd88662602b40373ff21d14b84e81783";
@@ -29,10 +28,10 @@ const ENTRYPOINT: &str = "/bin/sh";
 
 /// The token comes on stdin, never argv: the proxy reads it from the
 /// environment only. `$1` is the optional domain.
-const START: &str = r#"IFS= read -r INFISICAL_AGENT_VAULT_PROXY_TOKEN
+const START: &str = r#"IFS= read -r INFISICAL_AGENT_VAULT_PROXY_TOKEN || exit 1
 export INFISICAL_AGENT_VAULT_PROXY_TOKEN
 setsid infisical agent-vault proxy --data-dir /data --listen-host 0.0.0.0 \
-  ${1:+--domain "$1"} >/data/proxy.log 2>&1 &"#;
+  ${1:+--domain "$1"} >>/data/proxy.log 2>&1 &"#;
 
 struct Infisical {
     image: String,
@@ -97,7 +96,7 @@ impl Managed for Infisical {
                 DATA.into(),
                 MountMode::ReadWrite,
             )],
-            fingerprint: fnv(self.proxy_token.expose().bytes()),
+            fingerprint: sha256_hex(self.proxy_token.expose().as_bytes()),
             entrypoint: Some(ENTRYPOINT.into()),
         }
     }
@@ -237,6 +236,8 @@ mod tests {
             "{call}"
         );
         assert!(call.contains(r#"${1:+--domain "$1"}"#), "{call}");
+        assert!(call.contains("TOKEN || exit 1"), "{call}");
+        assert!(call.contains(">>/data/proxy.log"), "{call}");
     }
 
     #[test]
@@ -268,7 +269,8 @@ mod tests {
         let fingerprint =
             || files.built("").unwrap().managed().unwrap().vm().fingerprint;
         let before = fingerprint();
-        assert!(!before.contains("SECRET"), "{before}");
+        assert_eq!(before, sha256_hex(b"pt-SECRET-1"));
+        assert_eq!(before.len(), 64);
         std::fs::write(files.dir.join("proxy"), "pt-SECRET-1").unwrap();
         assert_eq!(fingerprint(), before);
         std::fs::write(files.dir.join("proxy"), "pt-SECRET-3\n").unwrap();
