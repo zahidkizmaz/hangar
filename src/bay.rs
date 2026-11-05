@@ -263,7 +263,7 @@ fn create(
             guest: &mount.vm,
             mode: MountMode::writable(mount.writable),
             owner: (mount.vm != VM_CACHE).then_some((PILOT_ID, PILOT_ID)),
-            file: false,
+            file: mount.file,
         })
         .collect();
     let publish: Vec<(u16, u16)> = wanted

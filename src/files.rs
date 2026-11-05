@@ -1,7 +1,7 @@
 //! `files`: config files copied from the host into a bay. Secrets never
 //! go in: a refusal stops the whole step before anything is copied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -91,7 +91,7 @@ pub(crate) fn copy(
 ) -> Result<Copied> {
     let record_path = bay.dir.copies();
     let recorded = read_hashes(&record_path);
-    let declared = &BTreeMap::<String, String>::new();
+    let declared = mounts::copies(&bay.settings.mounts);
     if matches!(request, Request::Declared)
         && declared.is_empty()
         && recorded.is_empty()
@@ -100,10 +100,12 @@ pub(crate) fn copy(
     }
     let home = &hangar.host_home;
     let (entries, managed) = match request {
-        Request::Declared => (declared.clone(), true),
+        Request::Declared => (declared, true),
         Request::AdHoc { src, dest } => {
             let (dest, src) = ad_hoc_entry(src, *dest, home)?;
-            if let Some(mount) = mount_at(&dest, &bay.settings.mounts) {
+            if let Some(mount) =
+                mount_at(&dest, &mounts::live(&bay.settings.mounts))
+            {
                 return Err(Error::with_hint(
                     format!("{dest} overlaps the mount at {mount}"),
                     "a mounted folder is live already; change it on the host",
@@ -241,14 +243,14 @@ fn plan(
     let mut copies = Vec::new();
     let mut total = 0;
     for (vm, host) in files {
-        let host = host_path(host, home).context(format!("files.{vm}"))?;
-        // Resolved, so a symlinked parent can't hide hangar's folders; a
-        // missing source fails in `collect`.
-        if let Ok(resolved) = fs::canonicalize(&host) {
-            mounts::check_hangar_dirs(&resolved, roots)
-                .map_err(|why| refuse(&resolved, why))?;
-        }
-        collect(&host, vm, &mut copies, &mut total)?;
+        let host = host_path(host, home).context(format!("mounts.{vm}"))?;
+        let mut walk = Walk {
+            roots,
+            copies: &mut copies,
+            total: &mut total,
+            visiting: BTreeSet::new(),
+        };
+        walk.collect(&host, vm)?;
     }
     Ok(copies)
 }
@@ -266,21 +268,38 @@ pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn collect(
-    host: &Path,
-    vm: &str,
-    copies: &mut Vec<FileCopy>,
-    total: &mut u64,
-) -> Result<()> {
-    let meta = fs::symlink_metadata(host).context(host.display())?;
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        return Err(refuse(host, "is a symlink; point at its target instead"));
+struct Walk<'a> {
+    roots: &'a Roots,
+    copies: &'a mut Vec<FileCopy>,
+    total: &'a mut u64,
+    /// The canonical directories above the current one: meeting one again
+    /// is a loop, while the same target linked twice is fine.
+    visiting: BTreeSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    /// Every symlink is followed and each resolved target checked.
+    fn collect(&mut self, link: &Path, vm: &str) -> Result<()> {
+        let host = &fs::canonicalize(link).context(link.display())?;
+        mounts::check_hangar_dirs(host, self.roots)
+            .map_err(|why| refuse(host, why))?;
+        if is_credentials_file(host) || is_credentials_file(Path::new(vm)) {
+            return Err(refuse(host, "looks like a credentials file"));
+        }
+        let meta = fs::metadata(host).context(host.display())?;
+        if meta.is_dir() {
+            return self.collect_dir(host, vm);
+        }
+        if !meta.is_file() {
+            return Err(refuse(host, "isn't a regular file"));
+        }
+        self.add_file(host, vm, &meta)
     }
-    if is_credentials_file(host) || is_credentials_file(Path::new(vm)) {
-        return Err(refuse(host, "looks like a credentials file"));
-    }
-    if kind.is_dir() {
+
+    fn collect_dir(&mut self, host: &Path, vm: &str) -> Result<()> {
+        if !self.visiting.insert(host.to_path_buf()) {
+            return Err(refuse(host, "is a symlink loop"));
+        }
         let mut names = fs::read_dir(host)
             .and_then(Iterator::collect::<std::io::Result<Vec<_>>>)
             .context(host.display())?
@@ -295,40 +314,46 @@ fn collect(
             else {
                 return Err(refuse(&child, "has an unsupported file name"));
             };
-            collect(&child, &format!("{vm}/{name}"), copies, total)?;
+            self.collect(&child, &format!("{vm}/{name}"))?;
         }
-        return Ok(());
+        self.visiting.remove(host);
+        Ok(())
     }
-    if !kind.is_file() {
-        return Err(refuse(host, "isn't a regular file"));
+
+    fn add_file(
+        &mut self,
+        host: &Path,
+        vm: &str,
+        meta: &fs::Metadata,
+    ) -> Result<()> {
+        if meta.len() > MAX_FILE {
+            let size = meta.len();
+            return Err(refuse(
+                host,
+                format!("is {size} bytes; the limit is 1 MiB"),
+            ));
+        }
+        *self.total += meta.len();
+        if *self.total > MAX_TOTAL {
+            return Err(refuse(host, "takes files past 10 MiB in total"));
+        }
+        if self.copies.len() == MAX_FILES {
+            return Err(refuse(host, "takes files past 1000 files"));
+        }
+        let contents = fs::read(host).context(host.display())?;
+        if let Some(what) = find_secret(&String::from_utf8_lossy(&contents)) {
+            return Err(refuse(
+                host,
+                format!("contains what looks like a credential ({what})"),
+            ));
+        }
+        self.copies.push(FileCopy {
+            vm: vm.to_string(),
+            executable: meta.permissions().mode() & 0o111 != 0,
+            contents,
+        });
+        Ok(())
     }
-    if meta.len() > MAX_FILE {
-        let size = meta.len();
-        return Err(refuse(
-            host,
-            format!("is {size} bytes; the limit is 1 MiB"),
-        ));
-    }
-    *total += meta.len();
-    if *total > MAX_TOTAL {
-        return Err(refuse(host, "takes files past 10 MiB in total"));
-    }
-    if copies.len() == MAX_FILES {
-        return Err(refuse(host, "takes files past 1000 files"));
-    }
-    let contents = fs::read(host).context(host.display())?;
-    if let Some(what) = find_secret(&String::from_utf8_lossy(&contents)) {
-        return Err(refuse(
-            host,
-            format!("contains what looks like a credential ({what})"),
-        ));
-    }
-    copies.push(FileCopy {
-        vm: vm.to_string(),
-        executable: meta.permissions().mode() & 0o111 != 0,
-        contents,
-    });
-    Ok(())
 }
 
 pub(crate) fn is_credentials_file(path: &Path) -> bool {
@@ -544,8 +569,6 @@ mod tests {
         fs::write(home.join("token.md"), format!("ghp_{}", "x".repeat(36)))
             .unwrap();
         fs::write(home.join("big"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
-        std::os::unix::fs::symlink(home.join("token.md"), home.join("link"))
-            .unwrap();
         for (dir, file) in
             [("state/bays/other/home", "x"), ("cache/bays/other", "x")]
         {
@@ -557,7 +580,6 @@ mod tests {
         for (host, why) in [
             ("~/cfg", "looks like a credentials file"),
             ("~/token.md", "looks like a credential (ghp_)"),
-            ("~/link", "is a symlink"),
             ("~/big", "the limit is 1 MiB"),
             ("~/state", "hangar's own state"),
             ("~", "hangar's own state"),
@@ -577,6 +599,65 @@ mod tests {
         assert!(error.contains("credentials file"), "{error}");
         let error = refusal(&home, "/home/pilot/x", "~/token.md");
         assert!(error.contains("never copies secrets"), "{error}");
+    }
+
+    fn link(target: &Path, at: &Path) {
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    fn planned(home: &Path, host: &str) -> crate::error::Result<Vec<FileCopy>> {
+        let files = BTreeMap::from([("/home/pilot/x".into(), host.into())]);
+        plan(&files, home, &roots(home, "state", "cache"))
+    }
+
+    #[test]
+    fn copy_follows_symlinks_and_checks_targets() {
+        let home = fs::canonicalize(scratch_dir("files-links")).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        fs::write(home.join("plain.md"), "be terse").unwrap();
+        link(&home.join(".ssh/id_ed25519"), &home.join("innocent"));
+        link(&home.join("plain.md"), &home.join("ok"));
+        let error = planned(&home, "~/innocent").unwrap_err().to_string();
+        assert!(error.contains("looks like a credentials file"), "{error}");
+        let copies = planned(&home, "~/ok").unwrap();
+        assert_eq!(copies[0].contents, b"be terse");
+        assert_eq!(copies[0].vm, "/home/pilot/x");
+    }
+
+    #[test]
+    fn copy_dir_symlink_to_secret_content_is_refused() {
+        let home = fs::canonicalize(scratch_dir("files-link-secret")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        fs::write(home.join("real/notes"), "sk-ant-api03-abcdefghijklmnop")
+            .unwrap();
+        fs::create_dir_all(home.join("dir")).unwrap();
+        link(&home.join("real"), &home.join("dir/inner"));
+        let error = planned(&home, "~/dir").unwrap_err().to_string();
+        assert!(
+            error.contains("looks like a credential (sk-ant-)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn copy_symlink_loop_is_refused() {
+        let home = fs::canonicalize(scratch_dir("files-loop")).unwrap();
+        fs::create_dir_all(home.join("d")).unwrap();
+        link(&home.join("d"), &home.join("d/again"));
+        let error = planned(&home, "~/d").unwrap_err().to_string();
+        assert!(error.contains("symlink loop"), "{error}");
+    }
+
+    #[test]
+    fn the_same_target_linked_twice_is_not_a_loop() {
+        let home = fs::canonicalize(scratch_dir("files-twice")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        fs::write(home.join("real/a"), "a").unwrap();
+        fs::create_dir_all(home.join("d")).unwrap();
+        link(&home.join("real"), &home.join("d/one"));
+        link(&home.join("real"), &home.join("d/two"));
+        assert_eq!(planned(&home, "~/d").unwrap().len(), 2);
     }
 
     #[test]
