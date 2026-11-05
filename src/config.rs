@@ -891,9 +891,11 @@ mod tests {
     fn an_unregistered_kind_is_an_error() {
         let config =
             r#"{"proxies": {"p": {"kind": "nope", "run": "managed"}}}"#;
-        assert_eq!(
-            error(config),
-            "proxies.p.kind: unknown kind \"nope\"; known: fake"
+        assert!(
+            error(config)
+                .starts_with("proxies.p.kind: unknown kind \"nope\"; known: "),
+            "{}",
+            error(config)
         );
     }
 

@@ -5,15 +5,18 @@
 pub(crate) mod ca;
 #[cfg(test)]
 mod fake;
+mod http;
 pub(crate) mod managed;
 
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::config::Fields;
 use crate::error::{Context, Error, Result, bail};
-use crate::http;
+use crate::http::{http_authority, is_loopback_host};
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
 
@@ -91,6 +94,7 @@ const PROXY_VM_PREFIX: &str = "hangar-proxy-";
 /// Every kind, by the name a config's `kind` uses.
 pub(crate) fn kinds() -> Vec<(&'static str, Build)> {
     vec![
+        ("http", http::build),
         #[cfg(test)]
         ("fake", fake::build),
     ]
@@ -149,10 +153,32 @@ pub(crate) fn proxy_vm(name: &str) -> String {
     format!("{PROXY_VM_PREFIX}{name}")
 }
 
+/// The `url` of a kind that runs only external.
+pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
+    match &spec.location {
+        Location::External(url) => Ok(url),
+        Location::Managed => bail!(
+            "{}: kind {kind} runs only external (set \"url\")",
+            spec.fields.path()
+        ),
+    }
+}
+
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Up when something accepts connections on the loopback `port`.
+pub(crate) fn tcp_health(port: u16) -> Health {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) {
+        Ok(_) => Health::Up,
+        Err(why) => Health::Down(format!("127.0.0.1:{port}: {why}")),
+    }
+}
+
 pub(crate) fn loopback_port(url: &str) -> Result<u16> {
     let expected = || format!("{url}: expected http://127.0.0.1:<port>");
-    let (host, port) = http::http_authority(url).context(expected())?;
-    if !http::is_loopback_host(&host) {
+    let (host, port) = http_authority(url).context(expected())?;
+    if !is_loopback_host(&host) {
         return Err(Error::with_hint(
             format!("{url}: remote proxies aren't supported yet"),
             "see docs/proxy-kinds.md",
@@ -250,7 +276,7 @@ mod tests {
         let error = error_of(built(r#"{"kind": "socks"}"#));
         assert_eq!(
             error,
-            r#"proxies.p.kind: unknown kind "socks"; known: fake"#
+            r#"proxies.p.kind: unknown kind "socks"; known: fake, http"#
         );
     }
 

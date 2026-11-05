@@ -3,6 +3,7 @@
 mod fakes;
 
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -610,4 +611,68 @@ fn secrets_never_in_log() {
     let log = hangar_log(&machine);
     assert!(log.contains("run: msb"), "{log}");
     assert!(!log.contains("SECRET") && !said.contains("SECRET"), "{log}");
+}
+
+fn proxied_machine(name: &str, proxy: &str) -> Machine {
+    let machine = Machine::new(name);
+    let config = format!(
+        r#"{{"proxies": {{"p": {proxy}}},
+            "bays": [{{"name": "default", "proxy": "p",
+                       "image": "example/bay:1"}}]}}"#
+    );
+    let path = default_config(&machine);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, config).unwrap();
+    machine
+}
+
+fn listener() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+#[test]
+fn bay_through_http_proxy_has_one_egress_port() {
+    let (_proxy, port) = listener();
+    let machine = proxied_machine(
+        "http-proxy",
+        &format!(r#"{{"kind": "http", "url": "http://127.0.0.1:{port}"}}"#),
+    );
+    assert_eq!(run(&machine, &["up"]), "p: unchanged\ndefault: created\n");
+    let created = calls(&machine, "create ");
+    assert!(
+        created[0].contains(&format!("allow@host:tcp:{port}")),
+        "{created:?}"
+    );
+    let env = machine.fake_file("hangar-proxy-env");
+    assert!(
+        env.contains(&format!(
+            "HTTPS_PROXY='http://host.microsandbox.internal:{port}'"
+        )),
+        "{env}"
+    );
+}
+
+#[test]
+fn switching_bay_proxy_recreates() {
+    let (_first, first) = listener();
+    let (_second, second) = listener();
+    let proxy = |port| {
+        format!(r#"{{"kind": "http", "url": "http://127.0.0.1:{port}"}}"#)
+    };
+    let machine = proxied_machine("http-switch", &proxy(first));
+    run(&machine, &["up"]);
+    let config = read(default_config(&machine))
+        .replace(&first.to_string(), &second.to_string());
+    fs::write(default_config(&machine), config).unwrap();
+    assert_eq!(
+        run(&machine, &["up"]),
+        "p: unchanged\ndefault: recreated (proxy)\n"
+    );
+    let created = calls(&machine, "create ");
+    assert!(
+        created[1].contains(&format!("allow@host:tcp:{second}")),
+        "{created:?}"
+    );
 }
