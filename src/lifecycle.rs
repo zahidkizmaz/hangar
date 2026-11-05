@@ -1,9 +1,10 @@
 //! What `up`, `down` and `destroy` act on, and how `up` reconciles an
 //! existing VM with the one wanted.
 
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::sandbox::BoxState;
 use crate::vm_record::VmRecord;
+use log::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resource {
@@ -35,6 +36,22 @@ pub(crate) struct Change {
     pub(crate) name: String,
     pub(crate) resource: Resource,
     pub(crate) outcome: Outcome,
+}
+
+/// Runs one step of `up`; its error names the resource and the step.
+pub(crate) fn step<T>(
+    owner: &str,
+    name: &str,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    info!("{owner}: {name}");
+    run().map_err(|error| {
+        let message = format!("{owner}: {name}: {}", error.message());
+        match error.hint() {
+            Some(hint) => Error::with_hint(message, hint),
+            None => Error::new(message),
+        }
+    })
 }
 
 pub(crate) fn plan(

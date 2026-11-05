@@ -5,6 +5,7 @@
 pub(crate) mod ca;
 #[cfg(test)]
 mod fake;
+pub(crate) mod managed;
 
 use std::path::{Path, PathBuf};
 

@@ -235,7 +235,7 @@ fn would_be(path: &Path) -> Result<PathBuf> {
 
 /// Creates the missing components of a checked path, each 0700; existing
 /// ancestors are left as they are.
-fn create(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     fs::DirBuilder::new()
         .recursive(true)
@@ -357,7 +357,7 @@ fn resolved_host(host: &str) -> String {
         .map_or_else(|| host.to_string(), |p| p.display().to_string())
 }
 
-fn line(vm: &str, host: &str, writable: bool) -> String {
+pub(crate) fn line(vm: &str, host: &str, writable: bool) -> String {
     let mode = if writable { "rw" } else { "ro" };
     format!("{vm}\t{host}\t{mode}")
 }

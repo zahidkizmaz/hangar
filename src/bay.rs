@@ -127,20 +127,12 @@ fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
     }))
 }
 
-/// Runs one step of `up`; its error names the bay and the step.
 fn step<T>(
     bay: &Bay,
     name: &str,
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    info!("{}: {name}", bay.name);
-    run().map_err(|error| {
-        let message = format!("bay {}: {name}: {}", bay.name, error.message());
-        match error.hint() {
-            Some(hint) => Error::with_hint(message, hint),
-            None => Error::new(message),
-        }
-    })
+    lifecycle::step(&format!("bay {}", bay.name), name, run)
 }
 
 fn listed(label: &str, items: &[String]) -> Option<String> {
@@ -302,7 +294,7 @@ fn create(
     write_private(&bay.dir.vm(), wanted.render().as_bytes())
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
+pub(crate) fn remove_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Err(error) if error.kind() != ErrorKind::NotFound => {
             Err(error).context(path.display())
@@ -318,7 +310,7 @@ const WAIT_PAUSE: Duration = Duration::from_millis(500);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, PartialEq, Eq)]
-enum Probe {
+pub(crate) enum Probe {
     Done,
     /// Not yet, with what it last said.
     Pending(String),
@@ -328,7 +320,7 @@ enum Probe {
 
 /// Probes every `pause` until done, failed or `timeout` passed; the last
 /// answer.
-fn wait(
+pub(crate) fn wait(
     timeout: Duration,
     pause: Duration,
     mut probe: impl FnMut() -> Probe,
