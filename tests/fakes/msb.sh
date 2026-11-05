@@ -26,6 +26,22 @@ start) echo Running >"$fake/vm-$3"; exit 0 ;;
 stop) echo Stopped >"$fake/vm-$3"; exit 0 ;;
 rm) rm -f "$fake/vm-$4"; exit 0 ;;
 load) exit 0 ;;
+volume)
+  # volume inspect NAME | create --kind disk --size N -q NAME | rm NAME
+  case $2 in
+  create) for name; do :; done; touch "$fake/volume-$name"; exit 0 ;;
+  *) name=$3 ;;
+  esac
+  [ -f "$fake/volume-$name" ] ||
+    { echo "error: volume not found: $name" >&2; exit 1; }
+  [ "$2" != rm ] || rm -f "$fake/volume-$name"
+  exit 0 ;;
+copy)
+  # copy -q VM:SRC DEST
+  src=${3#*:}
+  [ -e "$fake/vmfs$src" ] || { echo "error: stat $src" >&2; exit 1; }
+  cp "$fake/vmfs$src" "$4"
+  exit 0 ;;
 exec)
   # exec <tty> [--user U] [--workdir W] VM -- COMMAND…
   until [ "${1--}" = -- ]; do

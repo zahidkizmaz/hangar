@@ -47,7 +47,7 @@ impl Sandbox for Msb {
             return Ok(false);
         }
         let stderr = process::stderr(&output);
-        if !is_not_found(&stderr) {
+        if !is_volume_not_found(&stderr) {
             bail!("msb volume inspect {name}: {stderr}");
         }
         run(&volume_create_args(name, size)).map(|_| true)
@@ -58,7 +58,7 @@ impl Sandbox for Msb {
         remove.args(["volume", "rm", name]);
         let output = process::output(&mut remove, None)?;
         let stderr = process::stderr(&output);
-        if output.status.success() || is_not_found(&stderr) {
+        if output.status.success() || is_volume_not_found(&stderr) {
             return Ok(());
         }
         bail!("msb volume rm {name}: {stderr}")
@@ -134,7 +134,11 @@ fn status(vm: &str) -> Result<Option<String>> {
 /// Only "doesn't exist" means missing; any other failure is an error, so
 /// `destroy` never mistakes a broken msb for an already-removed VM.
 fn is_not_found(stderr: &str) -> bool {
-    stderr.contains("sandbox not found") || stderr.contains("volume not found")
+    stderr.contains("sandbox not found")
+}
+
+fn is_volume_not_found(stderr: &str) -> bool {
+    stderr.contains("volume not found")
 }
 
 fn volume_create_args<'a>(name: &'a str, size: &'a str) -> Vec<&'a str> {
@@ -296,8 +300,8 @@ fn call(args: &[&str], stdin: Option<&[u8]>, what: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_out_args, create_args, exec_args, is_not_found, shell_args,
-        volume_create_args,
+        copy_out_args, create_args, exec_args, is_not_found,
+        is_volume_not_found, shell_args, volume_create_args,
     };
     use crate::sandbox::{Egress, Mount, MountMode, VmSpec, Volume};
     use std::path::Path;
@@ -534,7 +538,9 @@ mod tests {
     #[test]
     fn only_a_missing_sandbox_counts_as_not_found() {
         assert!(is_not_found("error: sandbox not found: hangar\n"));
-        assert!(is_not_found("error: volume not found: v\n"));
+        assert!(!is_not_found("error: volume not found: v\n"));
+        assert!(is_volume_not_found("error: volume not found: v\n"));
+        assert!(!is_volume_not_found("error: sandbox not found: v\n"));
         assert!(!is_not_found("error: permission denied"));
         assert!(!is_not_found(""));
     }
