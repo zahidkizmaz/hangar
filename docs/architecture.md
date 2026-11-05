@@ -93,7 +93,8 @@ proxy is only health-checked.
    As root over stdin, `up` writes the CA bundle
    (`/var/lib/hangar/ca-bundle.crt`: the image's CAs plus the proxy's),
    then `/etc/hangar/proxy.env` (root:pilot 0640: the proxy URL with the
-   login, `NO_PROXY`, the CA variables). Each replaces the old file only
+   login, `NO_PROXY`, the CA variables, and the CA's SHA-256 in a header,
+   so a new CA alone changes it too). Each replaces the old file only
    when it changed. Then it waits for Docker.
 4. **packages**: reconcile hangar's nix profile (below).
 5. **copies**: the `copy` mounts (`src/files.rs`).

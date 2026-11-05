@@ -14,6 +14,7 @@ use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::lifecycle::{self, Outcome, Plan, disk_changed};
 use crate::mounts::{self, Resolved, Roots};
+use crate::proxy::ca::sha256_hex;
 use crate::proxy::{self, Access};
 use crate::sandbox::{
     BoxState, Egress, Mount, MountMode, Sandbox, VmSpec, Volume, data_volume,
@@ -484,26 +485,23 @@ fn replace(
         .ends_with("changed"))
 }
 
-/// The CA bundle first: a new proxy env restarts the daemons that read it.
-/// Trap: the guest watches only the proxy env, and a new CA leaves it as
-/// it was, so a new CA alone restarts them from here.
+/// The CA bundle first: a new proxy env restarts the daemons that read it,
+/// and the env's CA hash makes a new CA a new env.
 fn apply_proxy(
     hangar: &Hangar,
     bay: &Bay,
     env: &Secret,
     ca_pem: &[u8],
-) -> Result<impl Iterator<Item = &'static str>> {
+) -> Result<Option<&'static str>> {
     let sandbox = hangar.sandbox.as_ref();
     let ca = replace(sandbox, &bay.vm, &CA_BUNDLE, Some(ca_pem))?;
     let env = env.expose().as_bytes();
     let login = replace(sandbox, &bay.vm, &PROXY_ENV, Some(env))?;
-    if ca && !login {
-        let restart = ["systemctl", "start", "hangar-proxy-env.service"];
-        sandbox.exec(&bay.vm, Some(ROOT), &restart, None)?;
-    }
-    Ok([(ca, "proxy CA"), (login, "proxy login")]
-        .into_iter()
-        .filter_map(|(changed, label)| changed.then_some(label)))
+    Ok(if ca {
+        Some("proxy CA")
+    } else {
+        login.then_some("proxy login")
+    })
 }
 
 /// The proxy for every client, and the CA bundle under every name a tool
@@ -527,9 +525,11 @@ fn proxy_env(kind: Option<&str>, access: &Access) -> Secret {
     ] {
         env.insert(name.to_string(), CA_BUNDLE.path.to_string());
     }
+    let ca = access.ca_pem.as_deref().map(sha256_hex);
     Secret::new(format!(
-        "# proxy {}\n{}",
+        "# proxy {}\n# ca {}\n{}",
         kind.unwrap_or("none"),
+        ca.as_deref().unwrap_or("none"),
         render_env(&env)
     ))
 }
@@ -827,12 +827,10 @@ mod tests {
         changes.iter().position(|c| c == call).unwrap()
     }
 
-    fn position_of(changes: &[String], pattern: &str) -> usize {
-        changes.iter().position(|c| c.contains(pattern)).unwrap()
+    fn never_starts_a_unit(sandbox: &FakeSandbox) {
+        let changes = sandbox.changes();
+        assert!(!changes.iter().any(|c| c.contains("systemctl start")));
     }
-
-    const RESTART_DAEMONS: &str =
-        "exec root@hangar-bay-work systemctl start hangar-proxy-env.service";
 
     #[test]
     fn new_bay_is_created_with_proxy_egress_and_reported_created() {
@@ -1016,7 +1014,7 @@ mod tests {
         );
         assert!(stdin_of(&sandbox, "hangar-proxy-env").contains("pw-2"));
         assert!(!stdin_of(&sandbox, LAUNCH).contains("pw-2"));
-        assert!(!sandbox.changes().iter().any(|c| c == RESTART_DAEMONS));
+        never_starts_a_unit(&sandbox);
         assert!(sandbox.changes().iter().all(|call| !call.contains("pw-2")));
     }
 
@@ -1027,27 +1025,29 @@ mod tests {
     }
 
     #[test]
-    fn a_new_ca_alone_restarts_the_daemons_and_is_reported_as_proxy_ca() {
+    fn a_new_ca_changes_the_proxy_env_and_is_reported_as_proxy_ca() {
         let state = scratch_dir("bay-up-ca");
         let sandbox = settled();
         assert_eq!(up_with(PROXIED, &state, &sandbox), "Created");
         let env = stdin_of(&sandbox, "hangar-proxy-env");
         forget(&sandbox);
-        let pem = include_str!("proxy/testdata/ca.pem").replace('\n', "\\n");
-        let with_ca =
-            PROXIED.replace(r#""port""#, &format!(r#""ca": "{pem}", "port""#));
+        let pem = include_str!("proxy/testdata/ca.pem");
+        let escaped = pem.replace('\n', "\\n");
+        let with_ca = PROXIED
+            .replace(r#""port""#, &format!(r#""ca": "{escaped}", "port""#));
         sandbox.reply_once(" hangar-ca ", Some("changed\n"));
+        sandbox.reply_once("hangar-proxy-env", Some("changed\n"));
         sandbox.reply_once(LAUNCH, Some("restarted"));
         assert_eq!(
             up_with(&with_ca, &state, &sandbox),
             r#"Updated(["proxy CA", "restarted paperclip"])"#
         );
         assert!(stdin_of(&sandbox, " hangar-ca ").contains("BEGIN CERT"));
-        assert_eq!(stdin_of(&sandbox, "hangar-proxy-env"), env);
-        let changes = sandbox.changes();
-        let restart = position(&changes, RESTART_DAEMONS);
-        assert!(restart > position_of(&changes, "hangar-proxy-env"));
-        assert!(restart < position_of(&changes, "hangar-docker"));
+        let rotated = stdin_of(&sandbox, "hangar-proxy-env");
+        assert_ne!(rotated, env);
+        let hash = crate::proxy::ca::sha256_hex(pem.as_bytes());
+        assert!(rotated.contains(&format!("# ca {hash}\n")), "{rotated}");
+        never_starts_a_unit(&sandbox);
     }
 
     #[test]
@@ -1205,15 +1205,17 @@ mod tests {
     }
 
     #[test]
-    fn the_proxy_env_names_the_proxy_kind_and_the_bundle_not_the_ca() {
-        let access = |ca: &[u8]| Access {
+    fn the_proxy_env_names_the_proxy_kind_and_the_ca_hash() {
+        let access = |ca: Option<&[u8]>| Access {
             url: Some(Secret::new("http://a'b@host:1".into())),
-            ca_pem: Some(ca.to_vec()),
+            ca_pem: ca.map(<[u8]>::to_vec),
         };
-        let env = proxy_env(Some("fake"), &access(b"CA-1"));
+        let env = proxy_env(Some("fake"), &access(Some(b"CA-1")));
         assert_eq!(
             env.expose(),
-            "# proxy fake\n\
+            format!(
+                "# proxy fake\n\
+                 # ca {}\n\
                  CURL_CA_BUNDLE='/var/lib/hangar/ca-bundle.crt'\n\
                  GIT_SSL_CAINFO='/var/lib/hangar/ca-bundle.crt'\n\
                  HTTPS_PROXY='http://a'\\''b@host:1'\n\
@@ -1224,10 +1226,14 @@ mod tests {
                  SSL_CERT_FILE='/var/lib/hangar/ca-bundle.crt'\n\
                  http_proxy='http://a'\\''b@host:1'\n\
                  https_proxy='http://a'\\''b@host:1'\n\
-                 no_proxy='localhost,127.0.0.1'\n"
+                 no_proxy='localhost,127.0.0.1'\n",
+                crate::proxy::ca::sha256_hex(b"CA-1")
+            )
         );
-        let rotated = proxy_env(Some("fake"), &access(b"CA-2"));
-        assert_eq!(env.expose(), rotated.expose());
+        let rotated = proxy_env(Some("fake"), &access(Some(b"CA-2")));
+        assert_ne!(env.expose(), rotated.expose());
+        let none = proxy_env(None, &access(None));
+        assert!(none.expose().starts_with("# proxy none\n# ca none\n"));
     }
 
     #[test]
