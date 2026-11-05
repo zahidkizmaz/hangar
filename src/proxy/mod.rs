@@ -109,11 +109,12 @@ fn kind_names() -> Vec<&'static str> {
     names
 }
 
-/// Fails for a `kind` no registered kind answers to.
-pub(crate) fn check_kind(fields: &Fields) -> Result<()> {
+/// The registered kind `kind` names; fails for any other.
+pub(crate) fn check_kind(fields: &Fields) -> Result<Build> {
     let kind = fields.string("kind")?;
-    if kinds().iter().any(|(name, _)| *name == kind) {
-        return Ok(());
+    let found = kinds().into_iter().find(|(name, _)| *name == kind);
+    if let Some((_, build)) = found {
+        return Ok(build);
     }
     bail!(
         "{}: unknown kind \"{kind}\"; known: {}",
@@ -123,12 +124,7 @@ pub(crate) fn check_kind(fields: &Fields) -> Result<()> {
 }
 
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
-    check_kind(&spec.fields)?;
-    let kind = spec.fields.string("kind")?;
-    let build = kinds()
-        .into_iter()
-        .find_map(|(name, build)| (name == kind).then_some(build));
-    build.context("no such kind")?(spec)
+    check_kind(&spec.fields)?(spec)
 }
 
 /// Where a proxy runs: `"run": "managed"` here, or a `url`.
