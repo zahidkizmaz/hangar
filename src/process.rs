@@ -1,17 +1,13 @@
-//! Every child process is built here, so none inherits the master
-//! password, and started here, so each one is logged at debug.
+//! Every child process is built and started here, so each one is logged at
+//! debug.
 
 use std::io::{ErrorKind, Write};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
 use crate::error::{Context, Error, Result};
 
-const SECRET_VAR: &str = "HANGAR_MASTER_PASSWORD";
-
 pub(crate) fn command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.env_remove(SECRET_VAR);
-    command
+    Command::new(program)
 }
 
 /// Runs `command`, writing `stdin` if given, and returns its output
@@ -74,17 +70,4 @@ pub(crate) fn spawn_error(command: &Command, error: &std::io::Error) -> Error {
 
 pub(crate) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SECRET_VAR, command};
-
-    #[test]
-    fn children_never_inherit_the_master_password() {
-        let removed = command("env")
-            .get_envs()
-            .any(|(key, value)| key == SECRET_VAR && value.is_none());
-        assert!(removed);
-    }
 }

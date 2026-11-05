@@ -21,9 +21,9 @@ const MAX_FILE: u64 = 1024 * 1024;
 const MAX_TOTAL: u64 = 10 * 1024 * 1024;
 const MAX_FILES: usize = 1000;
 
-const HINT: &str = "files never copies secrets; store them with \
-                    'hangar credential set NAME' (see docs/configuration.md, \
-                    \"Your config files in the VM\")";
+const HINT: &str = "files never copies secrets; keep them out of the files \
+                    you copy (see docs/configuration.md, \"Your config \
+                    files in the VM\")";
 
 #[derive(Debug, PartialEq)]
 struct FileCopy {
@@ -576,7 +576,7 @@ mod tests {
         );
         assert!(error.contains("credentials file"), "{error}");
         let error = refusal(&home, "/home/pilot/x", "~/token.md");
-        assert!(error.contains("hangar credential set"), "{error}");
+        assert!(error.contains("never copies secrets"), "{error}");
     }
 
     #[test]

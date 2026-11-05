@@ -1,5 +1,5 @@
 //! The shared context of a command: the resolved settings, the state
-//! directory, the package cache root and the sandbox and broker backends.
+//! directory, the package cache root and the sandbox backend.
 //! Each bay is built from it on demand ([`Hangar::bay`]).
 
 use std::fs;
@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::bay::Bay;
-use crate::broker::{AgentVault, Broker};
 use crate::config::{
     self, BaySettings, Paths, Settings, env_var, valid_bay_name,
 };
@@ -15,7 +14,6 @@ use crate::dirs::{self, Base};
 use crate::error::{Context, Error, Result};
 use crate::files;
 use crate::json;
-use crate::overview;
 use crate::sandbox::{Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
 
@@ -27,7 +25,6 @@ pub(crate) struct Hangar {
     /// The user's `$HOME`, which the mount rules protect.
     pub(crate) host_home: PathBuf,
     pub(crate) sandbox: Rc<dyn Sandbox>,
-    pub(crate) broker: Box<dyn Broker>,
 }
 
 impl Hangar {
@@ -48,29 +45,12 @@ impl Hangar {
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
         let host_home = files::host_home()?;
-        let broker = broker(&settings, sandbox.clone(), state.root())
-            .context(&invalid)?;
-        for route in settings.routes.values() {
-            broker.validate(route).context(&invalid)?;
-        }
-        for (scoped, whole) in config::uncovered_path_scopes(&settings) {
-            log::warn!(
-                "route {scoped} is scoped to a path, but route {whole} lets \
-                 bays reach its whole host"
-            );
-        }
-        for key in config::unused_credential_files(&settings) {
-            log::warn!("credentialFiles {key} is used by no route");
-        }
-        overview::check_ports(&overview::published(broker.as_ref(), &settings))
-            .context(&invalid)?;
         Ok(Self {
             settings,
             state,
             cache_root,
             host_home,
             sandbox,
-            broker,
         })
     }
 
@@ -145,29 +125,10 @@ fn sandbox(backend: &str) -> Result<Rc<dyn Sandbox>> {
     }
 }
 
-pub(crate) fn broker(
-    settings: &Settings,
-    sandbox: Rc<dyn Sandbox>,
-    state: &Path,
-) -> Result<Box<dyn Broker>> {
-    match settings.broker_backend.as_str() {
-        "agent-vault" => {
-            Ok(Box::new(AgentVault::new(&settings.tower, sandbox, state)?))
-        }
-        other => Err(Error::new(format!(
-            "config.tower.backend: unknown backend {other:?}; known: \
-             agent-vault"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{broker, check_disjoint, sandbox};
-    use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::settings;
+    use super::{check_disjoint, sandbox};
     use std::path::Path;
-    use std::rc::Rc;
 
     #[test]
     fn state_and_the_package_caches_never_overlap() {
@@ -199,19 +160,6 @@ mod tests {
         assert_eq!(
             error,
             r#"config.sandbox.backend: unknown backend "docker"; known: msb"#
-        );
-        let state = Path::new("/nonexistent");
-        let load = |config: &str| {
-            broker(&settings(config), Rc::new(FakeSandbox::default()), state)
-        };
-        assert!(load("{}").is_ok());
-        let error = load(r#"{"tower": {"backend": "vault"}}"#)
-            .err()
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            error,
-            r#"config.tower.backend: unknown backend "vault"; known: agent-vault"#
         );
     }
 }

@@ -2,21 +2,17 @@
 //! out is the tower's proxy.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::broker;
-use crate::config::{BaySettings, Settings, referenced_credentials};
+use crate::config::BaySettings;
 use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
-use crate::mounts::{self, Resolved, Roots};
-use crate::overview::RunState;
-use crate::sandbox::{BoxState, Egress, Mount, MountMode, Sandbox, VmSpec};
-use crate::state::{BayDir, fnv, write_private};
-use crate::vm_record::VmRecord;
+use crate::mounts::Roots;
+use crate::sandbox::Sandbox;
+use crate::state::{BayDir, fnv};
 use crate::{files, packages, process};
 use log::{info, warn};
 
@@ -70,32 +66,6 @@ fn recreate(bay: &str) -> String {
     format!("run 'hangar destroy {bay} && hangar up {bay}'")
 }
 
-/// ` --bay NAME` for hints, once there's more than one bay to choose from.
-pub(crate) fn flag(hangar: &Hangar, bay: &Bay) -> String {
-    if hangar.settings.bays.len() > 1 {
-        format!(" --bay {}", bay.name)
-    } else {
-        String::new()
-    }
-}
-
-/// The bay's first step: an existing VM must have been created with
-/// egress to the tower's proxy port, and with mounts today's rules still
-/// allow (a root may have moved since), or the bay isn't touched.
-pub(crate) fn preflight(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    let state = hangar.sandbox.state(&bay.vm)?;
-    let recorded = VmRecord::load(&bay.dir.vm());
-    let proxy = broker::proxy_port(hangar.broker.as_ref())?;
-    let fix = format!("{} (home is kept)", recreate(bay.name));
-    check_egress(state, recorded.as_ref(), proxy)
-        .map_err(|message| Error::with_hint(message, &fix))?;
-    if let Some(recorded) = recorded.filter(|_| state != BoxState::Missing) {
-        mounts::recheck(&recorded.mounts, &roots(hangar, bay)?)
-            .map_err(|error| Error::with_hint(error.message(), &fix))?;
-    }
-    Ok(())
-}
-
 pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
     Roots::new(
         &hangar.host_home,
@@ -104,157 +74,6 @@ pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
         &bay.dir.home(),
         &bay.cache,
     )
-}
-
-/// Egress is fixed when the VM is created, so a VM without a record, or
-/// recorded with another port, has to be recreated.
-fn check_egress(
-    state: BoxState,
-    recorded: Option<&VmRecord>,
-    proxy_port: u16,
-) -> std::result::Result<(), String> {
-    if state == BoxState::Missing {
-        return Ok(());
-    }
-    match recorded.and_then(|record| record.egress) {
-        Some(port) if port == proxy_port => Ok(()),
-        Some(port) => {
-            Err(format!("bay was created with egress to port {port}"))
-        }
-        None => Err("bay has no record of how it was created".into()),
-    }
-}
-
-/// The image, mounts and ports are fixed when the VM is created too, so an
-/// existing VM created with others keeps them: `up` warns instead of
-/// recreating it.
-fn drift_warnings(
-    bay: &str,
-    vm: &str,
-    recorded: &VmRecord,
-    wanted: &VmRecord,
-) -> Vec<String> {
-    let recreate = recreate(bay);
-    let mut warnings = Vec::new();
-    if let (Some(old), Some(new)) = (&recorded.image, &wanted.image)
-        && old != new
-    {
-        warnings
-            .push(format!("{vm} uses {old}; {recreate} to switch to {new}"));
-    }
-    if recorded.mounts != wanted.mounts {
-        warnings.push(format!(
-            "{vm} was created with different mounts; {recreate} to apply"
-        ));
-    }
-    if recorded.ports != wanted.ports {
-        warnings.push(format!(
-            "{vm} was created with different ports; {recreate} to apply"
-        ));
-    }
-    warnings
-}
-
-pub(crate) fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    // Checked before anything is created; resolved, so symlinks can't
-    // hide where a mount points.
-    let (home, cache) = bay.own_mounts();
-    let all = mounts::with_hangar(
-        &bay.settings.mounts,
-        home.as_ref(),
-        cache.as_ref(),
-    );
-    let resolved = mounts::resolve(&all, &roots(hangar, bay)?)?;
-    reconcile_vm(hangar, bay, &resolved)
-}
-
-fn wanted_record(
-    bay: &Bay,
-    image: &str,
-    egress: u16,
-    mounts: Vec<String>,
-) -> VmRecord {
-    let ports = &bay.settings.ports;
-    VmRecord {
-        image: Some(image.to_string()),
-        egress: Some(egress),
-        ports: ports
-            .iter()
-            .map(|port| (port.name.clone(), port.host, port.vm))
-            .collect(),
-        mounts,
-    }
-}
-
-fn reconcile_vm(
-    hangar: &Hangar,
-    bay: &Bay,
-    resolved: &[Resolved],
-) -> Result<()> {
-    let image = bay.settings.image_ref();
-    let proxy = broker::proxy_port(hangar.broker.as_ref())?;
-    let wanted = wanted_record(bay, &image, proxy, mounts::lines(resolved));
-    let state = hangar.sandbox.state(&bay.vm)?;
-    if state != BoxState::Missing
-        && let Some(recorded) = VmRecord::load(&bay.dir.vm())
-    {
-        for warning in drift_warnings(bay.name, &bay.vm, &recorded, &wanted) {
-            warn!("{warning}");
-        }
-    }
-    match state {
-        BoxState::Missing => {
-            ensure_image(hangar, bay, &image)?;
-            info!("creating {}", bay.vm);
-            let created =
-                create_vm(hangar, bay, &image, proxy, &wanted, resolved);
-            // A VM a failing create still left behind is recorded too, so
-            // the next `up` can account for it.
-            if created.is_err()
-                && hangar.sandbox.state(&bay.vm)? == BoxState::Missing
-            {
-                return created;
-            }
-            // A new VM has none of the files the record says were copied.
-            let copied = bay.dir.files();
-            if copied.exists() {
-                fs::remove_file(&copied).context(copied.display())?;
-            }
-            write_private(&bay.dir.vm(), wanted.render().as_bytes())?;
-            created
-        }
-        BoxState::Stopped => {
-            info!("starting {}", bay.vm);
-            hangar.sandbox.start(&bay.vm)
-        }
-        BoxState::Running => Ok(()),
-    }
-}
-
-/// Once the VM has booted, the tower's CA goes to `guest/`, then root
-/// writes the CA bundle and the daemons' proxy env inside the VM. The
-/// proxy URL can carry a token, so it goes on stdin, never into `guest/`
-/// or argv.
-pub(crate) fn start(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    let sandbox = hangar.sandbox.as_ref();
-    wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)?;
-    let access = broker::access(hangar, bay.name)?;
-    let ca = hangar.state.ca();
-    fs::write(&ca, &access.ca_pem).context(ca.display())?;
-    if access.renewed {
-        warn!(
-            "bay {}: its broker token was renewed; run 'hangar restart{}' \
-             so its run entries use it",
-            bay.name,
-            flag(hangar, bay)
-        );
-    }
-    // The bundle first: a new proxy env restarts the daemons that read it.
-    replace(sandbox, &bay.vm, &CA_BUNDLE, None)?;
-    let env = proxy_env(access.proxy_url.expose(), &access.ca_pem);
-    replace(sandbox, &bay.vm, &PROXY_ENV, Some(env.as_bytes()))?;
-    info!("waiting for docker in {}", bay.vm);
-    wait_for_docker(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
 }
 
 /// systemd's state once it can tell.
@@ -370,7 +189,6 @@ pub(crate) fn reconcile_packages(hangar: &Hangar, bay: &Bay) -> Result<()> {
 pub(crate) const ENV_FILE: &str = "/etc/hangar/bay.env";
 /// The daemons' proxy and CA variables, a systemd `EnvironmentFile`.
 pub(crate) const PROXY_ENV_FILE: &str = "/etc/hangar/proxy.env";
-const PLACEHOLDER: &str = "hangar-placeholder";
 
 /// A file root keeps in a bay, written from what `fill` prints.
 struct VmFile {
@@ -457,25 +275,18 @@ fn proxy_env(url: &str, ca_pem: &[u8]) -> String {
     )
 }
 
-/// A placeholder per injected credential; `env` wins for a name, for
-/// tools that want a specific placeholder format.
-fn vm_env(settings: &Settings, bay: &BaySettings) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = referenced_credentials(settings)
-        .into_iter()
-        .map(|name| (name, PLACEHOLDER.to_string()))
-        .collect();
-    env.extend(bay.env.clone());
-    env
-}
-
 pub(crate) fn write_env(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    let rendered = render_env(&vm_env(&hangar.settings, bay.settings));
+    let rendered = render_env(&vm_env(bay.settings));
     replace(
         hangar.sandbox.as_ref(),
         &bay.vm,
         &BAY_ENV,
         Some(rendered.as_bytes()),
     )
+}
+
+fn vm_env(bay: &BaySettings) -> BTreeMap<String, String> {
+    bay.env.clone()
 }
 
 fn render_env(env: &BTreeMap<String, String>) -> String {
@@ -501,10 +312,6 @@ active | activating)
 esac
 systemd-run --user --quiet --collect --unit="$1" --description="$3" \
   --property=TimeoutStopSec=10s /bin/sh -lc "$2" && echo started"#;
-
-/// Prints the unit's state; fails only when systemd can't tell.
-const RUN_STATE: &str = r#"state=$(systemctl --user is-active "$1")
-[ -n "$state" ] && echo "$state""#;
 
 /// A `run` entry's transient unit in pilot's user manager: stopping it
 /// stops every process the entry started, and its output is its journal.
@@ -551,10 +358,7 @@ fn needing_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
 
 pub(crate) fn check_setup(hangar: &Hangar, bay: &Bay) -> Result<()> {
     for name in needing_setup(hangar, bay)? {
-        warn!(
-            "{name} needs setup: run 'hangar setup{} {name}'",
-            flag(hangar, bay)
-        );
+        warn!("{name} needs setup: run 'hangar setup {name}'");
     }
     Ok(())
 }
@@ -567,13 +371,11 @@ pub(crate) fn start_runs(hangar: &Hangar, bay: &Bay) -> Result<()> {
         if needing_setup.contains(name) {
             continue;
         }
-        let wanted = description(hangar, bay, name, command);
+        let wanted = description(bay, name, command);
         match launch(hangar, bay, name, command, &wanted, false)?.as_str() {
             "started" => info!("started {name}: hangar logs {name}"),
             running if running != wanted => warn!(
-                "{name}'s inputs changed; run 'hangar restart{} {name}' to \
-                 apply",
-                flag(hangar, bay)
+                "{name}'s inputs changed; run 'hangar restart {name}' to apply"
             ),
             _ => {}
         }
@@ -612,7 +414,7 @@ pub(crate) fn restart(
     for name in &names {
         let command = &run[name];
         info!("restarting {name}");
-        let wanted = description(hangar, bay, name, command);
+        let wanted = description(bay, name, command);
         launch(hangar, bay, name, command, &wanted, true)?;
     }
     Ok(names)
@@ -620,13 +422,8 @@ pub(crate) fn restart(
 
 /// The unit's description records what the entry was started with: a
 /// hash of its command, the env file and the copied config files.
-fn description(
-    hangar: &Hangar,
-    bay: &Bay,
-    name: &str,
-    command: &str,
-) -> String {
-    let env = render_env(&vm_env(&hangar.settings, bay.settings));
+fn description(bay: &Bay, name: &str, command: &str) -> String {
+    let env = render_env(&vm_env(bay.settings));
     let inputs = [command, &env, &files::record_text(bay)].join("\0");
     format!("hangar run {name} {}", fnv(inputs.into_bytes()))
 }
@@ -661,24 +458,6 @@ fn launch(
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
-pub(crate) fn run_state(
-    sandbox: &dyn Sandbox,
-    vm: &str,
-    name: &str,
-) -> Result<RunState> {
-    let script = format!("{USER_MANAGER}{RUN_STATE}");
-    let output = sandbox.exec(
-        vm,
-        Some(PILOT),
-        &["sh", "-c", &script, "hangar-run-status", &run_unit(name)],
-        None,
-    )?;
-    Ok(match String::from_utf8_lossy(&output).trim() {
-        "active" | "activating" => RunState::Running,
-        _ => RunState::Stopped,
-    })
-}
-
 /// A Nix-built image is loaded into the sandbox once per image tag.
 fn ensure_image(hangar: &Hangar, bay: &Bay, image: &str) -> Result<()> {
     let Some(loader) = &bay.settings.image_loader else {
@@ -698,202 +477,24 @@ fn ensure_image(hangar: &Hangar, bay: &Bay, image: &str) -> Result<()> {
     imported
 }
 
-fn create_vm(
-    hangar: &Hangar,
-    bay: &Bay,
-    image: &str,
-    proxy: u16,
-    wanted: &VmRecord,
-    user: &[Resolved],
-) -> Result<()> {
-    let settings = bay.settings;
-    let guest = hangar.state.guest();
-    fs::create_dir_all(&guest).context(guest.display())?;
-    let mut mounts = vec![Mount {
-        host: &guest,
-        guest: GUEST_MOUNT,
-        mode: MountMode::ReadOnly,
-        owner: None,
-    }];
-    // The cache is root's, which installs the packages; the rest pilot's.
-    let cache = settings.cache.then_some(VM_CACHE);
-    mounts.extend(user.iter().map(|mount| Mount {
-        host: &mount.host,
-        guest: &mount.vm,
-        mode: MountMode::writable(mount.writable),
-        owner:
-            (Some(mount.vm.as_str()) != cache).then_some((PILOT_ID, PILOT_ID)),
-    }));
-    let publish: Vec<(u16, u16)> = wanted
-        .ports
-        .iter()
-        .map(|(_, host, vm)| (*host, *vm))
-        .collect();
-    hangar.sandbox.create(&VmSpec {
-        name: &bay.vm,
-        image,
-        cpus: settings.cpus,
-        memory: &settings.memory,
-        disk: Some(&settings.disk),
-        native_fs: &[PILOT_DATA],
-        init: Some(INIT),
-        egress: Egress::OnlyHostPort(proxy),
-        publish: &publish,
-        mounts: &mounts,
-        env: &[],
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTED, DOCKER_READY, Probe, WAIT_TIMEOUT, boot_state, check_egress,
-        drift_warnings, preflight, proxy_env, reconcile_vm, replace_script,
-        start, start_runs, vm_env, wait_booted, wait_for_docker, write_env,
+        Probe, WAIT_TIMEOUT, boot_state, ensure_image, proxy_env,
+        replace_script, start_runs, wait_booted, wait_for_docker, write_env,
     };
-    use crate::broker::fake::FakeBroker;
     use crate::error::Error;
-    use crate::mounts::Resolved;
+    use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::sandbox::{BoxState, Egress, Sandbox, TOWER_VM};
-    use crate::testing::{
-        hangar_with, hangar_with_broker, scratch_dir, settings,
-    };
-    use crate::vm_record::VmRecord;
+    use crate::testing::{hangar_with, scratch_dir};
     use std::fs;
-    use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::Duration;
 
-    const RECREATE: &str =
-        ": run 'hangar destroy default && hangar up default' (home is kept)";
     const BAY_VM: &str = "hangar-bay-default";
-
-    fn record(egress: u16) -> VmRecord {
-        VmRecord {
-            image: Some("example/agent:1".into()),
-            egress: Some(egress),
-            ports: vec![("paperclip".into(), 3100, 3100)],
-            mounts: vec![
-                "/home/pilot\t/home/you/.local/share/hangar/home\trw".into(),
-            ],
-        }
-    }
-
-    #[test]
-    fn an_existing_vm_created_with_other_inputs_is_reported_not_recreated() {
-        assert_eq!(
-            drift_warnings("default", BAY_VM, &record(1), &record(1)),
-            Vec::<String>::new()
-        );
-        let mut wanted = record(1);
-        wanted.image = Some("example/agent:2".into());
-        wanted.mounts.clear();
-        wanted.ports[0].1 = 3200;
-        assert_eq!(
-            drift_warnings("default", BAY_VM, &record(1), &wanted),
-            [
-                "hangar-bay-default uses example/agent:1; run 'hangar destroy \
-                 default && hangar up default' to switch to example/agent:2",
-                "hangar-bay-default was created with different mounts; run \
-                 'hangar destroy default && hangar up default' to apply",
-                "hangar-bay-default was created with different ports; run \
-                 'hangar destroy default && hangar up default' to apply",
-            ]
-        );
-        // An unreadable image line isn't a different image.
-        let mut recorded = record(1);
-        recorded.image = None;
-        assert_eq!(
-            drift_warnings("default", BAY_VM, &recorded, &record(1)),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn an_existing_vm_must_have_been_created_with_egress_to_the_proxy() {
-        let error = |state, recorded: Option<&VmRecord>| {
-            check_egress(state, recorded, 14322).unwrap_err()
-        };
-        for state in [BoxState::Running, BoxState::Stopped] {
-            assert!(check_egress(state, Some(&record(14322)), 14322).is_ok());
-            assert_eq!(
-                error(state, Some(&record(15000))),
-                "bay was created with egress to port 15000"
-            );
-            let unknown = "bay has no record of how it was created";
-            assert_eq!(error(state, None), unknown);
-            let mut no_egress = record(14322);
-            no_egress.egress = None;
-            assert_eq!(error(state, Some(&no_egress)), unknown);
-        }
-        // A missing VM is created with the current port.
-        assert!(check_egress(BoxState::Missing, None, 14322).is_ok());
-        assert!(check_egress(BoxState::Missing, Some(&record(1)), 2).is_ok());
-    }
 
     fn fake(vms: &[(&str, BoxState)]) -> Rc<FakeSandbox> {
         Rc::new(FakeSandbox::with(vms))
-    }
-
-    const CONFIG: &str = r#"{"bays": [{"name": "default",
-        "image": "example/agent:1",
-        "apps": ["nix", "github", "claude-code", "paperclip"]}]}"#;
-
-    fn write_record(state: &std::path::Path, record: &VmRecord) {
-        let file = state.join("bays/default/vm");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(file, record.render()).unwrap();
-    }
-
-    #[test]
-    fn refusals_leave_both_vms_untouched() {
-        let running =
-            [(BAY_VM, BoxState::Running), (TOWER_VM, BoxState::Stopped)];
-        let state = scratch_dir("preflight");
-        let unmounted = |egress| VmRecord {
-            mounts: Vec::new(),
-            ..record(egress)
-        };
-        for recorded in [None, Some(unmounted(15000))] {
-            if let Some(recorded) = &recorded {
-                write_record(&state, recorded);
-            }
-            let sandbox = fake(&running);
-            let hangar = hangar_with(CONFIG, &state, sandbox.clone());
-            assert!(
-                preflight(&hangar, &hangar.bay("default").unwrap()).is_err()
-            );
-            assert_eq!(sandbox.changes(), Vec::<String>::new());
-        }
-        write_record(&state, &unmounted(14322));
-        let hangar = hangar_with(CONFIG, &state, fake(&running));
-        assert!(preflight(&hangar, &hangar.bay("default").unwrap()).is_ok());
-    }
-
-    #[test]
-    fn a_recorded_mount_that_todays_rules_refuse_stops_the_bay() {
-        let state = scratch_dir("preflight-mounts");
-        fs::create_dir_all(state.join("vault")).unwrap();
-        let vault = fs::canonicalize(state.join("vault")).unwrap();
-        let recorded = VmRecord {
-            mounts: vec![format!("/data\t{}\tro", vault.display())],
-            ..record(14322)
-        };
-        write_record(&state, &recorded);
-        let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
-        let hangar = hangar_with(CONFIG, &state, sandbox.clone());
-        let error = preflight(&hangar, &hangar.bay("default").unwrap())
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "the bay's mount at /data: {} holds hangar's own state{RECREATE}",
-                vault.display()
-            )
-        );
-        assert_eq!(sandbox.changes(), Vec::<String>::new());
     }
 
     #[test]
@@ -977,121 +578,16 @@ mod tests {
     }
 
     #[test]
-    fn pilot_owns_the_home_and_user_mounts_and_root_the_cache() {
-        let state = scratch_dir("bay-owners");
-        let sandbox = fake(&[]);
-        let hangar = hangar_with(CONFIG, &state, sandbox.clone());
-        let bay = hangar.bay("default").unwrap();
-        let mount = |vm: &str, host: &str| Resolved {
-            vm: vm.into(),
-            host: PathBuf::from(host),
-            writable: true,
-        };
-        let mounts = [
-            mount("/home/pilot", "/h"),
-            mount("/home/pilot/.app", "/a"),
-            mount("/var/cache/hangar", "/c"),
-        ];
-        reconcile_vm(&hangar, &bay, &mounts).unwrap();
-        let created = sandbox.created.borrow();
-        assert_eq!(
-            created[0].mounts[1..],
-            [
-                "/h:/home/pilot:ReadWrite:1000:1000",
-                "/a:/home/pilot/.app:ReadWrite:1000:1000",
-                "/c:/var/cache/hangar:ReadWrite",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_new_bay_reaches_only_the_proxy_and_is_recorded() {
-        let state = scratch_dir("bay-create");
-        fs::create_dir_all(state.join("bays/default")).unwrap();
-        fs::write(state.join("bays/default/files"), "old").unwrap();
-        let sandbox = fake(&[]);
-        let hangar = hangar_with(CONFIG, &state, sandbox.clone());
-        let bay = hangar.bay("default").unwrap();
-        let home = || Resolved {
-            vm: "/home/pilot".into(),
-            host: PathBuf::from("/home/you/.local/share/hangar/home"),
-            writable: true,
-        };
-        reconcile_vm(&hangar, &bay, &[home()]).unwrap();
-
-        let created = sandbox.created.borrow();
-        assert_eq!(created.len(), 1);
-        assert_eq!(created[0].name, BAY_VM);
-        assert_eq!(created[0].init.as_deref(), Some("/sbin/init"));
-        assert_eq!(created[0].native_fs, ["/var/lib/pilot"]);
-        assert_eq!(created[0].egress, Egress::OnlyHostPort(14322));
-        assert_eq!(created[0].publish, [(3100, 3100)]);
-        assert_eq!(
-            created[0].mounts,
-            [
-                format!(
-                    "{}:/run/hangar:ReadOnly",
-                    state.join("guest").display()
-                ),
-                "/home/you/.local/share/hangar/home:/home/pilot:ReadWrite:\
-                 1000:1000"
-                    .into(),
-            ]
-        );
-        drop(created);
-        assert_eq!(
-            VmRecord::load(&state.join("bays/default/vm")),
-            Some(record(14322))
-        );
-        assert!(!state.join("bays/default/files").exists());
-
-        // Existing: kept as it is, or started.
-        reconcile_vm(&hangar, &bay, &[home()]).unwrap();
-        assert_eq!(sandbox.changes(), ["create hangar-bay-default"]);
-        let stopped = fake(&[(BAY_VM, BoxState::Stopped)]);
-        let hangar = hangar_with(CONFIG, &state, stopped.clone());
-        reconcile_vm(&hangar, &hangar.bay("default").unwrap(), &[home()])
-            .unwrap();
-        assert_eq!(stopped.changes(), ["start hangar-bay-default"]);
-    }
-
-    #[test]
-    fn a_vm_that_a_failing_create_left_behind_is_still_recorded() {
-        let state = scratch_dir("bay-half-created");
-        let sandbox = fake(&[]);
-        sandbox.fail_create.set(true);
-        let hangar = hangar_with(CONFIG, &state, sandbox.clone());
-        let error = reconcile_vm(&hangar, &hangar.bay("default").unwrap(), &[])
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "create hangar-bay-default: boot timed out");
-        assert!(state.join("bays/default/vm").exists());
-        // The next up accounts for it instead of refusing.
-        let hangar =
-            hangar_with(CONFIG, &state, fake(&[(BAY_VM, BoxState::Running)]));
-        assert!(preflight(&hangar, &hangar.bay("default").unwrap()).is_ok());
-    }
-
-    #[test]
-    fn a_built_image_is_loaded_once_before_the_vm_is_created() {
+    fn a_built_image_is_loaded_once() {
         let state = scratch_dir("bay-image-loader");
         let config = r#"{"bays": [{"name": "default",
             "image": "hangar-bay:dev", "imageLoader": "true"}]}"#;
         let sandbox = fake(&[]);
         let hangar = hangar_with(config, &state, sandbox.clone());
         let bay = hangar.bay("default").unwrap();
-        reconcile_vm(&hangar, &bay, &[]).unwrap();
-        sandbox.remove(BAY_VM).unwrap();
-        reconcile_vm(&hangar, &bay, &[]).unwrap();
-        assert_eq!(
-            sandbox.changes(),
-            [
-                "load hangar-bay:dev",
-                "create hangar-bay-default",
-                "remove hangar-bay-default",
-                "create hangar-bay-default"
-            ]
-        );
+        ensure_image(&hangar, &bay, "hangar-bay:dev").unwrap();
+        ensure_image(&hangar, &bay, "hangar-bay:dev").unwrap();
+        assert_eq!(sandbox.changes(), ["load hangar-bay:dev"]);
     }
 
     fn replace_call(name: &str, path: &str, owner: &str, mode: &str) -> String {
@@ -1104,60 +600,6 @@ mod tests {
         format!(
             "exec root@{BAY_VM} /bin/sh -c {script} {name} {path} {owner} {mode}"
         )
-    }
-
-    #[test]
-    fn the_bay_gets_its_ca_bundle_then_its_proxy_env_on_stdin() {
-        let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
-        let state = scratch_dir("bay-start");
-        fs::create_dir_all(state.join("guest")).unwrap();
-        let hangar = hangar_with("{}", &state, sandbox.clone());
-        start(&hangar, &hangar.bay("default").unwrap()).unwrap();
-        assert_eq!(
-            sandbox.changes(),
-            [
-                format!("exec root@{BAY_VM} /bin/sh -c {BOOTED} hangar-booted"),
-                replace_call(
-                    "hangar-ca",
-                    "/var/lib/hangar/ca-bundle.crt",
-                    "root:root",
-                    "0644"
-                ),
-                replace_call(
-                    "hangar-proxy-env",
-                    "/etc/hangar/proxy.env",
-                    "root:pilot",
-                    "0640"
-                ),
-                format!(
-                    "exec pilot@{BAY_VM} sh -c {DOCKER_READY} hangar-docker"
-                ),
-            ]
-        );
-        let stdins = sandbox.stdins.borrow();
-        assert_eq!(stdins[..2], [Vec::<u8>::new(), Vec::new()]);
-        assert_eq!(
-            String::from_utf8_lossy(&stdins[2]),
-            proxy_env("http://fake-token:vault@host.fake:14322", b"FAKE-CA\n")
-        );
-        drop(stdins);
-        assert_eq!(fs::read(state.join("guest/ca.pem")).unwrap(), b"FAKE-CA\n");
-
-        // A port other than the proxy the VM was created to reach.
-        let broker = FakeBroker::default();
-        broker.access_port.set(15000);
-        let sandbox = fake(&[(BAY_VM, BoxState::Running)]);
-        let hangar =
-            hangar_with_broker("{}", &state, sandbox.clone(), Box::new(broker));
-        let error = start(&hangar, &hangar.bay("default").unwrap())
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "broker gave port 15000 for bay default, but its proxy port is \
-             14322"
-        );
-        assert_eq!(sandbox.changes().len(), 1);
     }
 
     #[test]
@@ -1292,19 +734,6 @@ mod tests {
                 "hangar-run-web.service web serve --dev"
             ]
         );
-    }
-
-    #[test]
-    fn placeholders_are_set_and_bay_env_wins() {
-        let settings = settings(
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/t"}},
-                "bays": [{"name": "default", "apps": ["github-token"],
-                  "env": {"GITHUB_TOKEN": "gh-placeholder", "MODE": "x"}}]}"#,
-        );
-        let env = vm_env(&settings, &settings.bays[0]);
-        assert_eq!(env["GITHUB_TOKEN"], "gh-placeholder");
-        assert_eq!(env["GITHUB_GIT_USER"], "hangar-placeholder");
-        assert_eq!(env["MODE"], "x");
     }
 
     #[test]

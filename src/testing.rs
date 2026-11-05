@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::{self, JoinHandle};
 
-use crate::broker::Broker;
-use crate::broker::fake::FakeBroker;
 use crate::config::{Settings, defaults, resolve};
 use crate::error::Result;
 use crate::hangar::Hangar;
@@ -98,21 +96,11 @@ pub(crate) fn vars(
 
 /// A `Hangar` on `config` (merged over the defaults), with its state in
 /// `state` (the package caches in `<state>-cache` and the user's home in
-/// `<state>-home`, next to it), `sandbox` in place of a real backend and a
-/// [`FakeBroker`].
+/// `<state>-home`, next to it) and `sandbox` in place of a real backend.
 pub(crate) fn hangar_with(
     config: &str,
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
-) -> Hangar {
-    hangar_with_broker(config, state, sandbox, Box::new(FakeBroker::default()))
-}
-
-pub(crate) fn hangar_with_broker(
-    config: &str,
-    state: &Path,
-    sandbox: Rc<dyn Sandbox>,
-    broker: Box<dyn Broker>,
 ) -> Hangar {
     let settings = settings(config);
     let sibling = |suffix: &str| {
@@ -128,7 +116,6 @@ pub(crate) fn hangar_with_broker(
         cache_root: sibling("-cache"),
         host_home,
         sandbox,
-        broker,
     }
 }
 

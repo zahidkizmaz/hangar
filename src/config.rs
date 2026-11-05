@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::apps::{self, App};
-use crate::broker::{Auth, Route};
 use crate::dirs::{self, Base};
-use crate::error::{Context, Error, Result, bail};
+use crate::error::{Context, Result, bail};
 use crate::files;
 use crate::mounts::{self, MountSpec};
 use crate::sandbox::PublishedPort;
@@ -18,13 +17,11 @@ use crate::json::{self, Json};
 const DEFAULTS: &str = include_str!("../config/defaults.json");
 
 pub(crate) const INITIAL_CONFIG: &str = r#"{
-  "bays": [{ "name": "default", "apps": [], "packages": [] }],
-  "tower": { "credentialFiles": {} }
+  "bays": [{ "name": "default", "apps": [], "packages": [] }]
 }
 "#;
 
-const TOP_LEVEL: [&str; 5] =
-    ["bays", "tower", "appDefinitions", "sandbox", "stateDir"];
+const TOP_LEVEL: [&str; 4] = ["bays", "appDefinitions", "sandbox", "stateDir"];
 const BAY_KEYS: [&str; 16] = [
     "name",
     "apps",
@@ -44,46 +41,6 @@ const BAY_KEYS: [&str; 16] = [
     "cache",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Source {
-    File(String),
-    App { app: String, value: String },
-}
-
-/// The credentials hangar owns: `credentialFiles`, plus the apps' fixed
-/// values that a route references. Everything else in the vault belongs
-/// to the user.
-pub(crate) fn managed_credentials(
-    settings: &Settings,
-) -> BTreeMap<String, Source> {
-    let used = route_credentials(settings);
-    let fixed = settings
-        .app_credentials
-        .iter()
-        .filter(|(key, _)| used.contains(*key))
-        .map(|(key, (app, value))| {
-            let source = Source::App {
-                app: app.clone(),
-                value: value.clone(),
-            };
-            (key.clone(), source)
-        });
-    settings
-        .credential_files
-        .iter()
-        .map(|(key, file)| (key.clone(), Source::File(file.clone())))
-        .chain(fixed)
-        .collect()
-}
-
-fn route_credentials(settings: &Settings) -> BTreeSet<String> {
-    settings
-        .routes
-        .values()
-        .flat_map(|route| route.auth.credentials())
-        .collect()
-}
-
 /// Reads a non-empty environment variable; tests pass their own lookup.
 pub(crate) type Var<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -94,16 +51,8 @@ pub(crate) fn env_var(name: &str) -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct Settings {
     pub(crate) sandbox_backend: String,
-    pub(crate) broker_backend: String,
-    /// The `tower` object; each backend reads its own key.
-    pub(crate) tower: Json,
     pub(crate) bays: Vec<BaySettings>,
-    pub(crate) credential_files: BTreeMap<String, String>,
-    /// The enabled apps' fixed credentials: key -> (app, value).
-    pub(crate) app_credentials: BTreeMap<String, (String, String)>,
-    pub(crate) routes: BTreeMap<String, Route>,
     pub(crate) state_dir: Option<String>,
-    pub(crate) master_password_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -166,8 +115,7 @@ pub(crate) fn defaults() -> Result<Json> {
     json::parse(DEFAULTS).context("built-in defaults")
 }
 
-/// The config over the defaults: each bay over the defaults' `bay`, the
-/// tower's routes from every bay's apps plus the config's own.
+/// The config over the defaults: each bay over the defaults' `bay`.
 pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     let Json::Object(mut config) = config else {
         bail!("config must be a JSON object");
@@ -179,20 +127,9 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     let bay_defaults = merged.remove("bay").context("defaults: no bay")?;
     let catalog = apps::Catalog::new(config.remove("appDefinitions"))?;
     let bays = config.remove("bays");
-    let user_routes = match config.get_mut("tower") {
-        Some(Json::Object(tower)) => tower.remove("routes"),
-        _ => None,
-    };
     let mut merged = Json::Object(merged);
     merge(&mut merged, Json::Object(config));
     let top = Fields::new(&merged, "config")?;
-    let tower = top.object("tower")?;
-    tower.only(&[
-        "backend",
-        "agentVault",
-        "credentialFiles",
-        "masterPasswordFile",
-    ])?;
 
     let bays = bay_entries(bays)?
         .into_iter()
@@ -209,34 +146,16 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
             catalog.enabled(fields.map.get("apps"), &fields.at("apps"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let user_routes = routes(user_routes.as_ref(), "config.tower.routes")?;
-    let (routes, origins) = apps::merge_routes(&enabled, user_routes)?;
-    apps::check_routes(&routes, &origins)?;
 
     let mut settings = Settings {
         sandbox_backend: top.object("sandbox")?.string("backend")?,
-        broker_backend: tower.string("backend")?,
-        tower: Json::Object(tower.map.clone()),
         bays: Vec::new(),
-        credential_files: tower.string_map("credentialFiles")?,
-        app_credentials: apps::fixed_credentials(&enabled)?,
-        routes,
         state_dir: top.optional_string("stateDir")?,
-        master_password_file: tower.optional_string("masterPasswordFile")?,
     };
     top.object("sandbox")?.only(&["backend"])?;
-    apps::check_placeholders(&enabled, &referenced_credentials(&settings))?;
-    if let Some((key, (app, _))) = settings
-        .app_credentials
-        .iter()
-        .find(|(key, _)| settings.credential_files.contains_key(*key))
-    {
-        bail!("config.tower.credentialFiles.{key}: app {app} sets it");
-    }
     for (bay, apps) in bays.iter().zip(&enabled) {
         let mut bay = BaySettings::from_json(bay)?;
         apps::apply(&mut bay, apps)?;
-        check_packages(&bay, &settings.routes)?;
         settings.bays.push(bay);
     }
     Ok(settings)
@@ -276,117 +195,6 @@ fn bay_path(bay: &Json) -> String {
         }
         _ => "config.bays".to_string(),
     }
-}
-
-pub(crate) fn routes(
-    value: Option<&Json>,
-    path: &str,
-) -> Result<BTreeMap<String, Route>> {
-    let items = match value {
-        None | Some(Json::Null) => return Ok(BTreeMap::new()),
-        Some(Json::Array(items)) => items,
-        Some(_) => bail!("{path}: expected a list"),
-    };
-    let mut routes = BTreeMap::new();
-    for (index, item) in items.iter().enumerate() {
-        let entry = format!("{path}.{index}");
-        let name = Fields::new(item, &entry)?.string("name")?;
-        if !valid_name(&name) {
-            bail!("{entry}.name: names are lowercase, digits and -");
-        }
-        let route = parse_route(&format!("{path}.{name}"), &name, item)?;
-        if routes.insert(name.clone(), route).is_some() {
-            bail!("{path}: two routes named {name}");
-        }
-    }
-    Ok(routes)
-}
-
-/// Packages come from the nix caches, and flakes on GitHub (and registry
-/// names like `nixpkgs#…` or `flake:nixpkgs#…`, which resolve there)
-/// through GitHub's API.
-/// Without routes to those hosts, every install would fail halfway.
-fn check_packages(
-    bay: &BaySettings,
-    routes: &BTreeMap<String, Route>,
-) -> Result<()> {
-    let has_route =
-        |host: &str| routes.values().any(|route| route.host == host);
-    let via_github = |package: &String| {
-        let package = package.strip_prefix("flake:").unwrap_or(package);
-        package.starts_with("github:") || !package.contains(':')
-    };
-    let needed = [
-        (!bay.packages.is_empty(), "cache.nixos.org"),
-        (bay.packages.iter().any(via_github), "api.github.com"),
-    ];
-    if let Some((_, host)) =
-        needed.iter().find(|(need, host)| *need && !has_route(host))
-    {
-        return Err(Error::with_hint(
-            format!(
-                "bay {} has packages, but no route allows {host}",
-                bay.name
-            ),
-            "add \"nix\" and \"github\" (or \"github-token\") to its apps",
-        ));
-    }
-    Ok(())
-}
-
-/// `credentialFiles` entries no route uses: stored in the vault, never
-/// injected anywhere.
-pub(crate) fn unused_credential_files(settings: &Settings) -> Vec<String> {
-    let used = route_credentials(settings);
-    settings
-        .credential_files
-        .keys()
-        .filter(|key| !used.contains(*key))
-        .cloned()
-        .collect()
-}
-
-/// Path-scoped routes (`host/path`) that another route covers whole: the
-/// scope then keeps nothing out. Pairs of (scoped, covering) names.
-pub(crate) fn uncovered_path_scopes(
-    settings: &Settings,
-) -> Vec<(String, String)> {
-    let routes = settings.routes.values();
-    let scoped = routes.clone().filter_map(|route| {
-        let (host, _) = route.host.split_once('/')?;
-        Some((route, host))
-    });
-    scoped
-        .flat_map(|(route, host)| {
-            routes
-                .clone()
-                .filter(move |whole| covers(&whole.host, host))
-                .map(|whole| (route.name.clone(), whole.name.clone()))
-        })
-        .collect()
-}
-
-/// Whether route host `whole` (no path) matches every request to `host`:
-/// the same name, or a `*.` wildcard one label up, on any port unless it
-/// names one.
-fn covers(whole: &str, host: &str) -> bool {
-    if whole.contains('/') {
-        return false;
-    }
-    let split = |host: &str| {
-        let (name, port) = host.split_once(':').unwrap_or((host, ""));
-        (name.to_ascii_lowercase(), port.to_string())
-    };
-    let ((whole_name, whole_port), (name, port)) = (split(whole), split(host));
-    if !whole_port.is_empty() && whole_port != port {
-        return false;
-    }
-    let one_label_below = |suffix: &str| {
-        name.strip_suffix(suffix)
-            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
-    };
-    whole_name == name
-        || whole_name.strip_prefix('*').is_some_and(one_label_below)
 }
 
 pub(crate) fn state_dir(settings: &Settings, var: Var) -> Result<PathBuf> {
@@ -431,27 +239,7 @@ impl BaySettings {
     }
 }
 
-/// Every credential name the broker injects: what the routes' auth
-/// references, plus `credentialFiles`. Every bay gets a placeholder for
-/// each, so tools that read the variable find something to send.
-pub(crate) fn referenced_credentials(settings: &Settings) -> BTreeSet<String> {
-    let mut names = route_credentials(settings);
-    names.extend(settings.credential_files.keys().cloned());
-    names
-}
-
-pub(crate) fn route_json(route: &Route) -> Json {
-    let mut object = Object::new();
-    object.insert("name".into(), json::string(&route.name));
-    object.insert("host".into(), json::string(&route.host));
-    object.insert("auth".into(), route.auth.to_json());
-    if !route.extra.is_empty() {
-        object.insert("extra".into(), Json::Object(route.extra.clone()));
-    }
-    Json::Object(object)
-}
-
-/// agent-vault's credential key rule, `^[A-Z][A-Z0-9_]*$`.
+/// `^[A-Z][A-Z0-9_]*$`.
 pub(crate) fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
     chars.next().is_some_and(|first| first.is_ascii_uppercase())
@@ -512,10 +300,7 @@ pub(crate) fn checked_vars(
             bail!("{path}.{key}: expected UPPER_SNAKE_CASE");
         }
         if looks_like_a_secret(value) {
-            bail!(
-                "{path}.{key}: looks like a real secret; store it with \
-                 'hangar credential set {key}' instead"
-            );
+            bail!("{path}.{key}: looks like a real secret");
         }
     }
     Ok(vars)
@@ -594,62 +379,6 @@ fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
             Ok((expanded, spec))
         })
         .collect()
-}
-
-/// `auth` keys are checked: a typo there would silently change what
-/// gets injected.
-fn parse_route(path: &str, name: &str, value: &Json) -> Result<Route> {
-    let fields = Fields::new(value, path)?;
-    fields.only(&["name", "host", "auth", "extra"])?;
-    let extra = match fields.map.get("extra") {
-        None | Some(Json::Null) => Object::new(),
-        Some(_) => fields.object("extra")?.map.clone(),
-    };
-    Ok(Route {
-        name: name.to_string(),
-        host: fields.string("host")?,
-        auth: parse_auth(&fields.object("auth")?)?,
-        extra,
-    })
-}
-
-fn parse_auth(auth: &Fields) -> Result<Auth> {
-    let kind = auth.string("type")?;
-    let only = |keys: &[&str]| auth.only(&[&["type"], keys].concat());
-    Ok(match kind.as_str() {
-        "bearer" => {
-            only(&["token"])?;
-            Auth::Bearer {
-                token: auth.string("token")?,
-            }
-        }
-        "basic" => {
-            only(&["username", "password"])?;
-            Auth::Basic {
-                username: auth.string("username")?,
-                password: auth.optional_string("password")?,
-            }
-        }
-        "api-key" => {
-            only(&["key", "header", "prefix"])?;
-            Auth::ApiKey {
-                key: auth.string("key")?,
-                header: auth.optional_string("header")?,
-                prefix: auth.optional_string("prefix")?,
-            }
-        }
-        "custom" => {
-            only(&["headers"])?;
-            Auth::Custom {
-                headers: auth.string_map("headers")?,
-            }
-        }
-        "passthrough" => {
-            only(&[])?;
-            Auth::Passthrough
-        }
-        _ => bail!("{}: unknown auth type {kind:?}", auth.at("type")),
-    })
 }
 
 /// One JSON object being read into a struct; errors name the key's path
@@ -777,8 +506,7 @@ mod tests {
     use super::*;
 
     use crate::testing::{
-        config_error as error, one_bay, resolved as resolve_text,
-        settings as resolve_with, vars,
+        config_error as error, one_bay, settings as resolve_with, vars,
     };
 
     fn names(settings: &Settings) -> Vec<&str> {
@@ -796,15 +524,12 @@ mod tests {
     }
 
     #[test]
-    fn no_bays_is_one_bay_named_default_and_no_routes() {
+    fn no_bays_is_one_bay_named_default() {
         for config in ["{}", r#"{"bays": null}"#, r#"{"bays": []}"#] {
             let settings = resolve_with(config);
             assert_eq!(names(&settings), ["default"]);
             assert_eq!(settings.bays[0].cpus, 4);
-            assert!(settings.routes.is_empty(), "hangar ships no routes");
         }
-        let settings = resolve_with("{}");
-        assert_eq!(settings.broker_backend, "agent-vault");
     }
 
     #[test]
@@ -842,85 +567,13 @@ mod tests {
 
     #[test]
     fn misplaced_keys_are_refused() {
-        for key in ["bay", "credentialFiles"] {
+        for key in ["bay", "credentialFiles", "tower"] {
             let config = format!(r#"{{"{key}": {{}}}}"#);
             assert_eq!(
                 error(&config),
                 format!("config.{key}: unknown setting")
             );
         }
-        assert_eq!(
-            error(r#"{"tower": {"apps": []}}"#),
-            "config.tower.apps: unknown setting"
-        );
-    }
-
-    #[test]
-    fn the_tower_holds_routes_backend_and_credentials() {
-        let settings = resolve_with(
-            r#"{"tower": {
-              "agentVault": {"adminPort": 15000},
-              "credentialFiles": {"JIRA": "/run/j"},
-              "masterPasswordFile": "/run/pw",
-              "routes": [{"name": "twilio", "host": "api.twilio.com",
-                          "auth": {"type": "basic", "username": "SID"},
-                          "extra": {"substitutions": []}}]}}"#,
-        );
-        let twilio = &settings.routes["twilio"];
-        assert_eq!(twilio.name, "twilio");
-        assert_eq!(
-            json::stringify(&route_json(twilio)),
-            r#"{"auth":{"type":"basic","username":"SID"},"extra":{"substitutions":[]},"host":"api.twilio.com","name":"twilio"}"#
-        );
-        assert_eq!(settings.credential_files["JIRA"], "/run/j");
-        assert_eq!(settings.master_password_file.as_deref(), Some("/run/pw"));
-        let route = |route: &str| {
-            error(&format!(r#"{{"tower": {{"routes": [{route}]}}}}"#))
-        };
-        assert_eq!(
-            route(r#"{"host": "h", "auth": {"type": "passthrough"}}"#),
-            "config.tower.routes.0.name: expected a string"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h", "auth": {"type": "passthrough"}},
-                   {"name": "x", "host": "i", "auth": {"type": "passthrough"}}"#
-            ),
-            "config.tower.routes: two routes named x"
-        );
-        assert!(
-            route(r#"{"name": "x", "host": "h", "auth": {"type": "oops"}}"#)
-                .contains("unknown auth")
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "api-key", "key": "K", "prefx": "T"}}"#
-            ),
-            "config.tower.routes.x.auth.prefx: unknown setting"
-        );
-        assert_eq!(
-            route(r#"{"name": "x", "host": "h", "auth": {"type": "bearer"}}"#),
-            "config.tower.routes.x.auth.token: expected a string"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "passthrough"}, "substitutions": []}"#
-            ),
-            "config.tower.routes.x.substitutions: unknown setting"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "passthrough"}, "extra": []}"#
-            ),
-            "config.tower.routes.x.extra: expected an object"
-        );
-        assert_eq!(
-            error(r#"{"tower": {"routes": {}}}"#),
-            "config.tower.routes: expected a list"
-        );
     }
 
     #[test]
@@ -1077,174 +730,10 @@ mod tests {
             panic!("not an object")
         };
         let keys: Vec<&String> = top.keys().collect();
-        assert_eq!(keys, ["bays", "tower"]);
+        assert_eq!(keys, ["bays"]);
         let settings = resolve_with(INITIAL_CONFIG);
-        assert!(settings.routes.is_empty());
         assert_eq!(names(&settings), ["default"]);
         assert_eq!(settings.bays[0].packages, Vec::<String>::new());
-        assert!(settings.master_password_file.is_none());
-    }
-
-    #[test]
-    fn an_apps_fixed_credential_is_managed_while_a_route_sends_it() {
-        let app = |route_user: &str| {
-            format!(
-                r#"{{"bays": [{{"name": "default", "apps": ["git"]}}],
-                    "appDefinitions": {{"git": {{
-                      "credentials": {{"GIT_USER": "x-user"}},
-                      "routes": [{{"name": "git", "host": "git.example",
-                        "auth": {{"type": "basic", "username": "{route_user}",
-                                  "password": "GIT_TOKEN"}}}}]}}}},
-                    "tower": {{"credentialFiles": {{"GIT_TOKEN": "/run/t"}}}}}}"#
-            )
-        };
-        assert_eq!(
-            managed_credentials(&resolve_with(&app("GIT_USER"))),
-            BTreeMap::from([
-                (
-                    "GIT_USER".into(),
-                    Source::App {
-                        app: "git".into(),
-                        value: "x-user".into()
-                    }
-                ),
-                ("GIT_TOKEN".into(), Source::File("/run/t".into())),
-            ])
-        );
-        let unused = resolve_with(&app("OTHER_USER"));
-        assert_eq!(managed_credentials(&unused).len(), 1);
-        let clash = app("GIT_USER")
-            .replace(r#""GIT_TOKEN": "/run"#, r#""GIT_USER": "/run"#);
-        assert_eq!(
-            error(&clash),
-            "config.tower.credentialFiles.GIT_USER: app git sets it"
-        );
-        // A token file alone adds no routes.
-        let plain = resolve_with(
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/run/gh"}}}"#,
-        );
-        assert!(plain.routes.is_empty());
-        assert_eq!(unused_credential_files(&plain), ["GITHUB_TOKEN"]);
-        assert_eq!(
-            unused_credential_files(&resolve_with(&app("GIT_USER"))),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn a_path_scope_another_route_covers_whole_is_found() {
-        let routes = |hosts: &[&str]| {
-            let routes: Vec<String> = hosts
-                .iter()
-                .enumerate()
-                .map(|(index, host)| {
-                    format!(
-                        r#"{{"name": "r{index}", "host": "{host}",
-                             "auth": {{"type": "passthrough"}}}}"#
-                    )
-                })
-                .collect();
-            let config =
-                format!(r#"{{"tower": {{"routes": [{}]}}}}"#, routes.join(","));
-            uncovered_path_scopes(&resolve_with(&config))
-        };
-        let pair = |scoped: &str, whole: &str| (scoped.into(), whole.into());
-        assert_eq!(
-            routes(&["mcp.example.com/v1/mcp", "mcp.example.com"]),
-            [pair("r0", "r1")]
-        );
-        assert_eq!(
-            routes(&[
-                "mcp.example.com/v1/*",
-                "*.example.com",
-                "x.mcp.example.com"
-            ]),
-            [pair("r0", "r1")]
-        );
-        assert_eq!(
-            routes(&["MCP.example.com:8443/v1", "mcp.example.com:8443"]),
-            [pair("r0", "r1")]
-        );
-        for alone in [
-            &["mcp.example.com/v1/mcp", "mcp.example.com/v2/*"][..],
-            &["mcp.example.com/v1", "mcp.example.com:8443"],
-            &["mcp.example.com/v1", "*.mcp.example.com"],
-            &["a.mcp.example.com/v1", "*.example.com"],
-            &["mcp.example.com/v1", "example.com"],
-        ] {
-            assert_eq!(routes(alone), Vec::new(), "{alone:?}");
-        }
-    }
-
-    #[test]
-    fn placeholders_cover_every_injected_credential() {
-        let settings = resolve_with(
-            r#"{"bays": [{"name": "default", "apps": ["github-token"]}],
-                "tower": {"credentialFiles": {"GITHUB_TOKEN": "/run/gh"},
-                "routes": [
-                  {"name": "jira", "host": "x.atlassian.net",
-                   "auth": {"type": "custom",
-                            "headers": {"Authorization": "Basic {{ JIRA }}"}}},
-                  {"name": "keyed", "host": "api.example.com",
-                   "auth": {"type": "api-key", "key": "X_KEY"}}]}}"#,
-        );
-        let names: Vec<String> =
-            referenced_credentials(&settings).into_iter().collect();
-        assert_eq!(names, ["GITHUB_GIT_USER", "GITHUB_TOKEN", "JIRA", "X_KEY"]);
-    }
-
-    #[test]
-    fn packages_need_routes_to_the_nix_and_github_hosts() {
-        let route = |name: &str, host: &str| {
-            format!(
-                r#"{{"name": "{name}", "host": "{host}",
-                     "auth": {{"type": "passthrough"}}}}"#
-            )
-        };
-        let with = |packages: &str, routes: &[String]| {
-            resolve_text(&format!(
-                r#"{{"bays": [{{"name": "work", "packages": [{packages}]}}],
-                    "tower": {{"routes": [{}]}}}}"#,
-                routes.join(", ")
-            ))
-        };
-        let nix = route("n", "cache.nixos.org");
-        let github = route("g", "api.github.com");
-        let error = with(r#""path:/p""#, &[]).unwrap_err();
-        assert_eq!(
-            error.message(),
-            "bay work has packages, but no route allows cache.nixos.org"
-        );
-        assert_eq!(
-            error.hint(),
-            Some(r#"add "nix" and "github" (or "github-token") to its apps"#)
-        );
-        assert!(
-            with(
-                r#""path:/p", "https://x/y.tar.gz""#,
-                std::slice::from_ref(&nix)
-            )
-            .is_ok()
-        );
-        for package in [
-            r#""github:o/r#x""#,
-            r#""nixpkgs#rtk""#,
-            r#""flake:nixpkgs#rtk""#,
-        ] {
-            let error = with(package, std::slice::from_ref(&nix)).unwrap_err();
-            assert_eq!(
-                error.message(),
-                "bay work has packages, but no route allows api.github.com"
-            );
-            assert!(with(package, &[nix.clone(), github.clone()]).is_ok());
-        }
-        // An exact host, not a wildcard that happens to cover it.
-        let wild = route("w", "*.nixos.org");
-        assert!(with(r#""path:/p""#, &[wild]).is_err());
-        // Routes are shared: one bay's apps serve another's packages.
-        let two = r#"{"bays": [{"name": "a", "apps": ["nix", "github"]},
-                               {"name": "b", "packages": ["nixpkgs#rtk"]}]}"#;
-        assert!(resolve_text(two).is_ok());
     }
 
     #[test]
@@ -1255,7 +744,6 @@ mod tests {
             let message =
                 error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#), ""));
             assert!(message.contains("looks like a real secret"), "{message}");
-            assert!(message.contains("hangar credential set T"), "{message}");
         }
         let ok = resolve_with(&one_bay(
             r#""env": {"T": "placeholder value"}, "run": {"paper-clip2": "x"}"#,

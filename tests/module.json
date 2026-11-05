@@ -7,7 +7,7 @@
   "bays": [
     {
       "name": "default",
-      "apps": ["nix", "github-token", "claude-code", "web"],
+      "apps": ["claude-code", "web"],
       "image": "ghcr.io/example/hangar-bay:latest",
       "packages": ["github:numtide/llm-agents.nix#codex"],
       "env": { "EXAMPLE_MODE": "demo" },
@@ -22,9 +22,5 @@
       "image": "example/bay:dev",
       "imageLoader": "/nix/store/00000000000000000000000000000000-bay-image"
     }
-  ],
-  "tower": {
-    "credentialFiles": { "GITHUB_TOKEN": "/run/secrets/github-token" },
-    "routes": []
-  }
+  ]
 }
