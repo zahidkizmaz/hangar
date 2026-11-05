@@ -96,7 +96,9 @@ fn reconcile(
 }
 
 /// Mount sources live under the proxy's own folder, so a kind can't
-/// mount anything else; each is created 0700 and checked once resolved.
+/// mount anything else. Each is checked before it is created 0700 (a
+/// symlink planted in the folder must not make hangar create outside it)
+/// and again once resolved.
 fn resolve_mounts(
     hangar: &Hangar,
     name: &str,
@@ -117,6 +119,13 @@ fn resolve_mounts(
             let lexical = hangar.state.proxies().join(name);
             let climbs = host.components().any(|c| c == Component::ParentDir);
             if climbs || !host.starts_with(&lexical) {
+                return Err(outside());
+            }
+            let existing = host.ancestors().find(|path| path.exists());
+            let existing = existing.unwrap_or(host);
+            let existing =
+                fs::canonicalize(existing).context(existing.display())?;
+            if !existing.starts_with(&root) {
                 return Err(outside());
             }
             mounts::create(host).context(host.display())?;
@@ -355,6 +364,20 @@ mod tests {
             assert!(result.contains("is outside its data dir"), "{result}");
             assert!(sandbox.created.borrow().is_empty());
         }
+    }
+
+    #[test]
+    fn nothing_is_created_through_a_symlink_out_of_the_proxy_dir() {
+        let state = scratch_dir("managed-escape-create");
+        let outside = scratch_dir("managed-escape-create-target");
+        let root = state.join("proxies/p");
+        fs::create_dir_all(&root).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        let sandbox = Rc::new(FakeSandbox::default());
+        let host = root.join("link/new/deeper");
+        let result = run(&state, &sandbox, &with_mount(&host));
+        assert!(result.contains("is outside its data dir"), "{result}");
+        assert!(!outside.join("new").exists());
     }
 
     #[test]
