@@ -33,7 +33,8 @@ folder, `$XDG_DATA_HOME/hangar/proxies/<name>/data/data`, mounted at
 token on stdin; the proxy enrols with Infisical on every start. A bay
 logs in as `x-agent-vault` with the session token as its password, and
 trusts the CA the proxy serves at `/_agent-vault/ca`. `hangar logs NAME`
-shows the proxy's log.
+shows the proxy's log, `data/proxy.log`; each start moves a log past
+10 MiB to `proxy.log.1`, keeping one old log.
 
 Both token files must stay present for every hangar command, since the
 proxy is built when the config loads. An empty file is an error.
@@ -54,7 +55,16 @@ proxy is built when the config loads. An empty file is an error.
    `hangar up`.
 
 Which hosts a bay may reach, and which credential each gets, you set in
-Infisical.
+Infisical. A bay needs at least:
+
+- Nix (packages, apps): `cache.nixos.org`, `channels.nixos.org`,
+  `cache.numtide.com`, `github.com`, `api.github.com`,
+  `codeload.github.com`, `objects.githubusercontent.com`;
+- npm: `registry.npmjs.org`;
+- the apps' model APIs: `api.anthropic.com` (Claude Code),
+  `api.openai.com` (Codex), `openrouter.ai` if you use it;
+- Docker pulls, if you run Docker: `registry-1.docker.io`,
+  `auth.docker.io`, `production.cloudflare.docker.com`.
 
 **Renewing the session token:** replace the file, then run `hangar up`.
 Each bay updates in place (`updated (proxy login)`) and its apps restart

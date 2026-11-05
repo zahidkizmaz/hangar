@@ -56,6 +56,12 @@ Put each token in a file only you can read, then replace
 }
 ```
 
+Until a hangar release is tagged, the default bay image isn't
+published: build and load it, or use the Nix module's `imagePackage`
+([docs/nix.md](docs/nix.md#local-images)). The Infisical access bundle
+must allow the hosts a bay fetches from
+([list](docs/proxy-kinds.md#infisical-setup)).
+
 ```sh
 hangar up         # the proxy's VM, then the bay
 hangar ps         # what runs, and anything wrong
