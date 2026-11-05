@@ -429,11 +429,12 @@ fn hash(copy: &FileCopy) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Copied, CopyPlan, FileCopy, Record, apply_copy, hash,
-        is_credentials_file, plan, plan_copy, vm_path,
+        Copied, CopyPlan, FileCopy, Record, Request, ad_hoc_entry, apply_copy,
+        copy as copy_files, copy_declared, hash, is_credentials_file, plan,
+        plan_copy, vm_path,
     };
     use crate::error::Result;
-    use crate::testing::{roots, scratch_dir};
+    use crate::testing::{hangar_with, roots, scratch_dir, settled};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -822,5 +823,64 @@ mod tests {
         assert_ne!(hash(&plain), hash(&copy("/home/pilot/a", "y")));
         assert_ne!(hash(&plain), hash(&executable));
         assert_eq!(hash(&plain), hash(&copy("/elsewhere", "x")));
+    }
+
+    const CODE_MOUNT: &str = r#"{"bays": [{"name": "work", "proxy": null,
+        "mounts": {"~/code": {"host": "~/code", "mode": "rw"}}}]}"#;
+    const CONFIG_COPY: &str = r#"{"bays": [{"name": "work", "proxy": null,
+        "mounts": {"~/cfg": {"host": "~/cfg", "mode": "copy"}}}]}"#;
+    const NO_MOUNTS: &str = r#"{"bays": [{"name": "work", "proxy": null}]}"#;
+
+    #[test]
+    fn ad_hoc_copies_without_a_dest_stay_inside_the_home() {
+        let home = scratch_dir("files-outside-home");
+        let error = ad_hoc_entry("/etc/hosts", None, &home).unwrap_err();
+        assert!(
+            error.message().contains("is outside your home"),
+            "{}",
+            error.message()
+        );
+        let (dest, _) = ad_hoc_entry("~/notes", None, &home).unwrap();
+        assert_eq!(dest, "/home/pilot/notes");
+    }
+
+    #[test]
+    fn ad_hoc_copies_refuse_to_land_inside_a_live_mount() {
+        let state = scratch_dir("files-overlap");
+        let hangar = hangar_with(CODE_MOUNT, &state, settled());
+        let bay = hangar.bay("work").unwrap();
+        let request = Request::AdHoc {
+            src: "~/notes",
+            dest: Some("~/code/notes"),
+        };
+        let error = copy_files(&hangar, &bay, &request).unwrap_err();
+        assert!(
+            error.message().contains("overlaps the mount at"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_copy_dropped_from_the_config_is_removed_from_the_vm() {
+        let state = scratch_dir("files-dropped");
+        let sandbox = settled();
+        let hangar = hangar_with(CONFIG_COPY, &state, sandbox.clone());
+        fs::write(hangar.host_home.join("cfg"), "settings").unwrap();
+        let bay = hangar.bay("work").unwrap();
+        let copied = copy_declared(&hangar, &bay).unwrap();
+        assert_eq!(copied.copied, ["/home/pilot/cfg"]);
+
+        let hangar = hangar_with(NO_MOUNTS, &state, sandbox.clone());
+        let bay = hangar.bay("work").unwrap();
+        let copied = copy_declared(&hangar, &bay).unwrap();
+        assert_eq!(copied.removed, ["/home/pilot/cfg"]);
+        let calls = sandbox.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("rm -f -- /home/pilot/cfg")),
+            "{calls:?}"
+        );
     }
 }

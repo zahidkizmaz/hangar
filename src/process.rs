@@ -71,3 +71,28 @@ pub(crate) fn spawn_error(command: &Command, error: &std::io::Error) -> Error {
 pub(crate) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_error;
+    use std::io::{Error, ErrorKind};
+    use std::process::Command;
+
+    #[test]
+    fn a_missing_program_is_reported_as_not_on_path() {
+        let error = Error::from(ErrorKind::NotFound);
+        let message = spawn_error(&Command::new("nope"), &error);
+        assert_eq!(message.message(), "nope not found on PATH");
+    }
+
+    #[test]
+    fn any_other_spawn_failure_keeps_its_cause() {
+        let error = Error::from(ErrorKind::PermissionDenied);
+        let message = spawn_error(&Command::new("nope"), &error);
+        assert!(
+            message.message().starts_with("could not run nope: "),
+            "{}",
+            message.message()
+        );
+    }
+}

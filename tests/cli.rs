@@ -848,3 +848,57 @@ fn rotated_proxy_token_recreates_the_proxy_only() {
     assert_eq!(machine.fake_file("hangar-infisical"), "pt-SECRET-4\n");
     assert!(data.join("kept").exists());
 }
+
+#[test]
+fn up_loads_a_nix_built_image_through_its_loader() {
+    let machine = with_bay("loader", r#", "imageLoader": "image-loader""#, "");
+    machine.script("image-loader", "exit 0");
+    assert_eq!(run(&machine, &["up"]), "default: created\n");
+    assert_eq!(calls(&machine, "load "), ["load -q --tag example/bay:1"]);
+}
+
+#[test]
+fn up_reports_a_failed_image_load() {
+    let machine =
+        with_bay("loader-fail", r#", "imageLoader": "image-loader""#, "");
+    machine.script("image-loader", "exit 0");
+    machine.fail("load", "error: corrupt archive");
+    let output = machine.hangar(&["up"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let out = stdout(&output);
+    assert!(out.contains("msb load example/bay:1 failed"), "{out}");
+}
+
+#[test]
+fn up_reports_a_volume_msb_cannot_inspect() {
+    let machine = with_bay("volume-inspect", "", "");
+    machine.fail("volume", "error: database locked");
+    let output = machine.hangar(&["up"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let out = stdout(&output);
+    assert!(out.contains("msb volume inspect"), "{out}");
+    assert!(out.contains("database locked"), "{out}");
+}
+
+#[test]
+fn rm_data_reports_a_volume_msb_cannot_remove() {
+    let machine = with_bay("volume-rm", "", "");
+    run(&machine, &["up"]);
+    machine.fail("volume", "error: volume busy");
+    let output = machine.hangar(&["rm", "default", "--data", "--yes"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let out = stdout(&output);
+    assert!(
+        out.contains("msb volume rm hangar-bay-default-data"),
+        "{out}"
+    );
+    assert!(out.contains("volume busy"), "{out}");
+}
+
+#[test]
+fn a_missing_config_points_at_init() {
+    let machine = Machine::new("no-config");
+    let error = failed(&machine.hangar(&["ps"], &[]));
+    assert!(error.contains("no config at"), "{error}");
+    assert!(error.contains("hangar init"), "{error}");
+}

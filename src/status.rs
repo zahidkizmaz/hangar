@@ -327,4 +327,11 @@ mod tests {
         );
         assert_eq!(events(&all_well), Vec::<String>::new());
     }
+
+    #[test]
+    fn run_states_have_stable_words() {
+        assert_eq!(RunState::Running.as_str(), "running");
+        assert_eq!(RunState::Exited.as_str(), "exited");
+        assert_eq!(RunState::NeedsSetup.as_str(), "needs-setup");
+    }
 }

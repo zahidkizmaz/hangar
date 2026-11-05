@@ -450,6 +450,7 @@ mod tests {
     use crate::commands::UpReport;
     use crate::error::Error;
     use crate::lifecycle::{self, Change, Resource};
+    use crate::proxy::Health;
     use crate::sandbox::BoxState;
     use crate::status::{
         BayStatus, Detail, Overview, ProxyDetail, ProxyStatus, RunState,
@@ -637,5 +638,38 @@ mod tests {
             to_string(&error_json(&Error::new("plain"))),
             r#"{"error":"plain","hint":null}"#
         );
+    }
+
+    #[test]
+    fn overview_json_names_each_proxy_health() {
+        let health = |health| ProxyStatus {
+            health,
+            ..proxy_status(None)
+        };
+        let json = to_string(
+            &Outcome::Overview(Overview {
+                bays: Vec::new(),
+                proxies: vec![
+                    health(Some(Health::Up)),
+                    health(Some(Health::Down("refused".into()))),
+                    health(None),
+                ],
+                leftovers: Vec::new(),
+            })
+            .json(),
+        );
+        assert!(json.contains(r#""health":"up""#), "{json}");
+        assert!(json.contains(r#""health":"unreachable""#), "{json}");
+        assert!(json.contains(r#""health":null"#), "{json}");
+    }
+
+    #[test]
+    fn an_overview_of_nothing_prints_no_table() {
+        let empty = Outcome::Overview(Overview {
+            bays: Vec::new(),
+            proxies: Vec::new(),
+            leftovers: Vec::new(),
+        });
+        assert_eq!(empty.human(), "");
     }
 }
