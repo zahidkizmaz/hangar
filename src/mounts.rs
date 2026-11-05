@@ -105,7 +105,7 @@ pub(crate) fn check_targets(
             format!(
                 "mounts.{vm} covers {VM_HOME}, where the bay's home is mounted"
             ),
-            "set home = false to mount your own",
+            format!("mount it at a path below {VM_HOME}"),
         ));
     }
     let targets: Vec<&String> = mounts.keys().collect();
@@ -935,6 +935,10 @@ mod tests {
             assert!(
                 error.to_string().contains("bay's home is mounted"),
                 "{vm}: {error}"
+            );
+            assert_eq!(
+                error.hint(),
+                Some("mount it at a path below /home/pilot")
             );
         }
     }
