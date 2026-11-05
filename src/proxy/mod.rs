@@ -5,7 +5,7 @@
 mod agent_vault;
 pub(crate) mod ca;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 mod http;
 mod infisical;
 pub(crate) mod managed;

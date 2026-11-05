@@ -16,7 +16,7 @@ use crate::json;
 use crate::lifecycle::Resource;
 use crate::mounts;
 use crate::proxy::{self, Proxy, Spec};
-use crate::sandbox::{Msb, Sandbox, bay_vm};
+use crate::sandbox::{Egress, Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
 
 pub(crate) struct Hangar {
@@ -154,14 +154,23 @@ pub(crate) fn build_proxies(
         .collect()
 }
 
-/// No two things publish the same host port: managed proxies and bays.
+/// No two things take the same host port: proxies (where they listen or
+/// publish) and bays.
 pub(crate) fn check_ports(
     settings: &Settings,
     proxies: &BTreeMap<String, Box<dyn Proxy>>,
 ) -> Result<()> {
-    let managed = proxies.iter().filter_map(|(name, proxy)| {
-        let (host, _) = proxy.managed()?.vm().publish;
-        Some((host, format!("proxy {name}")))
+    let proxies = proxies.iter().flat_map(|(name, proxy)| {
+        let egress = match proxy.egress() {
+            Egress::HostPort(port) => Some(port),
+            Egress::Open => None,
+        };
+        let published = proxy.managed().map(|managed| managed.vm().publish.0);
+        let mut ports: Vec<u16> = egress.into_iter().chain(published).collect();
+        ports.dedup();
+        ports
+            .into_iter()
+            .map(move |port| (port, format!("proxy {name}")))
     });
     let bays = settings.bays.iter().flat_map(|bay| {
         bay.ports
@@ -169,7 +178,7 @@ pub(crate) fn check_ports(
             .map(|port| (port.host, format!("{}/{}", bay.name, port.name)))
     });
     let mut owners = BTreeMap::new();
-    for (port, owner) in managed.chain(bays) {
+    for (port, owner) in proxies.chain(bays) {
         if let Some(first) = owners.insert(port, owner.clone()) {
             bail!("port {port}: {first} and {owner}");
         }
@@ -210,6 +219,7 @@ mod tests {
     use crate::sandbox::fake::FakeSandbox;
     use crate::state::StateDir;
     use crate::testing::{hangar_with, scratch_dir, settings};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::rc::Rc;
@@ -273,6 +283,42 @@ mod tests {
         )
         .unwrap();
         assert!(check_ports(&settings, &proxies).is_ok());
+    }
+
+    #[test]
+    fn an_external_proxys_port_is_taken_too() {
+        let config = |port: u16| {
+            format!(
+                r#"{{"proxies": {{"p": {{"kind": "fake", "url": "x",
+                "port": {port}}}, "q": {{"kind": "fake", "url": "y",
+                "port": 3200}}}}, "bays": [{{"name": "work", "proxy": "p",
+                "apps": ["paperclip"]}}]}}"#
+            )
+        };
+        let error_at = |port: u16| {
+            let settings = settings(&config(port));
+            let state = StateDir::new(scratch_dir("hangar-external-port"));
+            let proxies =
+                build_proxies(&settings, &state, Path::new("/home/u")).unwrap();
+            check_ports(&settings, &proxies)
+                .err()
+                .map(|e| e.to_string())
+        };
+        assert_eq!(
+            error_at(3100).as_deref(),
+            Some("port 3100: proxy p and work/paperclip")
+        );
+        assert_eq!(
+            error_at(3200).as_deref(),
+            Some("port 3200: proxy p and proxy q")
+        );
+        assert_eq!(error_at(3300), None);
+        let open = crate::proxy::fake::FakeProxy {
+            egress: crate::sandbox::Egress::Open,
+            ..crate::proxy::fake::FakeProxy::at(1)
+        };
+        let proxies = BTreeMap::from([("o".to_string(), Box::new(open) as _)]);
+        assert!(check_ports(&settings(MANAGED_AT_3100), &proxies).is_ok());
     }
 
     #[test]
