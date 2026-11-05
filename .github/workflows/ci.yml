@@ -47,7 +47,7 @@ jobs:
         run: nix build --print-build-logs .#bay-image
       - run: nix develop --command prek run --all-files --show-diff-on-failure
       - run: nix develop --command cargo deny check
-      # The baseline was measured on macOS (keychain code differs per OS).
+      # The floor is measured on macOS only.
       # Raise the floor as tests are added; never lower it.
       - if: runner.os == 'macOS'
         run: nix develop --command cargo llvm-cov nextest --summary-only --fail-under-lines 98

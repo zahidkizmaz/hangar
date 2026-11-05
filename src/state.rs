@@ -100,8 +100,9 @@ pub(crate) fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
     format!("{hash:016x}")
 }
 
-/// Writes a file only its owner can read, creating its folder first. `mode` only applies on create, so an
-/// existing file is narrowed before the contents go in.
+/// Writes a file only its owner can read, creating its folder first.
+/// `mode` only applies on create, so an existing file is narrowed before
+/// the contents go in.
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).context(dir.display())?;
