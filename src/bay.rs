@@ -93,14 +93,13 @@ fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
         wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
     })?;
     let mut changes: Vec<String> = Vec::new();
-    let proxy_env = step(bay, "proxy env", || {
+    step(bay, "proxy env", || {
         let proxy = hangar.proxy_of(bay.settings);
         let access = proxy::access(proxy, bay.name, sandbox.host_address())?;
         let env = proxy_env(proxy.map(|(_, proxy)| proxy.kind()), &access);
         let ca = access.ca_pem.as_deref().unwrap_or_default();
         changes.extend(apply_proxy(hangar, bay, &env, ca)?.map(String::from));
-        wait_for_docker(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)?;
-        Ok(env)
+        wait_for_docker(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
     })?;
     let added = step(bay, "packages", || {
         packages::reconcile(sandbox, &bay.vm, &bay.settings.packages, true)
@@ -119,7 +118,7 @@ fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
     }
     let needing_setup = step(bay, "setup checks", || check_setup(hangar, bay))?;
     changes.extend(step(bay, "apps", || {
-        sync_apps(hangar, bay, &needing_setup, &proxy_env)
+        sync_apps(hangar, bay, &needing_setup)
     })?);
     Ok(vm.unwrap_or(if changes.is_empty() {
         Outcome::Unchanged
@@ -243,6 +242,7 @@ fn recreate(
     if sandbox.state(&bay.vm)? == BoxState::Running {
         sandbox.stop(&bay.vm)?;
     }
+    remove_if_present(&bay.dir.vm())?;
     sandbox.remove(&bay.vm)?;
     if disk {
         sandbox.remove_volume(&data_volume(bay.name))?;
@@ -297,16 +297,15 @@ fn create(
         mounts: &mounts,
         env: &[],
     })?;
-    forget_copies(bay)?;
+    // A new VM has none of the files the record says were copied.
+    remove_if_present(&bay.dir.copies())?;
     write_private(&bay.dir.vm(), wanted.render().as_bytes())
 }
 
-/// A new VM has none of the files the record says were copied.
-fn forget_copies(bay: &Bay) -> Result<()> {
-    let record = bay.dir.copies();
-    match fs::remove_file(&record) {
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Err(error) if error.kind() != ErrorKind::NotFound => {
-            Err(error).context(record.display())
+            Err(error).context(path.display())
         }
         _ => Ok(()),
     }
@@ -500,8 +499,7 @@ fn apply_proxy(
 }
 
 /// The proxy for every client, and the CA bundle under every name a tool
-/// looks for; a direct bay gets only the bundle. The kind and the CA's
-/// hash make a new proxy or CA a new file too.
+/// looks for; a direct bay gets only the bundle.
 fn proxy_env(kind: Option<&str>, access: &Access) -> Secret {
     let mut env = BTreeMap::new();
     if let Some(url) = &access.url {
@@ -521,11 +519,9 @@ fn proxy_env(kind: Option<&str>, access: &Access) -> Secret {
     ] {
         env.insert(name.to_string(), CA_BUNDLE.path.to_string());
     }
-    let ca_pem = access.ca_pem.as_deref().unwrap_or_default();
     Secret::new(format!(
-        "# proxy {} CA {}\n{}",
+        "# proxy {}\n{}",
         kind.unwrap_or("none"),
-        fnv(ca_pem.iter().copied()),
         render_env(&env)
     ))
 }
@@ -553,20 +549,25 @@ fn render_env(env: &BTreeMap<String, String>) -> String {
 /// its user manager.
 const USER_MANAGER: &str = "export XDG_RUNTIME_DIR=/run/user/1000\n";
 
-/// Starts the unit `$1` unless it runs, after stopping it for `restart`;
-/// prints `started`, or the running unit's description. `--collect`
-/// unloads it once it exits, failed or not, so its name is free again.
-/// The login shell brings the proxy env, `bay.env` and the profile.
-const START_RUN: &str = r#"case $(systemctl --user is-active "$1") in
+/// Starts the unit `$1` unless it runs with the description `$3` plus the
+/// checksum of the proxy env and CA bundle (`$4`, `$5`), restarting it
+/// otherwise; prints `running`, `started` or `restarted`. The checksum is
+/// taken in the guest so nothing derived from the login reaches the host.
+/// `--collect` unloads the unit once it exits, failed or not, so its name
+/// is free again. The login shell brings the proxy env, `bay.env` and the
+/// profile.
+const START_RUN: &str = r#"wanted="$3 $(cat "$4" "$5" | cksum)"
+case $(systemctl --user is-active "$1") in
 active | activating)
-  [ "$4" = restart ] || exec systemctl --user show -P Description "$1"
-  systemctl --user stop "$1" ;;
+  [ "$(systemctl --user show -P Description "$1")" = "$wanted" ] &&
+    exec echo running
+  systemctl --user stop "$1" && again=re ;;
 esac
-systemd-run --user --quiet --collect --unit="$1" --description="$3" \
-  --property=TimeoutStopSec=10s /bin/sh -lc "$2" && echo started"#;
+systemd-run --user --quiet --collect --unit="$1" --description="$wanted" \
+  --property=TimeoutStopSec=10s /bin/sh -lc "$2" && echo "${again}started""#;
 
 const LIST_RUNS: &str =
-    "systemctl --user list-units 'hangar-run-*' --plain --no-legend --all";
+    "systemctl --user list-units 'hangar-run-*' --plain --no-legend";
 const STOP_RUN: &str = r#"systemctl --user stop "$1""#;
 const RUN_PREFIX: &str = "hangar-run-";
 
@@ -621,21 +622,15 @@ fn sync_apps(
     hangar: &Hangar,
     bay: &Bay,
     needing_setup: &[String],
-    proxy_env: &Secret,
 ) -> Result<Vec<String>> {
     let mut changes = Vec::new();
     for (name, command) in &bay.settings.run {
         if needing_setup.contains(name) {
             continue;
         }
-        let wanted = description(bay, name, command, proxy_env);
-        match launch(hangar, bay, name, command, &wanted, false)?.as_str() {
-            "started" => changes.push(format!("started {name}")),
-            running if running != wanted => {
-                launch(hangar, bay, name, command, &wanted, true)?;
-                changes.push(format!("restarted {name}"));
-            }
-            _ => {}
+        let done = launch(hangar, bay, name, command)?;
+        if matches!(done.as_str(), "started" | "restarted") {
+            changes.push(format!("{done} {name}"));
         }
     }
     for name in unlisted_runs(hangar, bay)? {
@@ -663,17 +658,12 @@ fn unlisted_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The unit's description records what the entry was started with: a
-/// hash of its command, the env files and the copied config files.
-fn description(
-    bay: &Bay,
-    name: &str,
-    command: &str,
-    proxy_env: &Secret,
-) -> String {
+/// The host's half of the unit's description: a hash of the entry's
+/// command, `bay.env` and the copied config files, none of them secret.
+fn description(bay: &Bay, name: &str, command: &str) -> String {
     let env = render_env(&bay.settings.env);
     let copies = files::record_text(bay);
-    let inputs = [command, &env, proxy_env.expose(), &copies].join("\0");
+    let inputs = [command, &env, &copies].join("\0");
     format!("hangar run {name} {}", fnv(inputs.into_bytes()))
 }
 
@@ -683,12 +673,17 @@ fn launch(
     bay: &Bay,
     name: &str,
     command: &str,
-    description: &str,
-    restart: bool,
 ) -> Result<String> {
-    let mode = if restart { "restart" } else { "start" };
     let unit = run_unit(name);
-    let args = ["hangar-run", &unit, command, description, mode];
+    let description = description(bay, name, command);
+    let args = [
+        "hangar-run",
+        &unit,
+        command,
+        &description,
+        PROXY_ENV_FILE,
+        CA_BUNDLE.path,
+    ];
     user_units(hangar, bay, START_RUN, &args)
 }
 
@@ -728,9 +723,9 @@ fn ensure_image(hangar: &Hangar, bay: &Bay, image: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Probe, WAIT_TIMEOUT, boot_state, check_setup, down, ensure_image,
-        proxy_env, replace_script, sync_apps, up, wait_booted, wait_for_docker,
-        write_env,
+        Probe, START_RUN, WAIT_TIMEOUT, boot_state, check_setup, down,
+        ensure_image, proxy_env, replace_script, sync_apps, up, wait_booted,
+        wait_for_docker, write_env,
     };
     use crate::error::Error;
     use crate::lifecycle::Outcome;
@@ -792,13 +787,12 @@ mod tests {
         String::from_utf8(sandbox.stdins.borrow()[at].clone()).unwrap()
     }
 
-    /// What the last launch of paperclip described it with.
-    fn launched_description(sandbox: &FakeSandbox) -> String {
-        let changes = sandbox.changes();
-        let call = changes.iter().rev().find(|c| c.contains(LAUNCH)).unwrap();
-        let (_, rest) = call.split_once(" hangar run ").unwrap();
-        let (named_hash, _mode) = rest.rsplit_once(' ').unwrap();
-        format!("hangar run {named_hash}")
+    /// The calls a fresh `up` of `config` makes in a fresh state.
+    fn first_up_calls(config: &str) -> Vec<String> {
+        let state = scratch_dir("bay-up-argv");
+        let sandbox = settled();
+        assert_eq!(up_with(config, &state, &sandbox), "Created");
+        sandbox.calls.borrow().clone()
     }
 
     fn position(changes: &[String], call: &str) -> usize {
@@ -841,15 +835,12 @@ mod tests {
         let state = scratch_dir("bay-up-unchanged");
         let sandbox = settled();
         assert_eq!(up_with(PROXIED, &state, &sandbox), "Created");
-        sandbox.reply(LAUNCH, &launched_description(&sandbox));
+        sandbox.reply(LAUNCH, "running");
         forget(&sandbox);
         assert_eq!(up_with(PROXIED, &state, &sandbox), "Unchanged");
         let changes = sandbox.changes();
-        assert!(
-            !changes.iter().any(|c| c.ends_with(" restart")),
-            "{changes:#?}"
-        );
         assert!(!changes.iter().any(|c| c.starts_with("create ")));
+        assert!(!changes.iter().any(|c| c.contains("hangar-run-stop")));
     }
 
     #[test]
@@ -875,6 +866,23 @@ mod tests {
         assert!(stop < remove && remove < create, "{changes:#?}");
         assert!(!changes.iter().any(|c| c.starts_with("volume rm")));
         assert!(state.join("bays/work/home").is_dir());
+    }
+
+    #[test]
+    fn a_failed_recreate_leaves_no_record() {
+        let state = scratch_dir("bay-up-recreate-fails");
+        let sandbox = settled();
+        assert_eq!(up_with(WORK_DIRECT, &state, &sandbox), "Created");
+        let bigger = WORK_DIRECT
+            .replace(r#""proxy": null"#, r#""proxy": null, "cpus": 8"#);
+        sandbox.fail_create.set(true);
+        assert!(up_with(&bigger, &state, &sandbox).starts_with("Failed("));
+        assert!(!state.join("bays/work/vm").exists());
+        sandbox.fail_create.set(false);
+        assert_eq!(
+            up_with(&bigger, &state, &sandbox),
+            r#"Recreated(["no record"])"#
+        );
     }
 
     #[test]
@@ -960,9 +968,9 @@ mod tests {
         let state = scratch_dir("bay-up-login");
         let sandbox = settled();
         assert_eq!(up_with(PROXIED, &state, &sandbox), "Created");
-        sandbox.reply(LAUNCH, &launched_description(&sandbox));
         forget(&sandbox);
         sandbox.reply_once("hangar-proxy-env", Some("changed\n"));
+        sandbox.reply_once(LAUNCH, Some("restarted"));
         let renewed = PROXIED.replace("pw-1", "pw-2");
         assert_eq!(
             up_with(&renewed, &state, &sandbox),
@@ -974,15 +982,29 @@ mod tests {
     }
 
     #[test]
+    fn nothing_login_derived_reaches_argv() {
+        let renewed = PROXIED.replace("pw-1", "pw-2");
+        assert_eq!(first_up_calls(PROXIED), first_up_calls(&renewed));
+    }
+
+    #[test]
     fn a_new_ca_is_reported_as_proxy_ca() {
         let state = scratch_dir("bay-up-ca");
         let sandbox = settled();
-        assert_eq!(up_with(WORK_DIRECT, &state, &sandbox), "Created");
+        assert_eq!(up_with(PROXIED, &state, &sandbox), "Created");
+        let env = stdin_of(&sandbox, "hangar-proxy-env");
+        forget(&sandbox);
+        let pem = include_str!("proxy/testdata/ca.pem").replace('\n', "\\n");
+        let with_ca =
+            PROXIED.replace(r#""port""#, &format!(r#""ca": "{pem}", "port""#));
         sandbox.reply_once(" hangar-ca ", Some("changed\n"));
+        sandbox.reply_once(LAUNCH, Some("restarted"));
         assert_eq!(
-            up_with(WORK_DIRECT, &state, &sandbox),
-            r#"Updated(["proxy CA"])"#
+            up_with(&with_ca, &state, &sandbox),
+            r#"Updated(["proxy CA", "restarted paperclip"])"#
         );
+        assert!(stdin_of(&sandbox, " hangar-ca ").contains("BEGIN CERT"));
+        assert_eq!(stdin_of(&sandbox, "hangar-proxy-env"), env);
     }
 
     #[test]
@@ -1140,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn the_proxy_env_names_the_proxy_kind_the_bundle_and_the_ca() {
+    fn the_proxy_env_names_the_proxy_kind_and_the_bundle_not_the_ca() {
         let access = |ca: &[u8]| Access {
             url: Some(Secret::new("http://a'b@host:1".into())),
             ca_pem: Some(ca.to_vec()),
@@ -1149,8 +1171,7 @@ mod tests {
         let env = proxy_env(Some("fake"), &access(b"CA-1"));
         assert_eq!(
             env.expose(),
-            format!(
-                "# proxy fake CA {}\n\
+            "# proxy fake\n\
                  CURL_CA_BUNDLE='/var/lib/hangar/ca-bundle.crt'\n\
                  GIT_SSL_CAINFO='/var/lib/hangar/ca-bundle.crt'\n\
                  HTTPS_PROXY='http://a'\\''b@host:1'\n\
@@ -1161,13 +1182,10 @@ mod tests {
                  SSL_CERT_FILE='/var/lib/hangar/ca-bundle.crt'\n\
                  http_proxy='http://a'\\''b@host:1'\n\
                  https_proxy='http://a'\\''b@host:1'\n\
-                 no_proxy='localhost,127.0.0.1'\n",
-                crate::state::fnv(*b"CA-1")
-            )
+                 no_proxy='localhost,127.0.0.1'\n"
         );
-        // A new CA alone is a new file, which restarts the daemons.
         let rotated = proxy_env(Some("fake"), &access(b"CA-2"));
-        assert_ne!(env.expose(), rotated.expose());
+        assert_eq!(env.expose(), rotated.expose());
     }
 
     #[test]
@@ -1206,6 +1224,67 @@ mod tests {
             1,
             "a tmp file was left behind"
         );
+    }
+
+    const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+case "$2" in
+is-active) cat "$d/active" 2>/dev/null || echo inactive ;;
+show) cat "$d/description" ;;
+stop) echo inactive >"$d/active" ;;
+esac"#;
+    const FAKE_SYSTEMD_RUN: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+for arg; do
+  case "$arg" in --description=*) echo "${arg#*=}" >"$d/description" ;; esac
+done
+echo active >"$d/active""#;
+
+    #[test]
+    fn a_run_restarts_in_the_guest_when_the_proxy_env_or_ca_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("start-run");
+        for (name, script) in [
+            ("systemctl", FAKE_SYSTEMCTL),
+            ("systemd-run", FAKE_SYSTEMD_RUN),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let (env, ca) = (dir.join("proxy.env"), dir.join("ca.crt"));
+        fs::write(&env, "login-1").unwrap();
+        fs::write(&ca, "ca-1").unwrap();
+        let path =
+            format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+        let launch = || {
+            let output = std::process::Command::new("/bin/sh")
+                .env("PATH", &path)
+                .args([
+                    "-c",
+                    START_RUN,
+                    "hangar-run",
+                    "u",
+                    "cmd",
+                    "hangar run x 1",
+                ])
+                .args([&env, &ca])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(launch(), "started");
+        assert_eq!(launch(), "running");
+        fs::write(&env, "login-2").unwrap();
+        assert_eq!(launch(), "restarted");
+        assert_eq!(launch(), "running");
+        fs::write(&ca, "ca-2").unwrap();
+        assert_eq!(launch(), "restarted");
+        let description = fs::read_to_string(dir.join("description")).unwrap();
+        assert!(description.starts_with("hangar run x 1 "), "{description}");
+        assert!(!description.contains("login"), "{description}");
     }
 
     #[test]
@@ -1260,7 +1339,6 @@ mod tests {
             "setup": {"command": "web init", "check": "test -f ~/.web"},
             "run": "web serve"}},
             "bays": [{"name": "default", "proxy": null, "apps": ["web"]}]}"#;
-        let env = Secret::new(String::new());
         for (check, expected) in [("needed", vec![]), ("done", vec!["web"])] {
             let sandbox = Rc::new(FakeSandbox::default());
             sandbox.reply("hangar-setup-check", check);
@@ -1268,7 +1346,8 @@ mod tests {
             let hangar = hangar_with(config, &state, sandbox.clone());
             let bay = hangar.bay("default").unwrap();
             let needing = check_setup(&hangar, &bay).unwrap();
-            sync_apps(&hangar, &bay, &needing, &env).unwrap();
+            let changes = sync_apps(&hangar, &bay, &needing).unwrap();
+            assert_eq!(changes.len(), expected.len());
             let expected: Vec<String> = expected
                 .iter()
                 .map(|name| format!("hangar-run-{name}.service {name} serve"))
