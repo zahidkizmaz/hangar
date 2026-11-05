@@ -12,6 +12,15 @@ pub(crate) enum Resource {
     Proxy,
 }
 
+impl Resource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Bay => "bay",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     Create,

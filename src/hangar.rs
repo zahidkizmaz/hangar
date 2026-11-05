@@ -14,6 +14,7 @@ use crate::error::{Context, Error, Result, bail};
 use crate::files;
 use crate::json;
 use crate::lifecycle::Resource;
+use crate::mounts;
 use crate::proxy::{self, Proxy, Spec};
 use crate::sandbox::{Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
@@ -46,6 +47,8 @@ impl Hangar {
             config::resolve(config::defaults()?, config).context(&invalid)?;
         let sandbox = sandbox(&settings.sandbox_backend).context(&invalid)?;
         let state = StateDir::new(dirs::hangar_dir(Base::Data, &env_var)?);
+        // The mount rules resolve it, so it must exist before any `up`.
+        mounts::create(state.root()).context(state.root().display())?;
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
         let host_home = files::host_home()?;

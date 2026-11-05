@@ -394,7 +394,7 @@ fn wait_for_docker(
         Probe::Pending(state) | Probe::Failed(state) => Err(Error::with_hint(
             format!("dockerd in {} did not start: {state}", bay.vm),
             format!(
-                "in 'hangar shell -b {}', run 'systemctl --user reset-failed \
+                "in 'hangar exec {}', run 'systemctl --user reset-failed \
                  docker && systemctl --user restart docker'",
                 bay.name
             ),
@@ -601,7 +601,10 @@ fn check_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
         if let Some(setup) = &app.setup
             && !setup_done(hangar.sandbox.as_ref(), &bay.vm, &setup.check)?
         {
-            warn!("{} needs setup: run 'hangar setup {}'", app.name, app.name);
+            warn!(
+                "{} needs setup: run 'hangar setup {} {}'",
+                app.name, bay.name, app.name
+            );
             names.push(app.name.clone());
         }
     }
@@ -725,7 +728,7 @@ mod tests {
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{BoxState, Egress};
     use crate::secret::Secret;
-    use crate::testing::{DIRECT, hangar_with, scratch_dir};
+    use crate::testing::{DIRECT, hangar_with, scratch_dir, settled};
     use std::fs;
     use std::path::Path;
     use std::rc::Rc;
@@ -742,16 +745,6 @@ mod tests {
 
     fn fake(vms: &[(&str, BoxState)]) -> Rc<FakeSandbox> {
         Rc::new(FakeSandbox::with(vms))
-    }
-
-    /// A sandbox whose bay answers like one that is already in line.
-    fn settled() -> Rc<FakeSandbox> {
-        let sandbox = Rc::new(FakeSandbox::default());
-        sandbox.reply("umask 077", "same\n");
-        sandbox.reply("hangar-packages /", "{}");
-        sandbox.reply("hangar-profile", r#"{"elements":{}}"#);
-        sandbox.reply("hangar-setup-check", "done");
-        sandbox
     }
 
     fn up_with(
@@ -1305,7 +1298,7 @@ echo active >"$d/active""#;
         );
         assert!(
             error.ends_with(
-                "in 'hangar shell -b default', run 'systemctl --user \
+                "in 'hangar exec default', run 'systemctl --user \
                  reset-failed docker && systemctl --user restart docker'"
             ),
             "{error}"

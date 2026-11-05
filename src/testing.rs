@@ -13,6 +13,7 @@ use crate::hangar::{Hangar, build_proxies};
 use crate::json;
 use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
+use crate::sandbox::fake::FakeSandbox;
 use crate::state::StateDir;
 
 /// An empty directory unique to this test process and `name`.
@@ -131,6 +132,16 @@ pub(crate) fn hangar_with(
         sandbox,
         proxies,
     }
+}
+
+/// A sandbox whose bays answer like ones that are already in line.
+pub(crate) fn settled() -> Rc<FakeSandbox> {
+    let sandbox = Rc::new(FakeSandbox::default());
+    sandbox.reply("umask 077", "same\n");
+    sandbox.reply("hangar-packages /", "{}");
+    sandbox.reply("hangar-profile", r#"{"elements":{}}"#);
+    sandbox.reply("hangar-setup-check", "done");
+    sandbox
 }
 
 /// Answers one request per `(status, body)`, in order, and returns

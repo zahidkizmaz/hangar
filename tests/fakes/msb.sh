@@ -23,7 +23,7 @@ create)
   echo Running >"$fake/vm-$4"
   exit 0 ;;
 start) echo Running >"$fake/vm-$3"; exit 0 ;;
-stop) echo Stopped >"$fake/vm-$3"; exit 0 ;;
+stop) echo Stopped >"$fake/vm-$3"; rm -f "$fake"/hangar-run-*; exit 0 ;;
 rm) rm -f "$fake/vm-$4"; exit 0 ;;
 load) exit 0 ;;
 volume)
@@ -60,7 +60,8 @@ want=root
 case "$1 $2" in
 "sh -c")
   case $4 in
-  hangar-run | hangar-run-status | hangar-setup-check | hangar-file | hangar-docker)
+  hangar-run | hangar-runs | hangar-run-stop | hangar-setup-check | \
+    hangar-file | hangar-docker)
     want=pilot ;;
   esac ;;
 "rm -f" | "sh -l" | "sh -lc") want=pilot ;;
@@ -100,16 +101,17 @@ case "$1 $2" in
     cat >"$fake/vmfs$5"
     chmod "$6" "$fake/vmfs$5" ;;
   hangar-run)
-    # Pilot's user units: hangar-run <unit> <command> <description> <mode>.
-    # A file per active unit holds its description.
-    if [ "$8" = restart ]; then
-      echo "$5" >>"$fake/restarts"
-    elif [ -f "$fake/$5" ]; then
-      cat "$fake/$5"; exit 0
-    fi
+    # hangar-run <unit> <command> <description> …: a file per active
+    # unit holds its description.
+    if [ "$(cat "$fake/$5" 2>/dev/null)" = "$7" ]; then echo running; exit; fi
+    [ ! -f "$fake/$5" ] || again=re
     echo "$7" >"$fake/$5"
-    echo started ;;
-  hangar-run-status) if [ -f "$fake/$5" ]; then echo active; fi ;;
+    echo "${again}started" ;;
+  hangar-runs)
+    for unit in "$fake"/hangar-run-*.service; do
+      [ ! -f "$unit" ] || echo "${unit##*/} loaded active running"
+    done ;;
+  hangar-run-stop) rm -f "$fake/$5" ;;
   hangar-setup-check) cat "$fake/setup-check" 2>/dev/null || echo needed ;;
   *) cat >"$fake/$4" ;;
   esac ;;

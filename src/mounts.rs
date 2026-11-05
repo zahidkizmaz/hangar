@@ -253,7 +253,7 @@ fn check(
 
 /// Where a missing path would end up: its nearest existing ancestor with
 /// symlinks resolved, plus the missing components.
-fn would_be(path: &Path) -> Result<PathBuf> {
+pub(crate) fn would_be(path: &Path) -> Result<PathBuf> {
     use std::path::Component;
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(Error::new("can't contain .."));
