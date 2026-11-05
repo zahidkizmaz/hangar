@@ -2,6 +2,7 @@
 //! one file in this folder plus one line in [`kinds`]; nothing else in
 //! `src/` names one.
 
+mod agent_vault;
 pub(crate) mod ca;
 #[cfg(test)]
 mod fake;
@@ -95,6 +96,7 @@ const PROXY_VM_PREFIX: &str = "hangar-proxy-";
 pub(crate) fn kinds() -> Vec<(&'static str, Build)> {
     vec![
         ("http", http::build),
+        ("agent-vault", agent_vault::build),
         #[cfg(test)]
         ("fake", fake::build),
     ]
@@ -276,7 +278,7 @@ mod tests {
         let error = error_of(built(r#"{"kind": "socks"}"#));
         assert_eq!(
             error,
-            r#"proxies.p.kind: unknown kind "socks"; known: fake, http"#
+            r#"proxies.p.kind: unknown kind "socks"; known: agent-vault, fake, http"#
         );
     }
 

@@ -676,3 +676,39 @@ fn switching_bay_proxy_recreates() {
         "{created:?}"
     );
 }
+
+#[test]
+fn bay_through_agent_vault_gets_token_url_on_stdin_only() {
+    let (_proxy, port) = listener();
+    let machine = Machine::new("agent-vault");
+    let token = machine.home.join("av-token");
+    fs::write(&token, "av_SECRET-9\n").unwrap();
+    let ca = concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/testdata/ca.pem");
+    let proxy = format!(
+        r#"{{"kind": "agent-vault", "url": "http://127.0.0.1:{port}",
+            "ca": {{"file": "{ca}"}}, "tokenFile": "{}"}}"#,
+        token.display()
+    );
+    let config = format!(
+        r#"{{"proxies": {{"p": {proxy}}}, "bays": [{{"name": "default",
+            "proxy": "p", "image": "example/bay:1"}}]}}"#
+    );
+    let path = default_config(&machine);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, config).unwrap();
+
+    let output = machine.hangar(&["up", "-vv"], &[]);
+    let said = stderr(ok(&output));
+    let env = machine.fake_file("hangar-proxy-env");
+    assert!(
+        env.contains(&format!(
+            "HTTPS_PROXY='http://av_SECRET-9:default@\
+             host.microsandbox.internal:{port}'"
+        )),
+        "{env}"
+    );
+    let log = hangar_log(&machine);
+    for text in [machine.msb_log(), log, said] {
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+}
