@@ -206,6 +206,7 @@ mod tests {
     use super::{build_proxies, check_disjoint, check_ports, sandbox};
     use crate::lifecycle::Resource;
     use crate::sandbox::fake::FakeSandbox;
+    use crate::state::StateDir;
     use crate::testing::{hangar_with, scratch_dir, settings};
     use std::fs;
     use std::path::Path;
@@ -309,5 +310,19 @@ mod tests {
             Rc::new(FakeSandbox::default()),
         );
         assert!(direct.proxy_of(&direct.settings.bays[0]).is_none());
+    }
+
+    #[test]
+    fn proxy_kind_options_are_checked_by_the_kind() {
+        let settings = settings(
+            r#"{"proxies": {"p":
+                {"kind": "fake", "run": "managed", "zzz": 1}},
+                "bays": [{"name": "work", "proxy": null}]}"#,
+        );
+        let state = StateDir::new(scratch_dir("hangar-kind-options"));
+        let error = build_proxies(&settings, &state, Path::new("/home/u"))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "proxies.p.zzz: unknown setting");
     }
 }

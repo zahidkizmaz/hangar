@@ -95,19 +95,32 @@ pub(crate) fn kinds() -> Vec<(&'static str, Build)> {
     ]
 }
 
-pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
-    let kind = spec.fields.string("kind")?;
-    let mut known = kinds();
-    known.sort_by_key(|(name, _)| *name);
-    if let Some((_, build)) = known.iter().find(|(name, _)| *name == kind) {
-        return build(spec);
+fn kind_names() -> Vec<&'static str> {
+    let mut names: Vec<&str> = kinds().iter().map(|(name, _)| *name).collect();
+    names.sort_unstable();
+    names
+}
+
+/// Fails for a `kind` no registered kind answers to.
+pub(crate) fn check_kind(fields: &Fields) -> Result<()> {
+    let kind = fields.string("kind")?;
+    if kinds().iter().any(|(name, _)| *name == kind) {
+        return Ok(());
     }
-    let names: Vec<&str> = known.iter().map(|(name, _)| *name).collect();
     bail!(
         "{}: unknown kind \"{kind}\"; known: {}",
-        spec.fields.at("kind"),
-        names.join(", ")
+        fields.at("kind"),
+        kind_names().join(", ")
     )
+}
+
+pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
+    check_kind(&spec.fields)?;
+    let kind = spec.fields.string("kind")?;
+    let build = kinds()
+        .into_iter()
+        .find_map(|(name, build)| (name == kind).then_some(build));
+    build.context("no such kind")?(spec)
 }
 
 /// Where a proxy runs: `"run": "managed"` here, or a `url`.

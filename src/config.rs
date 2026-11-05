@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::apps::{self, App};
 use crate::dirs::{self, Base};
 use crate::error::{Context, Result, bail};
 use crate::files;
 use crate::mounts::{self, Mode, MountSpec};
-use crate::proxy::{self, Location, Spec};
+use crate::proxy::{self, Location};
 use crate::sandbox::PublishedPort;
 use crate::secret::{SECRET_PREFIXES, find_secret};
 use miniserde::json::Object;
@@ -163,6 +163,7 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
         bays: Vec::new(),
     };
     for (bay, apps) in bays.iter().zip(&enabled) {
+        Fields::new(bay, &bay_path(bay))?.only(&BAY_KEYS)?;
         let proxy =
             bay_proxy(bay, default_proxy.as_deref(), &settings.proxies)?;
         let mut bay = BaySettings::from_json(bay, proxy)?;
@@ -190,15 +191,8 @@ fn proxy_settings(
         }
         let fields = Fields::new(&raw, &path)?;
         let kind = fields.string("kind")?;
+        proxy::check_kind(&fields)?;
         let location = proxy::location(&fields)?;
-        let spec = Spec {
-            name: &name,
-            fields,
-            location: location.clone(),
-            home: Path::new(""),
-            data: PathBuf::new(),
-        };
-        proxy::build(&spec).map(drop)?;
         let entry = ProxySettings {
             name: name.clone(),
             kind,
@@ -250,7 +244,6 @@ fn bay_proxy(
     proxies: &BTreeMap<String, ProxySettings>,
 ) -> Result<Option<String>> {
     let bay = Fields::new(bay, &bay_path(bay))?;
-    bay.only(&BAY_KEYS)?;
     let name = match bay.map.get("proxy") {
         Some(Json::Null) => return Ok(None),
         Some(Json::String(name)) => name.as_str(),
@@ -895,10 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_kind_options_are_checked_by_the_kind() {
-        let config = r#"{"proxies": {"p":
-            {"kind": "fake", "run": "managed", "zzz": 1}}}"#;
-        assert_eq!(error(config), "proxies.p.zzz: unknown setting");
+    fn an_unregistered_kind_is_an_error() {
         let config =
             r#"{"proxies": {"p": {"kind": "nope", "run": "managed"}}}"#;
         assert_eq!(
