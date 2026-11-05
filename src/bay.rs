@@ -480,6 +480,8 @@ fn replace(
 }
 
 /// The CA bundle first: a new proxy env restarts the daemons that read it.
+/// Trap: the guest watches only the proxy env, and a new CA leaves it as
+/// it was, so a new CA alone restarts them from here.
 fn apply_proxy(
     hangar: &Hangar,
     bay: &Bay,
@@ -490,6 +492,10 @@ fn apply_proxy(
     let ca = replace(sandbox, &bay.vm, &CA_BUNDLE, Some(ca_pem))?;
     let env = env.expose().as_bytes();
     let login = replace(sandbox, &bay.vm, &PROXY_ENV, Some(env))?;
+    if ca && !login {
+        let restart = ["systemctl", "start", "hangar-proxy-env.service"];
+        sandbox.exec(&bay.vm, Some(ROOT), &restart, None)?;
+    }
     Ok([(ca, "proxy CA"), (login, "proxy login")]
         .into_iter()
         .filter_map(|(changed, label)| changed.then_some(label)))
@@ -816,6 +822,13 @@ mod tests {
         changes.iter().position(|c| c == call).unwrap()
     }
 
+    fn position_of(changes: &[String], pattern: &str) -> usize {
+        changes.iter().position(|c| c.contains(pattern)).unwrap()
+    }
+
+    const RESTART_DAEMONS: &str =
+        "exec root@hangar-bay-work systemctl start hangar-proxy-env.service";
+
     #[test]
     fn new_bay_is_created_with_proxy_egress_and_reported_created() {
         let state = scratch_dir("bay-up-create");
@@ -998,6 +1011,7 @@ mod tests {
         );
         assert!(stdin_of(&sandbox, "hangar-proxy-env").contains("pw-2"));
         assert!(!stdin_of(&sandbox, LAUNCH).contains("pw-2"));
+        assert!(!sandbox.changes().iter().any(|c| c == RESTART_DAEMONS));
         assert!(sandbox.changes().iter().all(|call| !call.contains("pw-2")));
     }
 
@@ -1008,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_ca_is_reported_as_proxy_ca() {
+    fn a_new_ca_alone_restarts_the_daemons_and_is_reported_as_proxy_ca() {
         let state = scratch_dir("bay-up-ca");
         let sandbox = settled();
         assert_eq!(up_with(PROXIED, &state, &sandbox), "Created");
@@ -1025,6 +1039,10 @@ mod tests {
         );
         assert!(stdin_of(&sandbox, " hangar-ca ").contains("BEGIN CERT"));
         assert_eq!(stdin_of(&sandbox, "hangar-proxy-env"), env);
+        let changes = sandbox.changes();
+        let restart = position(&changes, RESTART_DAEMONS);
+        assert!(restart > position_of(&changes, "hangar-proxy-env"));
+        assert!(restart < position_of(&changes, "hangar-docker"));
     }
 
     #[test]
