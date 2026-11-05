@@ -99,6 +99,17 @@ pub(crate) fn call(
     Ok(response.body)
 }
 
+/// A GET for a CA: https, or http to this machine.
+pub(crate) fn fetch(url: &str, timeout: Duration) -> Result<Response> {
+    let loopback = url
+        .strip_prefix("http://127.0.0.1")
+        .is_some_and(|rest| rest.starts_with([':', '/']) || rest.is_empty());
+    if !loopback && !url.starts_with("https://") {
+        bail!("CA URL must be https, or http on 127.0.0.1");
+    }
+    run(&agent(timeout, false), http::Request::get(url), None).context(url)
+}
+
 pub(crate) trait Https {
     fn get(&self, url: &str) -> Result<Response>;
     fn post_json(&self, url: &str, body: &str) -> Result<Response>;

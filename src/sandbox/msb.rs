@@ -170,7 +170,7 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
     if let Some(disk) = spec.disk {
         args.extend(root_disk(spec, disk));
     }
-    if let Egress::OnlyHostPort(port) = spec.egress {
+    if let Egress::HostPort(port) = spec.egress {
         args.push("--no-net".into());
         args.extend(["--net-rule".into(), format!("allow@host:tcp:{port}")]);
         // Trap: forwarded connections don't count as `host`, so ingress to
@@ -249,7 +249,7 @@ mod tests {
             disk: Some("40G"),
             native_fs: &["/var/lib/pilot"],
             init: Some("/sbin/init"),
-            egress: Egress::OnlyHostPort(14322),
+            egress: Egress::HostPort(14322),
             publish: &[(3100, 3100)],
             mounts: &[Mount {
                 host: Path::new("/state/guest"),

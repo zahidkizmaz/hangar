@@ -101,6 +101,8 @@ dependencies = [
  "log",
  "miniserde",
  "percent-encoding",
+ "ring",
+ "rustls-pki-types",
  "ureq",
 ]
 

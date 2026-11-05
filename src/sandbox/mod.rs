@@ -39,10 +39,26 @@ impl BoxState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Egress {
-    /// Only this port on the host: a bay, to the proxy.
-    OnlyHostPort(u16),
-    /// Anything: the tower needs the internet.
     Open,
+    /// Only this port on the host: a bay, to its proxy.
+    HostPort(u16),
+}
+
+impl Egress {
+    pub(crate) fn record(self) -> String {
+        match self {
+            Self::Open => "open".into(),
+            Self::HostPort(port) => format!("host:{port}"),
+        }
+    }
+
+    pub(crate) fn from_record(text: &str) -> Option<Self> {
+        match text.split_once(':') {
+            None if text == "open" => Some(Self::Open),
+            Some(("host", port)) => port.parse().ok().map(Self::HostPort),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,4 +176,21 @@ pub(crate) trait Sandbox {
 
     /// How a VM reaches its host.
     fn host_address(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Egress;
+
+    #[test]
+    fn egress_record_round_trips() {
+        assert_eq!(Egress::Open.record(), "open");
+        assert_eq!(Egress::HostPort(5).record(), "host:5");
+        for egress in [Egress::Open, Egress::HostPort(5)] {
+            assert_eq!(Egress::from_record(&egress.record()), Some(egress));
+        }
+        for text in ["host:x", "remote:a:1", "", "host"] {
+            assert_eq!(Egress::from_record(text), None, "{text}");
+        }
+    }
 }

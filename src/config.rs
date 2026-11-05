@@ -402,6 +402,10 @@ impl<'a> Fields<'a> {
         })
     }
 
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
     pub(crate) fn at(&self, key: &str) -> String {
         if self.path.is_empty() {
             key.to_string()
@@ -514,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_follow_agent_vaults_rule() {
+    fn keys_follow_the_env_key_rule() {
         for key in ["A", "GITHUB_TOKEN", "K8S_", "X_1"] {
             assert!(valid_key(key), "{key}");
         }

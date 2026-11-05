@@ -18,6 +18,7 @@ mod mounts;
 mod output;
 mod packages;
 mod process;
+mod proxy;
 mod sandbox;
 mod secret;
 mod state;
