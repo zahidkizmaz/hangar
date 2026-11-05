@@ -265,6 +265,8 @@ fn app_env(apps: &[AppDef]) -> Result<BTreeMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::BUILTINS;
     use crate::config::{BaySettings, Settings};
     use crate::testing::{
@@ -282,6 +284,50 @@ mod tests {
             let settings = resolve_text(&config).unwrap();
             assert!(bay(&settings).apps.iter().any(|app| app.name == name));
         }
+    }
+
+    fn builtin_env(name: &str) -> BTreeMap<String, String> {
+        let config = one_bay(&format!(r#""apps": ["{name}"]"#), "");
+        bay(&resolve_text(&config).unwrap()).env.clone()
+    }
+
+    #[test]
+    fn builtin_apps_are_claude_code_codex_paperclip() {
+        let names: Vec<&str> = BUILTINS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["claude-code", "codex", "paperclip"]);
+    }
+
+    #[test]
+    fn claude_code_env_is_a_placeholder() {
+        let env = builtin_env("claude-code");
+        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "hangar-placeholder");
+        assert_eq!(
+            builtin_env("codex")["OPENAI_API_KEY"],
+            "hangar-placeholder"
+        );
+    }
+
+    #[test]
+    fn routes_in_an_app_are_unknown() {
+        assert_eq!(
+            error(r#"{"apps": {"x": {"routes": []}}}"#),
+            "app x: routes: unknown setting"
+        );
+        assert_eq!(
+            error(r#"{"apps": {"x": {"credentials": {}}}}"#),
+            "app x: credentials: unknown setting"
+        );
+    }
+
+    #[test]
+    fn real_looking_env_value_refused() {
+        let key = format!("sk-ant-api03-{}", "a1B2".repeat(10));
+        assert_eq!(
+            error(&format!(
+                r#"{{"apps": {{"x": {{"env": {{"K": "{key}"}}}}}}}}"#
+            )),
+            "app x: env.K: looks like a real secret"
+        );
     }
 
     #[test]

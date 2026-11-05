@@ -1,3 +1,4 @@
 {
-  "packages": ["github:numtide/llm-agents.nix#claude-code"]
+  "packages": ["github:numtide/llm-agents.nix#claude-code"],
+  "env": { "CLAUDE_CODE_OAUTH_TOKEN": "hangar-placeholder" }
 }

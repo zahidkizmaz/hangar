@@ -1,5 +1,6 @@
 {
   "packages": ["github:numtide/llm-agents.nix#codex"],
+  "env": { "OPENAI_API_KEY": "hangar-placeholder" },
   "setup": {
     "command": "printenv OPENAI_API_KEY | codex login --with-api-key",
     "check": "codex login status 2>&1 | grep -q 'using an API key'"
