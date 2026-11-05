@@ -3,9 +3,11 @@
 mod fakes;
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::thread;
 
 use fakes::{Machine, stderr, stdout};
 
@@ -711,4 +713,138 @@ fn bay_through_agent_vault_gets_token_url_on_stdin_only() {
     for text in [machine.msb_log(), log, said] {
         assert!(!text.contains("SECRET"), "{text}");
     }
+}
+
+/// An Infisical proxy's CA endpoint on `port`: 503 until the fake msb has
+/// started the proxy in `vm`, then the CA as JSON.
+fn infisical_ca_server(listener: TcpListener, up: PathBuf) {
+    let pem = include_str!("../src/proxy/testdata/ca.pem").replace('\n', "\\n");
+    let body = format!(r#"{{"certificate": "{pem}"}}"#);
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.read(&mut [0; 4096]);
+            let (status, body) = if up.exists() {
+                ("200 OK", body.as_str())
+            } else {
+                ("503 Starting", "")
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+}
+
+/// Proxy `infi` (managed infisical) and bay `work` running app `web`
+/// through it; returns the machine and the proxy's host port.
+fn infisical_machine(name: &str) -> (Machine, u16) {
+    let machine = Machine::new(name);
+    let (listener, port) = listener();
+    infisical_ca_server(
+        listener,
+        machine.fake.join("proxy-up-hangar-proxy-infi"),
+    );
+    fs::write(machine.home.join("proxy-token"), "pt-SECRET-1\n").unwrap();
+    fs::write(machine.home.join("session-token"), "st-SECRET-2\n").unwrap();
+    fs::write(machine.fake.join("setup-check"), "done").unwrap();
+    let config = format!(
+        r#"{{"proxies": {{"infi": {{"kind": "infisical", "run": "managed",
+              "proxyTokenFile": "~/proxy-token",
+              "sessionTokenFile": "~/session-token", "hostPort": {port}}}}},
+            "bays": [{{"name": "work", "proxy": "infi",
+                       "image": "example/bay:1", "apps": ["web"]}}]{WEB_APP}}}"#
+    );
+    let path = default_config(&machine);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, config).unwrap();
+    (machine, port)
+}
+
+/// Runs `up -vv`; its stdout, after checking no token reached argv, a log
+/// or stderr.
+fn up_keeping_tokens_secret(machine: &Machine) -> String {
+    let output = machine.hangar(&["up", "-vv"], &[]);
+    let said = stderr(ok(&output));
+    for text in [machine.msb_log(), hangar_log(machine), said] {
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+    stdout(&output)
+}
+
+#[test]
+fn managed_infisical_then_bay() {
+    let (machine, port) = infisical_machine("infisical");
+    assert_eq!(
+        up_keeping_tokens_secret(&machine),
+        "infi: created\nwork: created\n"
+    );
+    let created = calls(&machine, "create ");
+    assert_eq!(created.len(), 2, "{created:?}");
+    assert!(
+        created[0].contains("--name hangar-proxy-infi"),
+        "{created:?}"
+    );
+    assert!(created[0].contains("--entrypoint /bin/sh"), "{created:?}");
+    assert!(!created[0].contains("--no-net"), "{created:?}");
+    assert!(created[1].contains("--name hangar-bay-work"), "{created:?}");
+    assert!(
+        created[1].contains(&format!("allow@host:tcp:{port}")),
+        "{created:?}"
+    );
+    let started = calls(&machine, "exec --no-tty hangar-proxy-infi");
+    assert!(
+        started.last().unwrap().ends_with(" hangar-infisical"),
+        "{started:?}"
+    );
+    assert_eq!(machine.fake_file("hangar-infisical"), "pt-SECRET-1\n");
+    let env = machine.fake_file("hangar-proxy-env");
+    assert!(
+        env.contains(&format!(
+            "HTTPS_PROXY='http://x-agent-vault:st-SECRET-2@\
+             host.microsandbox.internal:{port}'"
+        )),
+        "{env}"
+    );
+    assert!(machine.fake_file("hangar-ca").contains("BEGIN CERTIFICATE"));
+}
+
+#[test]
+fn renewed_session_token_updates_bays_in_place() {
+    let (machine, _) = infisical_machine("infisical-session");
+    up_keeping_tokens_secret(&machine);
+    fs::write(machine.home.join("session-token"), "st-SECRET-3\n").unwrap();
+    assert_eq!(
+        up_keeping_tokens_secret(&machine),
+        "infi: unchanged\nwork: updated (proxy login; restarted web)\n"
+    );
+    assert_eq!(calls(&machine, "create ").len(), 2);
+    assert!(
+        machine
+            .fake_file("hangar-proxy-env")
+            .contains("st-SECRET-3")
+    );
+}
+
+#[test]
+fn rotated_proxy_token_recreates_the_proxy_only() {
+    let (machine, _) = infisical_machine("infisical-rotate");
+    up_keeping_tokens_secret(&machine);
+    let data = data(&machine).join("proxies/infi/data/data");
+    fs::write(data.join("kept"), "x").unwrap();
+    fs::write(machine.home.join("proxy-token"), "pt-SECRET-4\n").unwrap();
+    assert_eq!(
+        up_keeping_tokens_secret(&machine),
+        "infi: recreated (fingerprint)\nwork: unchanged\n"
+    );
+    let created = calls(&machine, "create ");
+    assert_eq!(created.len(), 3, "{created:?}");
+    assert!(
+        created[2].contains("--name hangar-proxy-infi"),
+        "{created:?}"
+    );
+    assert_eq!(machine.fake_file("hangar-infisical"), "pt-SECRET-4\n");
+    assert!(data.join("kept").exists());
 }

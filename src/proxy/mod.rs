@@ -7,6 +7,7 @@ pub(crate) mod ca;
 #[cfg(test)]
 mod fake;
 mod http;
+mod infisical;
 pub(crate) mod managed;
 
 use std::fs;
@@ -98,6 +99,7 @@ pub(crate) fn kinds() -> Vec<(&'static str, Build)> {
     vec![
         ("http", http::build),
         ("agent-vault", agent_vault::build),
+        ("infisical", infisical::build),
         #[cfg(test)]
         ("fake", fake::build),
     ]
@@ -289,7 +291,7 @@ mod tests {
         let error = error_of(built(r#"{"kind": "socks"}"#));
         assert_eq!(
             error,
-            r#"proxies.p.kind: unknown kind "socks"; known: agent-vault, fake, http"#
+            r#"proxies.p.kind: unknown kind "socks"; known: agent-vault, fake, http, infisical"#
         );
     }
 
