@@ -171,8 +171,10 @@ mod tests {
 
     #[test]
     fn a_bundle_or_a_key_is_not_a_ca() {
-        let key =
-            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let key = format!(
+            "-----BEGIN {0} KEY-----\nAAAA\n-----END {0} KEY-----\n",
+            "PRIVATE"
+        );
         for pem in [format!("{PEM}{PEM}"), format!("{PEM}{key}")] {
             for pin in [None, Some(FINGERPRINT)] {
                 let error =

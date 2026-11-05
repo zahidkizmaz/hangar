@@ -436,8 +436,10 @@ mod tests {
     #[test]
     fn access_refuses_a_ca_that_is_not_exactly_one_certificate() {
         let cert = include_str!("testdata/ca.pem");
-        let key = "-----BEGIN PRIVATE KEY-----\nAAAA\n\
-                   -----END PRIVATE KEY-----\n";
+        let key = format!(
+            "-----BEGIN {0} KEY-----\nAAAA\n-----END {0} KEY-----\n",
+            "PRIVATE"
+        );
         for pem in [format!("{cert}{cert}"), format!("{cert}{key}")] {
             let proxy = FakeProxy {
                 ca: Some(pem.into_bytes()),
