@@ -207,7 +207,7 @@ fn restart_is_down_then_up() {
     run(&machine, &["up"]);
     assert_eq!(
         run(&machine, &["restart", "default"]),
-        "default: stopped\ndefault: unchanged\n"
+        "default: stopped\ndefault: updated (started)\n"
     );
     let log = machine.msb_log();
     let stop = log.find("stop -q hangar-bay-default").unwrap();
@@ -369,9 +369,14 @@ fn cp_into_bay_runs_copy_checks() {
 #[test]
 fn cp_needs_exactly_one_bay_side() {
     let machine = with_bay("cp-sides", "", "");
-    for (src, dest) in [("a", "b"), ("default:a", "default:b")] {
+    for (src, dest, said) in [
+        ("/a", "/b", "exactly one"),
+        ("default:a", "default:b", "exactly one"),
+        ("/a", "typo:b", "no bay or proxy typo"),
+        ("/a", "default:", "default: has no path"),
+    ] {
         let error = failed(&machine.hangar(&["cp", src, dest], &[]));
-        assert!(error.contains("exactly one"), "{error}");
+        assert!(error.contains(said), "{error}");
     }
 }
 

@@ -88,11 +88,13 @@ pub(crate) fn down(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
 
 fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
     let sandbox = hangar.sandbox.as_ref();
-    let vm = step(bay, "vm", || ensure_vm(hangar, bay))?;
+    let (vm, mut changes) = match step(bay, "vm", || ensure_vm(hangar, bay))? {
+        Some(Outcome::Updated(changes)) => (None, changes),
+        vm => (vm, Vec::new()),
+    };
     step(bay, "boot", || {
         wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
     })?;
-    let mut changes: Vec<String> = Vec::new();
     step(bay, "proxy env", || {
         let proxy = hangar.proxy_of(bay.settings);
         let access = proxy::access(proxy, bay.name, sandbox.host_address())?;
@@ -157,8 +159,8 @@ fn resolve_mounts(hangar: &Hangar, bay: &Bay) -> Result<Vec<Resolved>> {
     mounts::resolve(&all, &roots(hangar, bay)?)
 }
 
-/// The VM's outcome when it was created or recreated; `None` when the
-/// existing one is used.
+/// The VM's outcome when it was created, recreated or started; `None`
+/// when the running one is used.
 fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
     let resolved = resolve_mounts(hangar, bay)?;
     let image = bay.settings.image_ref();
@@ -186,7 +188,10 @@ fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
             }
             Ok(Some(Outcome::Recreated(reasons)))
         }
-        Plan::Start => sandbox.start(&bay.vm).map(|()| None),
+        Plan::Start => {
+            sandbox.start(&bay.vm)?;
+            Ok(Some(Outcome::Updated(vec!["started".into()])))
+        }
         Plan::Keep => Ok(None),
     }
 }
@@ -919,7 +924,10 @@ mod tests {
         assert_eq!(up_with(WORK_DIRECT, &state, &sandbox), "Created");
         sandbox.set(WORK_VM, BoxState::Stopped);
         forget(&sandbox);
-        assert_eq!(up_with(WORK_DIRECT, &state, &sandbox), "Unchanged");
+        assert_eq!(
+            up_with(WORK_DIRECT, &state, &sandbox),
+            r#"Updated(["started"])"#
+        );
         assert_eq!(sandbox.changes()[0], "start hangar-bay-work");
     }
 

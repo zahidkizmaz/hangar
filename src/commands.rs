@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::apps::Setup;
 use crate::bay::{self, Bay, PILOT, VM_HOME};
-use crate::config::{self, BaySettings, Paths};
+use crate::config::{self, BaySettings, Paths, valid_name};
 use crate::error::{Context, Error, Result, bail};
 use crate::files::{self, Copied, Request};
 use crate::hangar::Hangar;
@@ -290,7 +290,8 @@ fn confirm(name: &str, doomed: &Doomed) -> Result<bool> {
     eprint!("Delete {}{volume}? [y/N] ", doomed.folder.display());
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).context("terminal")?;
-    Ok(answer.trim() == "y")
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 pub(crate) fn ps(hangar: &Hangar) -> Overview {
@@ -436,10 +437,10 @@ fn last_lines(text: &[u8], count: usize) -> &[u8] {
 
 /// Exactly one side is `BAY:PATH`; the other is a host path.
 pub(crate) fn cp(hangar: &Hangar, src: &str, dest: &str) -> Result<Copied> {
-    match (bay_side(hangar, src), bay_side(hangar, dest)) {
-        (None, Some((bay, path))) => {
+    match (bay_side(hangar, src)?, bay_side(hangar, dest)?) {
+        (None, Some((bay, dest))) => {
             let bay = running_bay(hangar, bay)?;
-            let dest = (!path.is_empty()).then_some(path);
+            let dest = Some(dest);
             files::copy(hangar, &bay, &Request::AdHoc { src, dest })
         }
         (Some((bay, path)), None) => copy_out(hangar, bay, path, dest),
@@ -450,9 +451,26 @@ pub(crate) fn cp(hangar: &Hangar, src: &str, dest: &str) -> Result<Copied> {
     }
 }
 
-fn bay_side<'a>(hangar: &Hangar, arg: &'a str) -> Option<(&'a str, &'a str)> {
-    let (bay, path) = arg.split_once(':')?;
-    hangar.bay(bay).is_some().then_some((bay, path))
+/// `BAY:PATH` when the part before `:` is a name; anything else is a
+/// host path.
+fn bay_side<'a>(
+    hangar: &Hangar,
+    arg: &'a str,
+) -> Result<Option<(&'a str, &'a str)>> {
+    let Some((name, path)) = arg.split_once(':') else {
+        return Ok(None);
+    };
+    if !valid_name(name) {
+        return Ok(None);
+    }
+    bay_named(hangar, name)?;
+    if path.is_empty() {
+        return Err(Error::with_hint(
+            format!("{arg} has no path"),
+            format!("name one, like {name}:~/file"),
+        ));
+    }
+    Ok(Some((name, path)))
 }
 
 /// Only from a running bay: copying from a stopped one never returns.
@@ -501,7 +519,8 @@ pub(crate) fn setup(
         return Ok(());
     }
     let command = ["sh".to_string(), "-lc".into(), setup.command.clone()];
-    let mut shell = pilot_shell(hangar, &bay, &command, true);
+    let tty = io::stdin().is_terminal();
+    let mut shell = pilot_shell(hangar, &bay, &command, tty);
     if !process::status(&mut shell)?.success() {
         return Err(Error::with_hint(
             format!("{app}'s setup failed: {}", setup.command),
@@ -639,7 +658,10 @@ mod tests {
             ["stop hangar-bay-a", "stop hangar-proxy-p"]
         );
         let report = restart(&hangar, &names(&["c"])).unwrap();
-        assert_eq!(summary(&report), ["c bay Stopped", "c bay Unchanged"]);
+        assert_eq!(
+            summary(&report),
+            ["c bay Stopped", r#"c bay Updated(["started"])"#]
+        );
         assert!(sandbox.changes().contains(&"start hangar-bay-c".into()));
     }
 
@@ -682,7 +704,7 @@ mod tests {
             assert_eq!(error.to_string(), "p is a proxy, not a bay");
         }
         let error = cp(&hangar, "/tmp/x", "p:~/x").map(drop).unwrap_err();
-        assert!(error.to_string().contains("exactly one"), "{error}");
+        assert_eq!(error.to_string(), "p is a proxy, not a bay");
     }
 
     #[test]

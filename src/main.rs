@@ -69,6 +69,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    #[command(flatten)]
+    OnHangar(OnHangar),
+}
+
+/// The commands that act on the configured hangar.
+#[derive(Debug, Subcommand)]
+enum OnHangar {
     /// Create or start bays and proxies and apply the config
     #[command(after_help = "Without NAME: every bay and proxy. A bay's \
                             proxy comes up first; a bay whose proxy fails \
@@ -152,7 +159,7 @@ enum Command {
     },
 }
 
-impl Command {
+impl OnHangar {
     fn changes_state(&self) -> bool {
         matches!(
             self,
@@ -194,11 +201,17 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<Outcome> {
     let paths = Paths::locate(&env_var)?;
-    if let Command::Init { force } = command {
-        commands::init(&paths, force)?;
-        return Ok(Outcome::Done);
+    match command {
+        Command::Init { force } => {
+            commands::init(&paths, force)?;
+            Ok(Outcome::Done)
+        }
+        Command::OnHangar(command) => on_hangar(&paths, command),
     }
-    let hangar = Hangar::load(&paths)?;
+}
+
+fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
+    let hangar = Hangar::load(paths)?;
     let _lock = if command.changes_state() {
         let path = hangar.state_root.join("lock");
         Some(lock::acquire(&path, || {
@@ -209,35 +222,34 @@ fn run(command: Command) -> Result<Outcome> {
     };
     let hangar = &hangar;
     Ok(match command {
-        Command::Init { .. } => Outcome::Done,
-        Command::Up { names } => {
+        OnHangar::Up { names } => {
             Outcome::Changes(commands::up(hangar, &names)?)
         }
-        Command::Down { names } => {
+        OnHangar::Down { names } => {
             Outcome::Changes(commands::down(hangar, &names)?)
         }
-        Command::Restart { names } => {
+        OnHangar::Restart { names } => {
             Outcome::Changes(commands::restart(hangar, &names)?)
         }
-        Command::Rm { name, data, yes } => {
+        OnHangar::Rm { name, data, yes } => {
             Outcome::Changes(commands::rm(hangar, &name, data, yes)?)
         }
-        Command::Ps => Outcome::Overview(commands::ps(hangar)),
-        Command::Inspect { name } => {
+        OnHangar::Ps => Outcome::Overview(commands::ps(hangar)),
+        OnHangar::Inspect { name } => {
             Outcome::Detail(commands::inspect(hangar, &name)?)
         }
-        Command::Exec { bay, args } => {
+        OnHangar::Exec { bay, args } => {
             commands::exec(hangar, &bay, &args)?;
             Outcome::Streamed
         }
-        Command::Logs { name, app, follow } => {
+        OnHangar::Logs { name, app, follow } => {
             commands::logs(hangar, name.as_deref(), app.as_deref(), follow)?;
             Outcome::Streamed
         }
-        Command::Cp { src, dest } => {
+        OnHangar::Cp { src, dest } => {
             Outcome::Copied(commands::cp(hangar, &src, &dest)?)
         }
-        Command::Setup { bay, app, force } => {
+        OnHangar::Setup { bay, app, force } => {
             commands::setup(hangar, &bay, &app, force)?;
             Outcome::Streamed
         }
