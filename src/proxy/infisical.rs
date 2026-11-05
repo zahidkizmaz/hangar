@@ -27,9 +27,13 @@ const DATA: &str = "/data";
 const ENTRYPOINT: &str = "/bin/sh";
 
 /// The token comes on stdin, never argv: the proxy reads it from the
-/// environment only. `$1` is the optional domain.
+/// environment only. `$1` is the optional domain. The log is moved aside
+/// past 10 MiB, keeping one old one.
 const START: &str = r#"IFS= read -r INFISICAL_AGENT_VAULT_PROXY_TOKEN || exit 1
 export INFISICAL_AGENT_VAULT_PROXY_TOKEN
+[ -f /data/proxy.log ] &&
+  [ "$(wc -c </data/proxy.log)" -gt 10485760 ] &&
+  mv -f /data/proxy.log /data/proxy.log.1
 setsid infisical agent-vault proxy --data-dir /data --listen-host 0.0.0.0 \
   ${1:+--domain "$1"} >>/data/proxy.log 2>&1 &"#;
 
@@ -247,6 +251,11 @@ mod tests {
         assert!(call.contains(r#"${1:+--domain "$1"}"#), "{call}");
         assert!(call.contains("TOKEN || exit 1"), "{call}");
         assert!(call.contains(">>/data/proxy.log"), "{call}");
+        let rotate = r#"[ -f /data/proxy.log ] &&
+  [ "$(wc -c </data/proxy.log)" -gt 10485760 ] &&
+  mv -f /data/proxy.log /data/proxy.log.1"#;
+        assert!(call.contains(rotate), "{call}");
+        assert!(call.find(rotate) < call.find("setsid"), "{call}");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -384,6 +385,13 @@ fn journal(
     let unit = match app {
         None => bay::run_unit("*"),
         Some(app) if bay.settings.run.contains_key(app) => bay::run_unit(app),
+        Some(app) if bay.settings.apps.iter().any(|on| on.name == app) => {
+            bail!(
+                "{app} has no long-running unit in bay {0}, so it has no \
+                 log: it only runs setup ('hangar setup {0} {app}')",
+                bay.name
+            );
+        }
         Some(app) => {
             return Err(Error::with_hint(
                 format!("{app} is not an app of bay {}", bay.name),
@@ -406,9 +414,14 @@ fn journal(
     Ok(())
 }
 
-/// The last lines of `path`, then, with `follow`, what it gains.
+/// The last lines of `path`, then, with `follow`, what it gains. A
+/// proxy's VM writes its log: a symlink planted there is never followed.
 fn tail(path: &Path, follow: bool) -> Result<()> {
-    let mut file = File::open(path).context(path.display())?;
+    let mut file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context(path.display())?;
     let mut text = Vec::new();
     file.read_to_end(&mut text).context(path.display())?;
     let mut stdout = io::stdout();
@@ -559,13 +572,14 @@ fn app_setup<'a>(settings: &'a BaySettings, name: &str) -> Result<&'a Setup> {
 mod tests {
     use super::{
         cp, down, exec, inspect, last_lines, logs, ps, restart, rm, setup,
-        target, up,
+        tail, target, up,
     };
     use crate::hangar::Hangar;
     use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
     use crate::status::Detail;
     use crate::testing::{hangar_with, scratch_dir, settled};
+    use std::fs;
     use std::rc::Rc;
 
     const PROXIED: &str = r#"{"proxies": {
@@ -800,6 +814,37 @@ mod tests {
             "proxy ext runs elsewhere; its log is there"
         );
         assert!(error("p", None).starts_with("fake.log"));
+    }
+
+    #[test]
+    fn a_log_reached_through_a_symlink_is_refused() {
+        let dir = scratch_dir("cmd-tail-link");
+        fs::write(dir.join("real.log"), "line\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.log"), dir.join("proxy.log"))
+            .unwrap();
+        assert!(tail(&dir.join("real.log"), false).is_ok());
+        let error = tail(&dir.join("proxy.log"), false).unwrap_err();
+        assert!(error.to_string().contains("proxy.log"), "{error}");
+    }
+
+    #[test]
+    fn logs_of_an_app_without_a_run_say_there_is_nothing_to_show() {
+        let config = r#"{"bays": [{"name": "default", "proxy": null,
+            "apps": ["login-only"]}], "apps": {"login-only":
+            {"setup": {"command": "login", "check": "ok"}}}}"#;
+        let sandbox = settled();
+        sandbox.set("hangar-bay-default", crate::sandbox::BoxState::Running);
+        let hangar = hangar_with(config, &scratch_dir("cmd-no-run"), sandbox);
+        let error = logs(&hangar, Some("default"), Some("login-only"), false)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "login-only has no long-running unit in bay default, so it has \
+             no log: it only runs setup ('hangar setup default login-only')"
+        );
+        let error =
+            logs(&hangar, Some("default"), Some("other"), false).unwrap_err();
+        assert!(error.to_string().contains("add it to apps"), "{error}");
     }
 
     #[test]
