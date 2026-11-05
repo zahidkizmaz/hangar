@@ -1,232 +1,154 @@
 # hangar CLI for agents and scripts
 
-Everything here works without a terminal. Add `--json` to any command (before
-or after it) for machine-readable output.
+Everything here works without a terminal. Add `--json` to any command
+(before or after it) for machine-readable output.
 
 ## Streams and exit codes
 
-- **stdout**: the command's result, nothing else. With `--json`, exactly one
-  JSON document per command.
-- **stderr**: progress and diagnostics (`==> …`, `warning: …`; more with
+- **stdout**: the command's result, nothing else. With `--json`, at most
+  one JSON document per command.
+- **stderr**: progress and warnings (`==> …`, `warning: …`; more with
   `-v`/`-vv` or `HANGAR_LOG=debug`). With `--json`, an error is the last
   stderr line, as JSON.
+- **`$XDG_STATE_HOME/hangar/hangar.log`** (0600): every info line and every
+  change, timestamped, whatever the flags.
 
 | Code | Meaning |
-|---|---|
-| 0 | success (for `status`: healthy) |
-| 1 | error; for `up`, also a bay that failed (see `failed`) |
-| 2 | usage error (unknown command or flag; clap's text, not JSON) |
-| 3 | `status` ran, but something isn't healthy |
+| --- | --- |
+| 0 | success |
+| 1 | error; for `up`, `down`, `restart` and `rm`, any change that failed |
+| 2 | usage error (clap's text, not JSON) |
+| 3 | `ps` ran and found something wrong (its warnings say what) |
 
-Healthy means: the tower and every configured bay running, the vault
-healthy and denying unlisted hosts, and every bay's `run` entries running.
-Bays left out of the config don't count. `up` never exits 3: health is
-`status`'s.
+`exec` replaces hangar with the shell, so its exit code is the command's.
 
-`down` and `destroy` exit 1 when msb can't report a VM's state: a broken
-msb is never mistaken for a stopped or missing VM.
+`up`, `down`, `restart`, `rm`, `cp` and `setup` hold a lock
+(`$XDG_STATE_HOME/hangar/lock`); a second one waits until the first is
+done. `ps`, `inspect`, `logs`, `exec` and `init` never wait.
 
-One hangar changes state at a time. `up`, `down`, `restart`, `copy`,
-`destroy` and `credential set|rm|login` hold a lock (`login` only
-while it hands the client to the vault, not while it waits for the
-browser)
-(`$XDG_STATE_HOME/hangar/lock`); a second one logs
-`==> waiting for another hangar` and continues once the first is done.
-`status`, `shell`, `logs`, `setup`, `vault-ui`, `credential list` and
-`init` never wait.
+## Documents
 
-## Commands
+Every document has `"version": 1`. It stays 1 until the first release;
+after that it goes up when a field changes meaning or disappears. Key
+order isn't significant.
 
-Bays: `up`, `down` and `destroy` take `[BAY…]` (none: every bay, and for
-`down`/`destroy` the tower and left-over bays too). `shell`, `logs`,
-`setup`, `copy` and `restart` act on one bay: the only one, or `--bay
-NAME` (`-b`); with several bays and no `--bay` they fail with `several
-bays: pass --bay (…)`. A name that's neither configured nor left over is
-an error (exit 1).
+| Command | `--json` |
+| --- | --- |
+| `up`, `down`, `restart`, `rm` | the changes, below |
+| `ps` | the overview, below |
+| `inspect NAME` | the detail, below |
+| `cp` | `{"version":1,"copied":[…],"removed":[…]}` |
+| `init` | `{"version":1,"ok":true}` |
+| `exec`, `logs`, `setup` | the command's own output; `--json` changes only errors |
 
-| Command | Result (`--json`) |
-|---|---|
-| `up [BAY…]` | the status document below plus `failed` (as text: `status`'s short view) |
-| `status [--all]` | the status document, always complete (`--all` changes only the text); exit 3 when unhealthy |
-| `down`, `init`, `destroy`, `credential set`, `credential rm`, `credential login` | `{"ok":true,"version":1}` |
-| `credential list` | names and who manages them, never values |
-| `vault-ui` | where the vault login is, never the password |
-| `copy [SRC [DEST]]` | `{"ok":true,"bay":…,"copied":[…],"removed":[…],"version":1}` (VM paths only) |
-| `restart [NAME…] [--no-copy]` | `{"ok":true,"bay":…,"restarted":[…],"version":1}` |
-| `shell [CMD…]`, `logs NAME [-f]`, `setup NAME [--force]` | the command's own output, streamed; `--json` only changes errors |
-
-Every document is an object with a `version`, 1. It stays 1 until the
-first release; after that it goes up when a field changes meaning or
-disappears. Key order isn't significant.
-
-### `status --json` (and `up --json`)
+### Changes
 
 ```json
-{
-  "version": 1,
-  "healthy": true,
-  "tower": { "vm": "running", "backend": "agent-vault", "reachable": true,
-             "healthy": true, "unlistedHosts": "deny",
-             "ports": [
-    { "name": "vault-ui", "app": null, "url": "http://127.0.0.1:14321",
-      "purpose": "agent-vault admin UI and API", "reachable": true },
-    { "name": "proxy", "app": null, "url": "127.0.0.1:14322",
-      "purpose": "the bays' only way out", "reachable": null } ],
-             "routes": [
-    { "name": "anthropic", "host": "api.anthropic.com", "auth": "bearer",
-      "credentials": ["CLAUDE_CODE_OAUTH_TOKEN"], "app": "claude-code" },
-    { "name": "mirror", "host": "mirror.example", "auth": "passthrough",
-      "credentials": [], "app": null } ] },
+{ "version": 1, "changes": [
+  { "name": "vault", "type": "proxy", "outcome": "created",
+    "reasons": [], "error": null },
+  { "name": "work", "type": "bay", "outcome": "recreated",
+    "reasons": ["image", "mounts"], "error": null },
+  { "name": "docs", "type": "bay", "outcome": "failed", "reasons": [],
+    "error": { "error": "proxy corp failed", "hint": null } } ] }
+```
+
+`outcome` is `created`, `recreated`, `updated`, `unchanged`, `stopped`,
+`removed` or `failed`. `reasons` says why a VM was recreated (`image`,
+`proxy`, `mounts`, `ports`, `resources`, `fingerprint`, `no record`,
+`data disk replaced`) or what an update changed (`started`, `proxy CA`,
+`proxy login`, `packages …`, `copies …`, `env`, `started APP`,
+`restarted APP`, `stopped APP`).
+
+### `ps`
+
+```json
+{ "version": 1,
   "bays": [
-    { "name": "work", "vm": "hangar-bay-work", "state": "running",
-      "healthy": true,
-      "apps": {
-        "claude-code": { "routes": [
-          { "name": "anthropic", "host": "api.anthropic.com",
-            "credential": "CLAUDE_CODE_OAUTH_TOKEN" } ] },
-        "paperclip": { "routes": [] } },
-      "run": { "paperclip": "running" },
-      "mounts": [
-        { "vm": "/home/pilot", "host": "/home/you/.local/share/hangar/bays/work/home",
-          "writable": true, "home": true, "cache": false, "applied": true },
-        { "vm": "/var/cache/hangar", "host": "/home/you/.cache/hangar/bays/work",
-          "writable": true, "home": false, "cache": true, "applied": true } ],
-      "cache": { "host": "/home/you/.cache/hangar/bays/work", "bytes": 734003200 },
-      "ports": [
-        { "name": "paperclip", "app": "paperclip", "url": "http://127.0.0.1:3100",
-          "purpose": "Paperclip web UI", "reachable": true } ] }
-  ],
-  "leftovers": [ { "name": "old", "vm": "hangar-bay-old", "state": "running" } ],
-  "failed": [ { "name": "oss", "error": "…" } ]
-}
+    { "name": "work", "state": "running", "proxy": "vault",
+      "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
+      "apps": [ { "name": "paperclip", "state": "running" } ] } ],
+  "proxies": [
+    { "name": "vault", "kind": "infisical", "state": "running",
+      "image": "infisical/cli:0.44.15@sha256:…", "health": "up" },
+    { "name": "corp", "kind": "http", "state": null, "image": null,
+      "health": "unreachable" } ],
+  "leftovers": [ { "name": "old", "type": "bay" } ] }
 ```
 
-- `tower`: the VM running the credential broker; `vm` is its state
-  (`running`, `stopped`, `missing` or `unknown`: the sandbox failed),
-  `backend` is `tower.backend` (`agent-vault` is the only one so far),
-  `unlistedHosts` is `deny`, `allow`, or `null` while unreachable,
-  `ports` its ports (`app: null`), and `routes` every route it serves:
-  `auth` is the route's `type`, `credentials` the names it injects (never
-  values), `app` the first enabled app that brings it, `null` for one of
-  `tower.routes`.
-- `bays`: each configured bay, in config order. `state` as for the
-  tower; `healthy` is the bay running with every `run` entry running.
-- `bays[].apps.<name>.routes`: each enabled app's routes and the credential
-  the vault injects there (`null`: passthrough; several are comma-joined).
-- `bays[].run.<name>`: `running`, `stopped` or `unknown`, for each `run`
-  entry, including the apps' own.
-- `bays[].mounts`: the `home` mount (`home: true`), the `cache` mount
-  (`cache: true`) and each `mounts` entry; `applied` is false when the bay
-  is missing or was created without it, and `null` when an existing VM has
-  no `bays/<name>/vm` record (the text output says `unknown`); fix with
-  `hangar destroy NAME && hangar up NAME`. Mounts don't affect `healthy`.
-- `bays[].cache`: the bay's package cache folder and size in bytes, or
-  `null` when `cache` is off.
-- `bays[].ports`: each app's ports. `url` has `http://` for HTTP ports.
-  `reachable` comes from an HTTP GET for HTTP ports and a TCP connect
-  otherwise; it's `null` for the proxy, which only the bays use. Ports
-  don't affect `healthy`.
-- `leftovers`: bays with a folder in `stateDir` but no config entry; fix
-  with `hangar destroy NAME` (then `--state` once the VM is gone). They
-  don't affect `healthy`.
-- `failed` (`up` only): each bay whose steps failed, with the error; `up`
-  then exits 1. The other bays still came up.
+- `state` is `running`, `stopped`, `missing`, or `unknown` when the sandbox
+  can't tell. An external proxy's `state` and `image` are `null`.
+- A bay's `proxy` is `null` for the open internet. Its `apps` lists the
+  apps with a run entry while it runs: `running`, `exited` or
+  `needs-setup`.
+- `health` is `up`, `unreachable`, or `null` when a managed proxy's VM
+  isn't running.
+- `leftovers`: bays and proxies with a folder in the data dir but no config
+  entry; `hangar rm NAME --data` removes one.
 
-### `credential list --json`
+### `inspect`
+
+A bay:
 
 ```json
-{ "version": 1, "credentials": [
-  { "name": "GITHUB_TOKEN", "source": "config", "type": "static",
-    "state": "set" },
-  { "name": "JIRA", "source": "user", "type": "oauth",
-    "state": "oauth: connected" } ] }
+{ "version": 1, "name": "work", "type": "bay", "state": "running",
+  "proxy": "vault", "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
+  "vm": "hangar-bay-work",
+  "home": "/home/you/.local/share/hangar/bays/work/home",
+  "cache": "/home/you/.cache/hangar/bays/work",
+  "volume": "hangar-bay-work-data",
+  "apps": ["claude-code"], "packages": ["github:numtide/llm-agents.nix#claude-code"],
+  "mounts": [
+    { "vm": "/home/pilot", "host": "/home/you/.local/share/hangar/bays/work/home",
+      "mode": "rw", "kind": "home", "applied": true } ] }
 ```
 
-`config` entries come from `tower.credentialFiles` and the apps' fixed
-`credentials` (e.g. `GITHUB_GIT_USER`); `user` ones from `hangar
-credential set` or an OAuth login. `type` is `static` or `oauth` (other
-kinds the vault holds count as `static`). `state` is `set` for a static
-value; for an OAuth one it's `oauth: connected`, `oauth: not connected`
-(no token yet) or `oauth: refresh failed (…)` with the first line of the
-token endpoint's answer. The text form prints name, source and state,
-tab-separated.
+`mounts` lists the `ro` and `rw` mounts with hangar's own (`kind`:
+`user`, `home` or `cache`). `applied` says whether the VM was created
+with it; `null` when there's no record.
 
-### `vault-ui --json`
+A proxy:
 
 ```json
-{ "version": 1, "url": "http://127.0.0.1:14321",
-  "login": "owner@hangar.local", "password": "clipboard",
-  "passwordFile": "/Users/you/.local/share/hangar/owner-password" }
+{ "version": 1, "name": "vault", "type": "proxy", "kind": "infisical",
+  "state": "running", "image": "infisical/cli:0.44.15@sha256:…",
+  "vm": "hangar-proxy-vault",
+  "data": "/home/you/.local/share/hangar/proxies/vault/data",
+  "log": "/home/you/.local/share/hangar/proxies/vault/data/data/proxy.log" }
 ```
 
-`password` is `clipboard` or `file`; the value itself is never printed.
+An external proxy has `state`, `image`, `vm` and `log` `null`.
 
-### Errors (`--json`)
+### Errors
 
 ```json
-{ "error": "the vault isn't running", "hint": "run 'hangar up' first" }
+{ "error": "bay work isn't running", "hint": "run 'hangar up work' first" }
 ```
 
 `hint` is the next step when there's an obvious one, otherwise `null`.
 
 ## Flows
 
-- **First run**: `hangar up --json` (generates the master password into the
-  OS keychain; no input needed). Check with `hangar status --json`.
-- **Ensure it's up**: `hangar status --json >/dev/null || hangar up`.
-- **Add a token**: `hangar credential set NAME < file` (or pipe it in). Name
-  it after the variable the tool reads, e.g. `CLAUDE_CODE_OAUTH_TOKEN`; the
-  bays get a placeholder automatically. Then `hangar up` if a route needs
-  to reference it.
-- **A 403 from the vault**: the message names the host. Add a route for it
-  under `tower.routes` (or the app that brings it to a bay's `apps`),
-  then `hangar up`.
-- **Get config files into the VM** (e.g. `~/.claude/CLAUDE.md`): add them
-  under `files` (VM path → host path), then `hangar copy` (or `up`).
-  One-off: `hangar copy SRC [DEST]`, same checks, not managed. A refusal
-  names the file and why (credentials file, secret-looking content,
-  symlink, limits); fix the config, never work around it.
-- **Set up a tool**: add its app (a built-in from
-  [configuration.md](configuration.md#built-in-apps), or one of
-  `appDefinitions`) to a bay's `apps`, then
-  `hangar up`. A bay with packages needs `nix` and `github` (or
-  `github-token`). A config error names the app and key
-  (`app paperclip: env.PATH: reserved for hangar`).
-- **App data that should survive a new VM**, and **a new VM without
-  downloading every package again**: nothing to do; the bay's `home` and
-  `cache` are kept on the host
-  ([A bay's home](configuration.md#a-bays-home),
-  [Package cache](configuration.md#package-cache)).
-- **Share another host folder with the VM**: add a dedicated host
-  directory under `mounts` (`"writable": true` if the VM should write),
-  then `hangar destroy NAME && hangar up NAME`.
-  [Mounting folders](configuration.md#mounting-folders) has the rules a
-  mount must pass.
-- **Apply changed config to a running app**: `up` never restarts; when it
-  warns `<name>'s inputs changed`, run `hangar restart <name>`
-  (`--no-copy` to keep the VM's current files).
-- **Switch a bay's image or VM sizes/ports**: `hangar destroy NAME &&
-  hangar up NAME`.
-- **Add a bay**: add it to `bays`, then `hangar up NAME`. **Remove one**:
-  drop it from `bays`, then `hangar destroy NAME` (and `--state` for its
-  home and records).
-- **Start over**: `hangar destroy --state --yes` (also deletes the keychain
-  item and every bay's home), then `hangar up`.
+- **Bring everything up**: `hangar up --json`; exit 1 means a change
+  failed, and its `error` says why.
+- **Check**: `hangar ps --json`; exit 3 means something needs doing, and
+  the warnings on stderr name the command.
+- **Change the config**: edit it, then `hangar up`. Read `reasons` to see
+  whether a VM was recreated.
+- **Renew an Infisical session token**: replace the file, then `hangar
+  up` ([proxy-kinds.md](proxy-kinds.md#infisical-setup)).
+- **Get config files into a bay**: a `copy` mount, then `hangar up`. Once:
+  `hangar cp FILE BAY:~/path`. A refusal names the file and the rule; fix
+  the config, never work around it.
+- **Start over with a bay**: `hangar rm NAME --data --yes`, then
+  `hangar up NAME`.
 
 ## Rules
 
-- Never pass a secret as an argument, in `env` or through
-  `files`: use `hangar credential set NAME` with the value on stdin.
+- Never pass a secret as an argument, in `env` or through a `copy` mount.
+  Secrets belong in the proxy, and token files stay on the host.
 - Never mount a directory a host program reads config from as writable;
   hangar refuses the known ones, but a dedicated directory is the rule.
-- Never copy or mount the user's own config such as `~/.claude` by
-  default: the bay's home is hangar's own.
-- `destroy --state` needs `--yes` without a terminal.
-- `copy`, `restart` and `setup` need the bay running (`hangar up`
-  first), and `--bay NAME` when there are several bays.
-- `setup NAME` is interactive: it runs the app's setup command with a
-  terminal. While an app's setup check fails, `up` warns
-  `NAME needs setup: run 'hangar setup NAME'` and doesn't start its run
-  entry, so `status` shows it `stopped` (unhealthy, exit 3).
-- `shell` passes everything after the command through unchanged, including
-  `--help`.
+- `rm --data` needs `--yes` without a terminal.
+- `setup` is interactive: it runs the app's setup command with a
+  terminal.

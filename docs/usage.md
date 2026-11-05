@@ -4,59 +4,48 @@ hangar runs [microsandbox](https://microsandbox.dev) VMs on your machine:
 
 ```
  your machine (macOS / Linux)
- ├─ hangar-tower      the tower: agent-vault holds the real credentials,
- │                    MITM proxy · 127.0.0.1:14321 admin, :14322 proxy
- ├─ hangar-bay-work   a bay: your agents (see apps, packages) + docker,
- │                    nix, git, gh, uv. Its only allowed connection is the
- │                    tower's proxy port.
- └─ hangar-bay-oss    any number of bays, each with its own home, cache
-                      and vault token
+ ├─ hangar-proxy-vault   a managed proxy (here: Infisical Agent Vault),
+ │                       published on 127.0.0.1:17323
+ ├─ hangar-bay-work      a bay: your agents, docker, nix, git, gh, uv.
+ │                       Its only allowed connection is its proxy's port.
+ └─ hangar-bay-scratch   "proxy": null: the open internet, no proxy
 ```
 
-Bays never reach each other or each other's folders, unless you mount one
-host folder into both. They share the tower: every bay can use every route
-and credential.
-
-A bay holds placeholders, never secrets.
-[agent-vault](https://github.com/Infisical/agent-vault) swaps in the real
-credential on the way out, and only for hosts on the allowlist. Everything
-else is refused, including direct connections, DNS, your LAN and the vault's
-admin port.
+A bay with a proxy holds placeholders, never secrets: the proxy swaps in
+the real credential on the way out, for the hosts you allow there.
+Everything else, direct connections, DNS and your LAN included, is
+blocked by the sandbox.
 
 ## Security model
 
-- **Tokens are the blast radius.** Agents can't steal credentials, but they
-  can use them. Give hangar a fine-grained GitHub token that covers only the
-  repos agents work on (no `workflow`, `gist` or admin scopes), and protect
-  your default branch.
-- **Deny by default.** The vault rejects every host that isn't on the
-  allowlist with a `403` that names the host.
-- **No production access to start with.** Add production APIs later, one at
-  a time, read-only and path-scoped, ideally in a separate vault.
-- **Keep app UIs behind a login.** App ports are published on `127.0.0.1`,
-  so any local process could reach them (the `paperclip` app runs
-  Paperclip in authenticated mode).
-- **Apps never run as root.** Everything an app, a shell or `files` does
-  in a bay runs as the user `pilot` (uid 1000, home `/home/pilot`), with no
-  sudo. Docker is pilot's own rootless daemon, and nix goes through a
-  daemon that doesn't trust pilot. The VM itself stays the real boundary.
-- **A bay is disposable.** Recreate it regularly with
-  `hangar destroy NAME && hangar up NAME`. Code leaves only through reviewed
-  PRs.
-- **Bays share credentials.** Every bay can use every route, so a
-  compromised bay can do what any bay can, and one bay can load the shared
-  tower for the rest. Use separate machines or vaults where that matters.
-  A host folder you mount into two bays is a channel between them; their
-  homes and caches never are.
+- **Tokens are the blast radius.** Agents can't read the credentials, but
+  they can use them. Give the proxy narrow tokens (a fine-grained GitHub
+  token for the repos agents work on, no admin scopes) and protect your
+  default branch.
+- **One egress.** A bay with a proxy reaches only that proxy's host port.
+  The rule is the sandbox's, outside the VM, so root or Docker in the bay
+  can't change it.
+- **A direct bay is a choice.** `"proxy": null` gives a bay the open
+  internet. A bay without a proxy and without `defaults.proxy` is an
+  error.
+- **Apps never run as root.** Apps, shells and copied files run as the
+  user `pilot` (uid 1000, home `/home/pilot`), with no sudo. Docker is
+  pilot's own rootless daemon. The VM stays the real boundary.
+- **Keep app UIs behind a login.** App ports are published on
+  `127.0.0.1`, so any local process can reach them.
+- **Bays sharing a proxy share its credentials.** Use separate proxies or
+  sessions where that matters. A host folder mounted into two bays is a
+  channel between them; their homes and caches never are.
+- **A bay is disposable.** Remove and recreate it now and then with
+  `hangar rm NAME && hangar up NAME`. Code leaves through reviewed PRs.
 
 ## Install
 
 On NixOS or nix-darwin, use the module: it installs hangar and
 microsandbox (see [nix.md](nix.md)).
 
-Otherwise you need [microsandbox](https://microsandbox.dev) (`msb`). On
-Linux you also need access to `/dev/kvm`. hangar itself is a single binary
-with no runtime dependencies.
+Otherwise install [microsandbox](https://microsandbox.dev) (`msb`); on
+Linux you also need access to `/dev/kvm`. hangar is a single binary.
 
 ```sh
 brew install superradcompany/tap/microsandbox # or see microsandbox.dev
@@ -69,359 +58,110 @@ curl -fsSLo ~/.local/bin/hangar \
   https://github.com/zahidkizmaz/hangar/releases/latest/download/hangar-aarch64-darwin
 chmod +x ~/.local/bin/hangar
 
-hangar init # writes a minimal ~/.config/hangar/hangar.json
+hangar init # writes ~/.config/hangar/hangar.json
 ```
 
-Edit `~/.config/hangar/hangar.json` (`$XDG_CONFIG_HOME/hangar/hangar.json`
-when that's set). It only holds what you set; everything else comes from
-the built-in defaults, so updates to them reach you:
-
-```json
-{
-  "bays": [
-    { "name": "default",
-      "apps": ["nix", "github", "claude-code"],
-      "packages": ["nixpkgs#rtk"] }
-  ],
-  "tower": { "credentialFiles": {} }
-}
-```
-
-- `bays`: the bays, in order; each lists its
-  [apps](configuration.md#apps). Without any there is one bay, `default`.
-- `tower.credentialFiles`: vault credential key → file holding its value,
-  e.g. `{"GITHUB_TOKEN": "/path/to/github-token"}`, for credentials you
-  keep in files. Others you store with `hangar credential set NAME`.
-
-Every other setting is in [configuration.md](configuration.md). Then run
-`hangar up`.
-
-### The master password
-
-You don't create one. On the first `hangar up`, each install generates its
-own random password and stores it in the OS keychain: the macOS login
-Keychain, or the Secret Service (`secret-tool`, from libsecret) on Linux. It
-only ever travels on stdin: never in a process's arguments or a child
-process's environment, and never written to disk. hangar calls the keychain
-tool by its absolute path, never through `PATH`: `/usr/bin/security` on
-macOS, and on Linux `/usr/bin/secret-tool` (the Nix package builds in
-libsecret's).
-
-Everything else is re-applied from your config on every `up` (deny mode,
-routes, credentials; a credential removed from `credentialFiles` is deleted
-from the vault), so a new machine only needs the same config and credential
-files. What doesn't carry over is state that lives only inside
-the vault, such as OAuth logins pasted into agent-vault.
-
-To supply your own instead, hangar uses the first of these that is set:
-
-1. `HANGAR_MASTER_PASSWORD`: the password itself
-2. `HANGAR_MASTER_PASSWORD_FILE`: a file holding it
-3. `tower.masterPasswordFile` in the config: an explicit opt-in, e.g. a
-   file a secrets manager provides in CI
-4. the OS keychain (service `hangar`, account `master-password`;
-   `HANGAR_KEYCHAIN_SERVICE` picks another service name)
-
-A password is only generated for a new vault. If vault data exists but the
-keychain item is gone, `hangar up` stops instead of generating one, which
-would lock that vault: restore the item, or `hangar destroy --state` to
-start fresh. `destroy --state` also deletes the keychain item.
-
-## First run
+`hangar init` writes one direct bay, `default`. Add a proxy and point the
+bay at it; the README has a full example with a managed Infisical proxy,
+and [proxy-kinds.md](proxy-kinds.md) has every kind. Then:
 
 ```sh
-hangar up             # creates the VMs; prints the overview below
-hangar status         # the same overview, any time
-hangar status --all   # plus apps, hosts, credential names, mounts, routes
+hangar up    # proxies first, then the bays
+hangar ps    # state, proxy and image of each bay and proxy
 ```
 
-`status` starts with the overall health, then each bay with its run
-entries and its apps' URLs, then the tower with its own ports:
+`up` prints one line per bay and proxy:
 
 ```
-hangar: healthy
-hangar-bay-default: Running
-  run paperclip: running
-  PORT       URL                    STATE      PURPOSE
-  paperclip  http://127.0.0.1:3100  reachable  Paperclip web UI
-hangar-tower: Running
-  vault: healthy, unlisted hosts: deny
-  PORT      URL                     STATE      PURPOSE
-  vault-ui  http://127.0.0.1:14321  reachable  agent-vault admin UI and API
-  proxy     127.0.0.1:14322         -          the bays' only way out
-all ports bind to 127.0.0.1 only
+vault: created
+work: recreated (image, mounts)
+docs: updated (packages nixpkgs#rtk; started paperclip)
+scratch: unchanged
 ```
-
-`--all` adds each bay's apps (hosts and credential names), mounts and
-package cache, and every route the tower serves, with its source (`app
-NAME` or `config` for `tower.routes`):
-
-```
-  ROUTE      HOST               AUTH                            SOURCE
-  anthropic  api.anthropic.com  bearer CLAUDE_CODE_OAUTH_TOKEN  app claude-code
-  mirror     mirror.example     passthrough                     config
-```
-
-Neither prints a credential's value; `hangar credential list` lists the
-stored ones.
-
-### Accounts and the vault UI
-
-You don't create any account. On the first `up`, hangar creates agent-vault's
-admin account itself:
-
-| | |
-|---|---|
-| email | `owner@hangar.local` (fixed, not a real address) |
-| password | random, in `<stateDir>/owner-password` (default `~/.local/share/hangar`, mode 0600) |
-
-Don't change or delete that account or file: hangar logs in with it on every
-`up`. To open the vault UI, run `hangar vault-ui`: it copies the password to
-the clipboard, prints the email and URL, and opens the page. Without it:
-`pbcopy < ~/.local/share/hangar/owner-password` (Linux: `wl-copy <` or
-`xclip -sel c <`), then open `http://127.0.0.1:14321`.
-
-You normally don't need the UI: add tokens with `hangar credential set`.
-The UI is for looking at services (one per route), the request log, where
-each bay shows as its own agent (`hangar-<bay>`), and `403`s.
-
-### Ports and URLs
-
-| Port | What | Reachable from |
-|---|---|---|
-| `127.0.0.1:14321` | vault UI and admin API (`tower.agentVault.adminPort`) | your machine |
-| `127.0.0.1:14322` | vault proxy (`tower.agentVault.proxyPort`) | the bays only |
-| app ports, e.g. `127.0.0.1:3100` | Paperclip's web UI (the `paperclip` app) | your machine |
-
-Everything binds to `127.0.0.1` only, and two ports can't share a host
-port: two bays running Paperclip need `ports.paperclip` in one of them
-(`port 3100: work/paperclip and oss/paperclip: set ports.paperclip in bay
-oss`). Changing a port takes `hangar destroy NAME && hangar up NAME`.
-
-### Where secrets live
-
-| Secret | Where |
-|---|---|
-| master password | the OS keychain, generated per install |
-| your tokens | inside agent-vault, encrypted (`hangar credential set`) |
-| a bay | placeholders only, never a real value |
-| Nix config, `hangar.json` | credential *names* only |
-
-Name a credential after the environment variable your tool reads (e.g.
-`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`). hangar then sets
-`NAME=hangar-placeholder` in every bay for every credential a route
-injects, and the vault swaps in the real value on the way out.
-`hangar credential list` shows the names, who manages them and their
-state (`set`, or for an OAuth credential whether it's connected), never
-the values; `hangar credential rm NAME` deletes one of yours. Names are
-`UPPER_SNAKE_CASE` starting with a letter, agent-vault's rule.
-
-### OAuth credentials
-
-Some APIs hand out OAuth tokens instead of a key you can paste: a login in
-your browser, then an access token that expires and a refresh token that
-renews it. The vault can hold such a credential and refresh it itself, so
-neither token ever enters a bay. Log it in once from your machine, giving
-the API's URL:
-
-```sh
-hangar credential login ATLASSIAN https://mcp.atlassian.com/v1/mcp
-```
-
-- hangar finds the provider's endpoints from that URL (the resource's
-  OAuth metadata, else the authorization server's or OpenID's at its
-  origin) and registers itself there as a public client, one without a
-  secret. Every URL it fetches must be `https` with a public host name.
-  `--scope` asks for a scope (repeat it), and `--client-id ID` uses a
-  client you registered instead.
-- A provider without that registration needs a client you register
-  yourself, with `http://127.0.0.1:14321/v1/oauth/callback` as its
-  redirect URL (your `tower.agentVault.adminPort`): the provider sends
-  your browser back to the vault there. Then pass its endpoints:
-
-  ```sh
-  hangar credential login EXAMPLE_API \
-    --authorization-url https://auth.example.com/authorize \
-    --token-url https://auth.example.com/token \
-    --client-id abc123 --client-secret --scope read
-  ```
-
-  `--client-secret` reads the secret like `credential set` (hidden
-  prompt, or stdin) and gives it to the vault only.
-- hangar opens the provider's consent page (`open` or `xdg-open`, and
-  prints the URL when you're at a terminal) and waits up to 10 minutes
-  until the vault has the tokens. The page in your browser says whether it
-  worked.
-- A route injects it like any credential, e.g.
-  `{"type": "bearer", "token": "ATLASSIAN"}` on the API's host; bays get
-  the placeholder.
-- `hangar credential login ATLASSIAN` alone logs in again with the client
-  the vault holds (and its secret), e.g. after `credential list` shows
-  `oauth: refresh failed`. `hangar credential rm ATLASSIAN` is the logout:
-  it deletes the tokens from the vault. Revoke the grant at the provider
-  too if you want it gone there.
-- A tower started before hangar knew its host address sends the browser
-  to an address it can't reach; `login` then refuses and says to restart
-  the tower (`hangar down && hangar up`).
-
-### MCP servers
-
-A remote MCP server is a host like any other: a route, a credential, and
-the server in your tool's own config. hangar never reads or writes that
-config, and it holds no secret.
-
-1. A route in `tower.routes`. Scope it to the server's path, so the bay
-   can reach only the MCP endpoint, never the provider's `/register` or
-   `/token` (a tool can't log itself in from inside the bay):
-
-   ```json
-   { "name": "atlassian-mcp", "host": "mcp.atlassian.com/v1/mcp",
-     "auth": { "type": "bearer", "token": "ATLASSIAN" } }
-   ```
-
-   A server that also needs other paths (an SSE server's `/sse` and
-   `/messages`) gets a glob such as `mcp.example.com/v1/*`. The scope
-   only guards while no other route covers the whole host.
-2. The credential: `hangar credential login ATLASSIAN
-   https://mcp.atlassian.com/v1/mcp` for OAuth, or `hangar credential set
-   NAME` for a key.
-3. The server in your tool, the way you always add it, with the
-   credential's placeholder for auth, so the tool sends a header the vault
-   replaces, and never starts a login of its own:
-
-   ```sh
-   hangar shell claude mcp add-json --scope user atlassian \
-     '{"type":"http","url":"https://mcp.atlassian.com/v1/mcp",
-       "headers":{"Authorization":"Bearer ${ATLASSIAN}"}}'
-   ```
-
-   Claude Code keeps user-scope servers in `~/.claude.json` in the bay's
-   kept home (it rewrites that file itself, so don't copy it with
-   `files`); a project's `.mcp.json` works too. opencode reads
-   `{env:ATLASSIAN}` in `headers` (set `"oauth": false`), and Codex
-   `bearer_token_env_var = "ATLASSIAN"`; their config files can come in
-   with `files`.
-
-A local (stdio) MCP server runs in the bay and calls its API through the
-tower: route that API's host with the credential the server reads from
-its environment (e.g. `context7.com` with bearer `CONTEXT7_API_KEY`), and
-the bay's placeholder does the rest.
-
-## Claude Code, Codex and Paperclip
-
-All three are built-in [apps](configuration.md#built-in-apps) and bring
-packages, so they need `nix` and `github` (or `github-token`):
-
-```nix
-services.hangar.bays = [
-  { name = "default"; apps = [ "nix" "github" "claude-code" "paperclip" ]; }
-];
-```
-
-Give Claude Code its token through the vault:
-
-```sh
-claude setup-token                               # on your machine
-hangar credential set CLAUDE_CODE_OAUTH_TOKEN    # paste it (hidden)
-```
-
-Paperclip needs Claude Code, so list both. Listing `claude-code` means you
-accept its unfree license. Claude Code may need hosts beyond
-`api.anthropic.com` for some features (not verified); the vault's `403`
-names any it hits, see
-[Allowing another host](configuration.md#allowing-another-host).
-
-Codex uses an OpenAI API key, which stays in the vault:
-
-```sh
-hangar credential set OPENAI_API_KEY             # paste it (hidden)
-hangar setup codex                               # once per home
-```
-
-`hangar setup codex` logs Codex in with the bay's placeholder (it writes
-only the placeholder to `~/.codex/auth.json`), and the vault swaps in the
-real key on `api.openai.com`. Sign in with ChatGPT doesn't work through
-the vault: Codex keeps that login's refresh token in the bay and renews it
-itself (`auth.openai.com`, `chatgpt.com`), so the real secret would live
-in the VM. `up` warns `codex needs setup` until Codex is logged in with
-an API key.
-
-**Paperclip needs onboarding once.** `paperclipai run` refuses to start
-until it's set up, so the first `hangar up` skips it and warns
-`paperclip needs setup: run 'hangar setup paperclip'`. Run that: it starts
-`paperclipai onboard` in the VM with your terminal (pick authenticated
-mode), then checks it worked. The next `hangar up` starts Paperclip;
-`hangar logs paperclip -f` follows its output, after the last 100 lines
-of its journal (with several bays, add `--bay NAME` to `setup` and
-`logs`). Then open `http://127.0.0.1:3100`. Its
-data lives in `~/.local/share/hangar/bays/default/home/.paperclip` on your
-machine and survives `hangar destroy` (see
-[A bay's home](configuration.md#a-bays-home) for the database caveat).
-Authenticated mode and bind `lan` (not `loopback`) are on purpose: the
-published port reaches the VM's network interface, and any local process
-could reach the port.
 
 ## Commands
 
-`hangar --help` lists the commands, flags and exit codes (0 ok, 1 error,
-2 usage, 3 `status`: not healthy); every command has its own `--help`
-with examples.
+`hangar --help` lists the commands and exit codes; each command has its
+own `--help`. Names are positional, and bays and proxies share one
+namespace.
 
-`-q`/`-v` work anywhere (`hangar -v up` or `hangar up -v`);
-`HANGAR_LOG=debug` does the same and also works for the login autostart.
-Output (status, ports, `credential list`) goes to stdout; progress and
-warnings go to stderr, so `hangar status | grep` stays clean. Everything
-after `hangar shell CMD` goes to the command unchanged, `--help` included:
-`hangar shell gh --help`.
+| Command | Does |
+| --- | --- |
+| `init [--force]` | writes a starter config |
+| `up [NAME…]` | creates, starts, updates or recreates bays and proxies (default: all) |
+| `down [NAME…]` | stops them (bays first) |
+| `restart [NAME…]` | `down`, then `up` |
+| `rm NAME [--data] [-y]` | removes a VM; `--data` also deletes its data |
+| `ps` | lists bays, proxies and leftovers, and warns about anything wrong |
+| `inspect NAME` | everything about one bay or proxy |
+| `exec BAY [CMD…]` | a login shell in the bay, or `CMD` |
+| `logs [NAME [APP]] [-f]` | hangar's log, a bay's app journal, or a managed proxy's log |
+| `cp SRC DEST` | copies into or out of a running bay (`BAY:PATH` on one side) |
+| `setup BAY APP [--force]` | runs an app's one-time interactive setup |
 
-**Bays:** `up`, `down` and `destroy` take bay names (`hangar up work`);
-without them they act on every bay, and `down`/`destroy` on the tower
-too. `shell`, `logs`, `setup`, `copy` and `restart` act on one bay: the
-only one, or `--bay NAME` (`-b`) when there are several (`hangar shell
---bay oss`). `up` takes the bays in config order, and a failing bay
-doesn't stop the others: it's logged as `bay NAME: …`, `--json` lists it
-under `failed`, and `up` exits 1. A bay removed from the config is
-reported as left over, with the `hangar destroy NAME` that removes it;
-its vault token goes on the next `up`.
+- **`up`** brings each selected bay's proxy up first. A bay whose proxy
+  failed is left alone, and any failure makes `up` exit 1 while the rest
+  goes on. What `up` applies in place and what recreates a VM is in
+  [configuration.md](configuration.md#what-up-changes).
+- **`rm`** takes a configured name or a leftover (a folder in the data dir
+  with no config entry). `--data` deletes a bay's home and data volume, or
+  a proxy's data folder, after asking; `-y` skips the question, and
+  without a terminal it's required. The package cache is always kept.
+- **`ps`** warns about apps that aren't running or need setup,
+  unreachable proxies and leftovers, and then exits 3.
+- **`exec`**, **`cp`** and **`setup`** need the bay running. Everything
+  after `exec BAY` goes to the command unchanged, `--help` included.
+- **`cp`** into a bay runs the same checks as a `copy` mount, but the copy
+  isn't managed. Out of a bay, the destination must not exist yet.
+- **`logs`** without a name shows hangar's own log; with a bay, the
+  journal of its apps (the last 200 lines); with a managed proxy, its log.
+  `-f` keeps following.
 
-**`up`, `copy` and `restart`:** `up` converges everything to your config
-and is safe to repeat, but **never restarts** a VM or a `run` entry
-(only a bay's Docker and nix daemons, when its token or the tower's CA
-changed; see [Docker in a bay](#docker-in-a-bay)): when a running `run`
-entry's command, environment or copied files changed, it says
-`<name>'s inputs changed; run 'hangar restart <name>' to apply`. `hangar
-copy` copies only the declared `files`; `hangar copy SRC [DEST]`
-copies one file or directory ad hoc (same checks, not managed, so a declared
-entry for the same path overwrites it on the next `copy`, `up` or
-`restart`). `hangar restart [NAME…]` re-applies `files` (skip with
-`--no-copy`) and the env file, then stops each entry with every process it
-started (TERM, then KILL after 10 seconds) and starts it again.
+`up`, `down`, `restart`, `rm`, `cp` and `setup` hold a lock
+(`$XDG_STATE_HOME/hangar/lock`); a second one logs `waiting for another
+hangar` and goes on once the first is done.
 
-**Scripts and agents:** add `--json` for one JSON document per command on
-stdout (`hangar status --json | jq .tower`), and use the exit codes
-(`hangar status --json || hangar up`). Schemas, flows and rules are in
-[cli.md](cli.md).
+`-q` and `-v`/`-vv` work anywhere; `HANGAR_LOG=debug` does the same when
+flags can't. Results go to stdout, progress and warnings to stderr.
+Everything at info level and above, and every change, also goes to
+`$XDG_STATE_HOME/hangar/hangar.log` (mode 0600). For scripts, add
+`--json` and see [cli.md](cli.md).
 
-Disks persist: repos, docker images, the nix store and Paperclip's data
-survive `down`/`up`. To bring the VMs back after a reboot, see
-[Autostart](nix.md#autostart).
+## Claude Code, Codex and Paperclip
+
+All three are built-in [apps](configuration.md#apps). Each sets its
+credential variable to a placeholder; the real credential belongs in the
+proxy, for that provider's host.
+
+- **Claude Code**: the bay sends `CLAUDE_CODE_OAUTH_TOKEN`'s placeholder.
+  Store the token from `claude setup-token` in your proxy.
+- **Codex**: store your OpenAI API key in the proxy, then run `hangar
+  setup BAY codex` once per home. It logs Codex in with the placeholder;
+  the proxy swaps in the real key. Sign in with ChatGPT doesn't work
+  through a proxy: Codex would keep that login's refresh token in the bay.
+- **Paperclip** needs onboarding once. Until then `up` doesn't start it
+  and `ps` says `app paperclip needs setup`. Run `hangar setup BAY
+  paperclip` (pick authenticated mode), then `hangar up` starts it. Open
+  `http://127.0.0.1:3100`; `hangar logs BAY paperclip -f` follows its
+  output. Its data lives in the bay's home.
+
+Listing `claude-code` means you accept its unfree license.
 
 ## Docker in a bay
 
 Each bay runs Docker rootless as `pilot` (`DOCKER_HOST` points at it), so
-full test suites with containers work without giving apps root. The usual
-rootless limits apply: no cgroup resource limits on containers, slower
-container networking, and `--privileged` only gets pilot's
-user-namespace capabilities. Pulls use the bay's proxy by themselves.
+test suites with containers work without root. The usual rootless limits
+apply: no cgroup limits on containers, slower container networking, and
+`--privileged` gets only pilot's user-namespace capabilities. Pulls go
+through the bay's proxy.
 
-Docker's data lives on a disk of its own in the VM, `disk` sized like the
-root (both grow only as they're used), and goes with the VM. When a
-bay's token is renewed or the tower's CA changes, `up` restarts the
-bay's Docker daemon so it uses the new ones, which stops its running
+Docker's data is on the bay's data volume (`/var/lib/pilot`), so images
+and containers survive a recreate unless `disk` changes. When the proxy
+login changes, the bay restarts its Docker daemon, which stops running
 containers.
 
-Containers don't inherit the proxy or its CA: pass them in. Containers
-can't resolve the proxy's host name, so add it:
+Containers don't inherit the proxy or its CA: pass them in, and add the
+proxy's host name, which containers can't resolve:
 
 ```sh
 ip=$(awk '$2 == "host.microsandbox.internal" {print $1; exit}' /etc/hosts)
@@ -430,23 +170,19 @@ docker run --rm --add-host "host.microsandbox.internal:$ip" \
   curlimages/curl https://example.com
 ```
 
-Never write the proxy URL (it carries the bay's token) into
+Never write the proxy URL (it carries the bay's login) into
 `~/.docker/config.json`: the home is kept on your machine.
 
 ## Troubleshooting
 
+- `ps` exits 3: read its warnings; each names the command that fixes it.
+- `proxy NAME unreachable` or `didn't come up`: `hangar logs NAME` shows a
+  managed proxy's log. For `infisical`, check both token files.
 - An image pull hangs on macOS: `msb` is waiting on
   `docker-credential-osxkeychain` from `~/.docker/config.json`. Run hangar
   with `DOCKER_CONFIG` set to a folder whose `config.json` is `{}`.
-- A host is refused with `403`: add a route for it, see
-  [Allowing another host](configuration.md#allowing-another-host).
-- `up` refuses an existing VM, or says its ports, mounts or image changed:
-  these are fixed when the VM is created, so run
-  `hangar destroy NAME && hangar up NAME` (the home is kept).
-- `NAME needs setup: run 'hangar setup NAME'`: the app's one-time setup
-  hasn't run yet; run that command (see
-  [Claude Code, Codex and Paperclip](#claude-code-codex-and-paperclip)).
-- `dockerd in hangar-bay-NAME did not start`: in `hangar shell -b NAME`,
-  run `systemctl --user reset-failed docker && systemctl --user restart
-  docker` (systemd stops restarting docker after three starts in a
-  minute); `systemctl --user status docker` says why it stopped.
+- `dockerd in hangar-bay-NAME did not start`: in `hangar exec NAME`, run
+  `systemctl --user reset-failed docker && systemctl --user restart
+  docker`; `systemctl --user status docker` says why it stopped.
+- A mount or copy is refused: the error names the path and the rule; see
+  [Mounting folders](configuration.md#mounting-folders).

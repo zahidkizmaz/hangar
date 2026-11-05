@@ -18,37 +18,50 @@ let
     }).config.services.hangar.package.config;
 
   settings = {
-    tower.credentialFiles.GITHUB_TOKEN = "/run/secrets/github-token";
-    appDefinitions.web.ports = [
+    proxies.vault = {
+      kind = "infisical";
+      run = "managed";
+      proxyTokenFile = "/run/secrets/infisical-proxy-token";
+      sessionTokenFile = "/run/secrets/infisical-session-token";
+    };
+    defaults.proxy = "vault";
+    apps.web.ports = [
       {
         name = "web";
         vm = 3100;
         purpose = "Example web UI";
       }
     ];
+    sandbox.backend = "msb";
     bays = [
       {
         name = "default";
         apps = [
-          "nix"
-          "github-token"
           "claude-code"
           "web"
         ];
         image = "ghcr.io/example/hangar-bay:latest";
         packages = [ "github:numtide/llm-agents.nix#codex" ];
         env.EXAMPLE_MODE = "demo";
-        run.web = "serve --port 3100";
-        files."~/.config/app/config.toml" = "~/dotfiles/app/config.toml";
-        mounts."~/.app-data" = {
-          host = "~/work/app-data";
-          writable = true;
+        ports.web = 3200;
+        cpus = 2;
+        memory = "8G";
+        mounts = {
+          "~/notes".host = "~/notes";
+          "~/projects" = {
+            host = "~/work/projects";
+            mode = "rw";
+          };
+          "~/.config/app" = {
+            host = "~/dotfiles/app";
+            mode = "copy";
+          };
         };
-        cache = false;
       }
       {
         name = "oss";
-        home = false;
+        proxy = null;
+        disk = "60G";
         # A stub: the test checks the rendering, not the image.
         imagePackage = {
           type = "derivation";

@@ -50,8 +50,8 @@ in
         ];
       };
     };
-  # hangar replaces proxy.env only when it changed (it names the tower's CA
-  # too): restart the daemons that read it.
+  # hangar replaces proxy.env only when it changed: restart the daemons
+  # that read it.
   systemd.paths.hangar-proxy-env = {
     wantedBy = [ "paths.target" ];
     pathConfig.PathChanged = "/etc/hangar/proxy.env";
@@ -122,7 +122,7 @@ in
   # store symlink it would write into /nix/store.
   environment.etc.profile.mode = "0644";
   environment.etc."ssl/certs/ca-certificates.crt".mode = "0644";
-  # Untouched by agentd: hangar adds the tower's CA to it.
+  # Untouched by agentd: hangar adds the proxy's CA to it.
   environment.etc."hangar/system-ca.crt".source = config.security.pki.caBundle;
 
   systemd.tmpfiles.rules = [
@@ -147,7 +147,7 @@ in
   '';
   programs.git = {
     enable = true;
-    # agent-vault swaps in the real token; git only needs a placeholder.
+    # The proxy swaps in the real token; git only needs a placeholder.
     config.credential."https://github.com".helper =
       "!f() { echo username=x-access-token; echo password=__placeholder__; }; f";
   };

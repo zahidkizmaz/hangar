@@ -608,6 +608,27 @@ mod tests {
     }
 
     #[test]
+    fn module_fixture_is_a_valid_config() {
+        let settings = resolve_with(include_str!("../tests/module.json"));
+        let proxies: Vec<&str> =
+            settings.proxies.keys().map(String::as_str).collect();
+        assert_eq!(proxies, ["vault"]);
+        assert!(matches!(
+            settings.proxies["vault"].location,
+            Location::Managed
+        ));
+        let [default, oss] = &settings.bays[..] else {
+            panic!("two bays expected");
+        };
+        assert_eq!(default.proxy.as_deref(), Some("vault"));
+        assert_eq!(oss.proxy, None);
+        let modes: Vec<Mode> =
+            default.mounts.values().map(|mount| mount.mode).collect();
+        assert_eq!(modes, [Mode::Copy, Mode::Ro, Mode::Rw]);
+        assert_eq!(default.ports[0].host, 3200);
+    }
+
+    #[test]
     fn no_bays_is_one_bay_named_default() {
         for bays in [r#""apps": {}"#, r#""bays": null"#, r#""bays": []"#] {
             let settings = resolve_with(&with_default_proxy(bays));
