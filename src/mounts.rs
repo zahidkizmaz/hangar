@@ -58,7 +58,11 @@ pub(crate) fn copies(
 }
 
 fn overlaps(a: &str, b: &str) -> bool {
-    Path::new(a).starts_with(b) || Path::new(b).starts_with(a)
+    overlaps_path(Path::new(a), Path::new(b))
+}
+
+fn overlaps_path(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }
 
 /// The mount a VM path collides with, if any: a VM path is either copied
@@ -129,6 +133,8 @@ pub(crate) struct Roots {
     pub(crate) cache: PathBuf,
     pub(crate) bay_home: PathBuf,
     pub(crate) bay_cache: PathBuf,
+    /// Every proxy's host secrets, as configured and resolved.
+    pub(crate) secrets: Vec<PathBuf>,
 }
 
 impl Roots {
@@ -141,6 +147,7 @@ impl Roots {
         cache: &Path,
         bay_home: &Path,
         bay_cache: &Path,
+        secrets: &[PathBuf],
     ) -> Result<Self> {
         let folder = |path: &Path| -> Result<PathBuf> {
             let (Some(parent), Some(name)) = (path.parent(), path.file_name())
@@ -158,6 +165,13 @@ impl Roots {
             cache: would_be(cache).context(cache.display())?,
             bay_home: folder(bay_home)?,
             bay_cache: folder(bay_cache)?,
+            secrets: secrets
+                .iter()
+                .flat_map(|path| {
+                    [Some(path.clone()), fs::canonicalize(path).ok()]
+                })
+                .flatten()
+                .collect(),
         })
     }
 }
@@ -273,9 +287,9 @@ pub(crate) fn create(path: &Path) -> std::io::Result<()> {
         .create(path)
 }
 
-/// Why a resolved source can't be used, if it can't, for what only hangar
-/// may touch: the two roots and other bays' folders. Copies check this
-/// too (`files::plan`).
+/// Why a source can't be used, if it can't, for what only hangar may
+/// touch: the two roots, other bays' folders and the proxies' token files.
+/// Copies check this too (`files::plan`).
 pub(crate) fn check_hangar_dirs(
     host: &Path,
     roots: &Roots,
@@ -285,8 +299,12 @@ pub(crate) fn check_hangar_dirs(
         cache,
         bay_home,
         bay_cache,
+        secrets,
         ..
     } = roots;
+    if secrets.iter().any(|secret| overlaps_path(host, secret)) {
+        return Err("holds a proxy's token file");
+    }
     if state.starts_with(host)
         || (host.starts_with(state) && !host.starts_with(bay_home))
     {
@@ -437,7 +455,7 @@ mod tests {
         lines, overlaps, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
-    use crate::testing::{roots, scratch_dir};
+    use crate::testing::{roots, roots_guarding, scratch_dir};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -454,6 +472,7 @@ mod tests {
             cache: cache.into(),
             bay_home: Path::new(state).join("bays/default/home"),
             bay_cache: Path::new(cache).join("bays/default"),
+            secrets: Vec::new(),
         }
     }
 
@@ -499,6 +518,7 @@ mod tests {
             ("/home/you/.ssh", false, "credentials or keys"),
             ("/home/you/work/.aws", false, "credentials or keys"),
             ("/home/you/.config/gh", false, "credentials or keys"),
+            ("/home/you/.secrets", false, "credentials or keys"),
             ("/home/you/.claude", true, "keep config"),
             ("/home/you/.claude/agents", true, "keep config"),
             ("/home/you/.config", true, "keep config"),
@@ -688,6 +708,42 @@ mod tests {
         )]);
         let error = resolve(&set, &roots).unwrap_err().to_string();
         assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn proxy_token_files_are_never_mounted() {
+        let home = fs::canonicalize(scratch_dir("mount-proxy-token")).unwrap();
+        fs::create_dir_all(home.join("tokens")).unwrap();
+        fs::write(home.join("tokens/proxy-token"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join("tokens"), home.join("via"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            home.join("tokens/proxy-token"),
+            home.join("innocent"),
+        )
+        .unwrap();
+        let secret = [home.join("via/proxy-token")];
+        let roots = roots_guarding(&home, "state", ".cache/hangar", &secret);
+        for (host, writable) in [
+            ("~/tokens", false),
+            ("~/tokens/proxy-token", false),
+            ("~/innocent", false),
+            ("~/via", false),
+            ("~/tokens", true),
+        ] {
+            let error =
+                resolve(&mounts(&[("/home/pilot/x", host, writable)]), &roots)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.starts_with("mounts./home/pilot/x: ")
+                    && error.contains("holds a proxy's token file"),
+                "{host}: {error}"
+            );
+        }
+        fs::create_dir_all(home.join("work")).unwrap();
+        let fine = mounts(&[("/home/pilot/x", "~/work", false)]);
+        assert!(resolve(&fine, &roots).is_ok());
     }
 
     #[test]

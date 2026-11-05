@@ -76,6 +76,16 @@ pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
 /// Roots for bay `default` in a scratch home, with `state` (created) and
 /// `cache` under it.
 pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
+    roots_guarding(home, state, cache, &[])
+}
+
+/// [`roots`] that also keep `secrets` (a proxy's token files) out.
+pub(crate) fn roots_guarding(
+    home: &Path,
+    state: &str,
+    cache: &str,
+    secrets: &[PathBuf],
+) -> Roots {
     let state = home.join(state);
     fs::create_dir_all(&state).unwrap();
     let cache = home.join(cache);
@@ -85,6 +95,7 @@ pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
         &cache,
         &state.join("bays/default/home"),
         &cache.join("bays/default"),
+        secrets,
     )
     .unwrap()
 }

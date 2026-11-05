@@ -90,6 +90,7 @@ mod tests {
         assert_eq!(proxy.kind(), "http");
         assert_eq!(proxy.egress(), Egress::HostPort(3128));
         assert!(proxy.managed().is_none());
+        assert_eq!(proxy.host_secrets(), Vec::<std::path::PathBuf>::new());
     }
 
     #[test]

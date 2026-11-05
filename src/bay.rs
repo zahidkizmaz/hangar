@@ -70,6 +70,11 @@ pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
         &hangar.cache_root,
         &bay.dir.home(),
         &bay.cache,
+        &hangar
+            .proxies
+            .values()
+            .flat_map(|proxy| proxy.host_secrets())
+            .collect::<Vec<_>>(),
     )
 }
 

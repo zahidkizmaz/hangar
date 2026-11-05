@@ -42,6 +42,10 @@ impl Proxy for AgentVault {
     fn health(&self) -> Health {
         super::tcp_health(self.port)
     }
+
+    fn host_secrets(&self) -> Vec<PathBuf> {
+        vec![self.token_file.clone()]
+    }
 }
 
 /// Reads `ca` (required), `tokenFile` and `vault` (default `default`).
@@ -148,6 +152,7 @@ mod tests {
             external(),
         )
         .unwrap();
+        assert_eq!(proxy.host_secrets(), [PathBuf::from("/nope/token")]);
         let error = proxy.login("work").err().unwrap();
         assert!(error.to_string().starts_with("/nope/token: "), "{error}");
     }

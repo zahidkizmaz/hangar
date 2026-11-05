@@ -42,6 +42,11 @@ pub(crate) trait Proxy {
     fn managed(&self) -> Option<&dyn Managed> {
         None
     }
+    /// Host files that hold the proxy's own credentials: no bay may
+    /// mount or copy them.
+    fn host_secrets(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 pub(crate) trait Managed {

@@ -14,6 +14,7 @@ pub(crate) struct FakeProxy {
     pub(crate) login: Option<(String, String)>,
     pub(crate) up: bool,
     pub(crate) managed: Option<FakeManaged>,
+    pub(crate) secrets: Vec<PathBuf>,
 }
 
 pub(crate) struct FakeManaged {
@@ -29,6 +30,7 @@ impl FakeProxy {
             login: None,
             up: true,
             managed: None,
+            secrets: Vec::new(),
         }
     }
 }
@@ -82,6 +84,10 @@ impl Proxy for FakeProxy {
     fn managed(&self) -> Option<&dyn Managed> {
         self.managed.as_ref().map(|managed| managed as &dyn Managed)
     }
+
+    fn host_secrets(&self) -> Vec<PathBuf> {
+        self.secrets.clone()
+    }
 }
 
 impl Managed for FakeManaged {
@@ -99,11 +105,11 @@ impl Managed for FakeManaged {
     }
 }
 
-/// Reads `port` (default 3128), `ca` (PEM text), `login` (`user:password`)
-/// and `managed` (a flag).
+/// Reads `port` (default 3128), `ca` (PEM text), `login` (`user:password`),
+/// `managed` (a flag) and `secret` (a host path).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
-    super::only(fields, &["port", "ca", "login", "managed"])?;
+    super::only(fields, &["port", "ca", "login", "managed", "secret"])?;
     let port = if fields.map.contains_key("port") {
         fields.number("port")?
     } else {
@@ -119,6 +125,12 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
         managed: fields
             .flag_or("managed", false)?
             .then(|| FakeManaged::new(port)),
+        secrets: fields
+            .optional_string("secret")?
+            .map(|path| crate::files::host_path(&path, spec.home))
+            .transpose()?
+            .into_iter()
+            .collect(),
         ..FakeProxy::at(port)
     }))
 }

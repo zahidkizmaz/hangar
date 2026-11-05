@@ -38,6 +38,7 @@ struct Infisical {
     host_port: u16,
     domain: String,
     proxy_token: Secret,
+    proxy_token_file: PathBuf,
     session_token_file: PathBuf,
     data: PathBuf,
 }
@@ -81,6 +82,13 @@ impl Proxy for Infisical {
 
     fn managed(&self) -> Option<&dyn Managed> {
         Some(self)
+    }
+
+    fn host_secrets(&self) -> Vec<PathBuf> {
+        vec![
+            self.proxy_token_file.clone(),
+            self.session_token_file.clone(),
+        ]
     }
 }
 
@@ -137,11 +145,13 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     } else {
         PORT
     };
+    let proxy_token_file = path("proxyTokenFile")?;
     Ok(Box::new(Infisical {
         image: fields.optional_string("image")?.unwrap_or(IMAGE.into()),
         host_port,
         domain: fields.optional_string("domain")?.unwrap_or_default(),
-        proxy_token: read_token(&path("proxyTokenFile")?)?,
+        proxy_token: read_token(&proxy_token_file)?,
+        proxy_token_file,
         session_token_file: path("sessionTokenFile")?,
         data: spec.data.clone(),
     }))
@@ -311,6 +321,16 @@ mod tests {
         std::fs::write(files.dir.join("session"), "\n").unwrap();
         let error = proxy.login("work").err().unwrap().to_string();
         assert!(error.ends_with("/session is empty"), "{error}");
+    }
+
+    #[test]
+    fn infisical_host_secrets_are_both_token_files() {
+        let files = Files::new("infisical-secrets");
+        let proxy = files.built("").unwrap();
+        assert_eq!(
+            proxy.host_secrets(),
+            [files.dir.join("proxy"), files.dir.join("session")]
+        );
     }
 
     #[test]

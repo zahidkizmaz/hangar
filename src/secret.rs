@@ -48,6 +48,9 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         return Some("a private key");
     }
+    if has_jwt(text) {
+        return Some("a JWT");
+    }
     let token = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     text.split(|c: char| !token(c)).find_map(|word| {
         SECRET_PREFIXES.iter().find_map(|prefix| {
@@ -62,6 +65,16 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
             };
             real.then_some(*prefix)
         })
+    })
+}
+
+/// `eyJ` (base64 of `{"`), 20 or more base64url characters, then a `.`.
+fn has_jwt(text: &str) -> bool {
+    let base64url = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices("eyJ").any(|(at, _)| {
+        let rest = &text[at + 3..];
+        let body = rest.find(|c| !base64url(c)).unwrap_or(rest.len());
+        body >= 20 && rest[body..].starts_with('.')
     })
 }
 
@@ -93,6 +106,22 @@ mod tests {
             "AKIA is the AWS key prefix",
             "-----BEGIN CERTIFICATE-----",
             "ghp_short",
+        ] {
+            assert_eq!(find_secret(prose), None, "{prose}");
+        }
+    }
+
+    #[test]
+    fn a_jwt_is_found_but_prose_mentioning_ey_j_is_not() {
+        let body = "a".repeat(20);
+        let jwt = format!("eyJ{body}.eyJ{body}.sig");
+        assert_eq!(find_secret(&format!("token={jwt}")), Some("a JWT"));
+        assert_eq!(find_secret(&format!("\"{jwt}\"")), Some("a JWT"));
+        for prose in [
+            "JWTs start with eyJ, the base64 of {\"",
+            "eyJhbGciOiJIUzI1NiJ9.",
+            &format!("eyJ{body} and no dot"),
+            &format!("eyJ{body}"),
         ] {
             assert_eq!(find_secret(prose), None, "{prose}");
         }

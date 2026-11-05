@@ -245,6 +245,7 @@ fn plan(
     for (vm, host) in files {
         let host = host_path(host, home).context(format!("mounts.{vm}"))?;
         let mut walk = Walk {
+            mount: vm,
             roots,
             copies: &mut copies,
             total: &mut total,
@@ -270,6 +271,8 @@ pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
 }
 
 struct Walk<'a> {
+    /// The `mounts` key the walk started from, named in its refusals.
+    mount: &'a str,
     roots: &'a Roots,
     copies: &'a mut Vec<FileCopy>,
     total: &'a mut u64,
@@ -285,8 +288,11 @@ impl Walk<'_> {
     /// Every symlink is followed and each resolved target checked.
     fn collect(&mut self, link: &Path, vm: &str) -> Result<()> {
         let host = &fs::canonicalize(link).context(link.display())?;
-        mounts::check_hangar_dirs(host, self.roots)
-            .map_err(|why| refuse(host, why))?;
+        for path in [host, link] {
+            mounts::check_hangar_dirs(path, self.roots).map_err(|why| {
+                refuse(path, format!("{why} (mounts.{})", self.mount))
+            })?;
+        }
         if [host, link, Path::new(vm)]
             .into_iter()
             .any(is_credentials_file)
@@ -368,7 +374,7 @@ impl Walk<'_> {
 }
 
 pub(crate) fn is_credentials_file(path: &Path) -> bool {
-    const DIRS: [&str; 4] = [".ssh", ".gnupg", ".aws", ".kube"];
+    const DIRS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", ".secrets"];
     const NAMES: [&str; 8] = [
         ".credentials.json",
         "credentials.json",
@@ -434,7 +440,9 @@ mod tests {
         plan_copy, vm_path,
     };
     use crate::error::Result;
-    use crate::testing::{hangar_with, roots, scratch_dir, settled};
+    use crate::testing::{
+        hangar_with, roots, roots_guarding, scratch_dir, settled,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -510,6 +518,7 @@ mod tests {
             "/h/.gnupg/gpg.conf",
             "/h/.kube/config",
             "/h/.config/gh/config.yml",
+            "/h/.secrets/proxy-token",
         ] {
             assert!(is_credentials_file(Path::new(path)), "{path}");
         }
@@ -675,6 +684,40 @@ mod tests {
         }
         let error = planned(&home, "~/web/l0").unwrap_err().to_string();
         assert!(error.contains("past 1000 files"), "{error}");
+    }
+
+    #[test]
+    fn copies_never_take_a_proxy_token_file() {
+        let home = fs::canonicalize(scratch_dir("files-proxy-token")).unwrap();
+        fs::create_dir_all(home.join("tokens")).unwrap();
+        fs::write(home.join("tokens/proxy-token"), "x").unwrap();
+        link(&home.join("tokens/proxy-token"), &home.join("innocent"));
+        link(&home.join("tokens"), &home.join("via"));
+        let secret = [home.join("via/proxy-token")];
+        let roots = roots_guarding(&home, "state", "cache", &secret);
+        for host in ["~/tokens/proxy-token", "~/tokens", "~/innocent"] {
+            let files = BTreeMap::from([("/home/pilot/x".into(), host.into())]);
+            let error = plan(&files, &home, &roots).unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "holds a proxy's token file (mounts./home/pilot/x)"
+                ),
+                "{host}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_proxys_token_is_never_copied() {
+        let state = scratch_dir("files-proxy-secret");
+        let config = r#"{"proxies": {"p": {"kind": "fake", "url": "x",
+            "secret": "~/cfg"}}, "bays": [{"name": "work", "proxy": "p",
+            "mounts": {"~/cfg": {"host": "~/cfg", "mode": "copy"}}}]}"#;
+        let hangar = hangar_with(config, &state, settled());
+        fs::write(hangar.host_home.join("cfg"), "settings").unwrap();
+        let bay = hangar.bay("work").unwrap();
+        let error = copy_declared(&hangar, &bay).unwrap_err().to_string();
+        assert!(error.contains("holds a proxy's token file"), "{error}");
     }
 
     #[test]
