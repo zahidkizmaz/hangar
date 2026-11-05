@@ -1,8 +1,4 @@
-use std::fmt::{self, Write as _};
-use std::fs::File;
-use std::io::Read;
-
-use crate::error::{Context, Result};
+use std::fmt;
 
 /// A credential that redacts itself in `Debug`. There is deliberately no
 /// `Display`: formatting a secret must go through `expose()`, so a mistake
@@ -69,17 +65,6 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn random_hex(bytes: usize) -> Result<String> {
-    let mut buffer = vec![0; bytes];
-    File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut buffer))
-        .context("/dev/urandom")?;
-    Ok(buffer.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    }))
-}
-
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[redacted]")
@@ -88,7 +73,7 @@ impl fmt::Debug for Secret {
 
 #[cfg(test)]
 mod tests {
-    use super::{Secret, find_secret, random_hex, trim_line_end};
+    use super::{Secret, find_secret, trim_line_end};
 
     #[test]
     fn real_looking_credentials_are_found_but_prose_is_not() {
@@ -111,14 +96,6 @@ mod tests {
         ] {
             assert_eq!(find_secret(prose), None, "{prose}");
         }
-    }
-
-    #[test]
-    fn random_hex_has_two_digits_per_byte() {
-        let hex = random_hex(16).unwrap();
-        assert_eq!(hex.len(), 32);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(hex, random_hex(16).unwrap());
     }
 
     #[test]

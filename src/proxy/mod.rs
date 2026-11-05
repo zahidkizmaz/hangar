@@ -69,7 +69,6 @@ pub(crate) enum Location {
 }
 
 pub(crate) struct Spec<'a> {
-    pub(crate) name: &'a str,
     pub(crate) fields: Fields<'a>,
     pub(crate) location: Location,
     pub(crate) home: &'a Path,
@@ -89,7 +88,6 @@ pub(crate) type Build = fn(&Spec) -> Result<Box<dyn Proxy>>;
 pub(crate) struct Access {
     pub(crate) url: Option<Secret>,
     pub(crate) ca_pem: Option<Vec<u8>>,
-    pub(crate) egress: Egress,
 }
 
 const PROXY_VM_PREFIX: &str = "hangar-proxy-";
@@ -212,19 +210,16 @@ pub(crate) fn access(
         return Ok(Access {
             url: None,
             ca_pem: None,
-            egress: Egress::Open,
         });
     };
     let ca_pem = proxy.ca()?;
     if let Some(pem) = &ca_pem {
         ca::verify(pem, None).context(format!("proxy {name}"))?;
     }
-    let egress = proxy.egress();
     let login = proxy.login(bay)?;
     Ok(Access {
-        url: proxy_url(egress, login.as_ref(), host_alias),
+        url: proxy_url(proxy.egress(), login.as_ref(), host_alias),
         ca_pem,
-        egress,
     })
 }
 
@@ -261,7 +256,6 @@ mod tests {
     fn built(text: &str) -> Result<Box<dyn Proxy>> {
         let value = json::parse(text).unwrap();
         let spec = Spec {
-            name: "p",
             fields: Fields::new(&value, "proxies.p")?,
             location: Location::Managed,
             home: Path::new("/home/u"),
@@ -402,15 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn access_direct_has_open_egress_and_no_ca() {
+    fn access_direct_has_no_url_and_no_ca() {
         let access = access(None, "w", "host").unwrap();
         assert!(access.url.is_none());
         assert!(access.ca_pem.is_none());
-        assert_eq!(access.egress, Egress::Open);
     }
 
     #[test]
-    fn access_carries_the_proxy_login_ca_and_egress() {
+    fn access_carries_the_proxy_login_and_ca() {
         let pem = include_bytes!("testdata/ca.pem").to_vec();
         let proxy = FakeProxy {
             ca: Some(pem.clone()),
@@ -420,7 +413,6 @@ mod tests {
         let access = access(Some(("p", &proxy)), "w", "host").unwrap();
         assert_eq!(access.url.unwrap().expose(), "http://u:pw@host:5");
         assert_eq!(access.ca_pem, Some(pem));
-        assert_eq!(access.egress, Egress::HostPort(5));
     }
 
     #[test]

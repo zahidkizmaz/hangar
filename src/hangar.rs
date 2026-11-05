@@ -144,7 +144,6 @@ pub(crate) fn build_proxies(
         .map(|entry| {
             let path = format!("proxies.{}", entry.name);
             let spec = Spec {
-                name: &entry.name,
                 fields: config::Fields::new(&entry.raw, &path)?,
                 location: entry.location.clone(),
                 home,

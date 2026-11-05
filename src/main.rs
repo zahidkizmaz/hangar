@@ -1,7 +1,5 @@
 //! hangar: locked-down bays for AI coding agents, in a sandbox.
 
-#![expect(dead_code, reason = "rewrite in progress; removed in Task 16")]
-
 mod apps;
 mod bay;
 mod commands;

@@ -444,23 +444,6 @@ fn cells<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.map(String::from).to_vec()
 }
 
-/// Each app's hosts and the credential each one gets, by name only.
-fn size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    #[expect(clippy::cast_precision_loss, reason = "display only")]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Outcome, Render, error_json};

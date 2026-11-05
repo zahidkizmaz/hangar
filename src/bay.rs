@@ -1186,7 +1186,6 @@ mod tests {
         let access = |ca: &[u8]| Access {
             url: Some(Secret::new("http://a'b@host:1".into())),
             ca_pem: Some(ca.to_vec()),
-            egress: Egress::HostPort(1),
         };
         let env = proxy_env(Some("fake"), &access(b"CA-1"));
         assert_eq!(

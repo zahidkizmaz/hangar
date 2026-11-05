@@ -194,7 +194,6 @@ mod tests {
     ) -> Result<Box<dyn Proxy>> {
         let value = json::parse(fields).unwrap();
         let spec = Spec {
-            name: "infi",
             fields: Fields::new(&value, "proxies.infi")?,
             location,
             home: Path::new("/home/u"),

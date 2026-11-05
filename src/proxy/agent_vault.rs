@@ -75,7 +75,6 @@ mod tests {
     fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {
         let value = json::parse(fields).unwrap();
         let spec = Spec {
-            name: "av",
             fields: Fields::new(&value, "proxies.av")?,
             location,
             home: Path::new("/home/u"),

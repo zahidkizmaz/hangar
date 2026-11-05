@@ -158,8 +158,7 @@ pub(crate) fn serve_each(
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 let mut buffer = [0; 4096];
-                // Head and body may arrive in separate writes.
-                while !complete(&request) {
+                while !request.contains("\r\n\r\n") {
                     let read = stream.read(&mut buffer).unwrap();
                     request.push_str(&String::from_utf8_lossy(&buffer[..read]));
                 }
@@ -174,17 +173,4 @@ pub(crate) fn serve_each(
             .collect()
     });
     (port, server)
-}
-
-fn complete(request: &str) -> bool {
-    let Some((head, body)) = request.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let length = head
-        .to_ascii_lowercase()
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length: "))
-        .and_then(|length| length.parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= length
 }

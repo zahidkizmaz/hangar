@@ -13,9 +13,6 @@ use crate::error::Result;
 
 pub(crate) use msb::Msb;
 
-pub(crate) const TOWER_VM: &str = "hangar-tower";
-
-/// A bay's VM: the prefix keeps every bay name clear of `TOWER_VM`.
 pub(crate) fn bay_vm(bay: &str) -> String {
     format!("hangar-bay-{bay}")
 }
@@ -84,26 +81,14 @@ impl MountMode {
 /// A port a VM publishes on the host's 127.0.0.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishedPort {
-    /// The app that brings it; `None` for the tower's own.
-    pub(crate) app: Option<String>,
-    /// The bay that publishes it; `None` for the tower's own.
-    pub(crate) bay: Option<String>,
+    /// The app that brings it.
+    pub(crate) app: String,
     pub(crate) name: String,
     pub(crate) host: u16,
     pub(crate) vm: u16,
     pub(crate) purpose: String,
     /// Probed with an HTTP GET; a TCP connect otherwise.
     pub(crate) http: bool,
-}
-
-impl PublishedPort {
-    /// `bay/name` for a bay's port, so two bays' ports never look alike.
-    pub(crate) fn owner(&self) -> String {
-        match &self.bay {
-            Some(bay) => format!("{bay}/{}", self.name),
-            None => self.name.clone(),
-        }
-    }
 }
 
 /// A bay's named data volume: outlives the VM it is mounted in.

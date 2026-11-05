@@ -58,7 +58,6 @@ pub(crate) struct Settings {
 #[derive(Debug)]
 pub(crate) struct ProxySettings {
     pub(crate) name: String,
-    pub(crate) kind: String,
     pub(crate) location: Location,
     /// The entry as written; the kind reads its own options from it.
     pub(crate) raw: Json,
@@ -190,12 +189,10 @@ fn proxy_settings(
             bail!("{path}: {}", NAME_RULE);
         }
         let fields = Fields::new(&raw, &path)?;
-        let kind = fields.string("kind")?;
         proxy::check_kind(&fields)?;
         let location = proxy::location(&fields)?;
         let entry = ProxySettings {
             name: name.clone(),
-            kind,
             location,
             raw,
         };
@@ -322,7 +319,7 @@ impl BaySettings {
             run: BTreeMap::new(),
             mounts: bay_mounts(&bay)?,
         };
-        mounts::check_targets(&settings.mounts, true, std::iter::empty())?;
+        mounts::check_targets(&settings.mounts)?;
         Ok(settings)
     }
 }
@@ -805,7 +802,6 @@ mod tests {
         let config = with_default_proxy(r#""bays": [{"name": "work"}]"#);
         let settings = resolve_with(&config);
         assert_eq!(settings.bays[0].proxy.as_deref(), Some("p"));
-        assert_eq!(settings.proxies["p"].kind, "fake");
     }
 
     #[test]

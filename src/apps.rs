@@ -169,8 +169,7 @@ fn ports(app: &str, fields: &Fields) -> Result<Vec<PublishedPort>> {
                 Some(_) => port.number("host")?,
             };
             Ok(PublishedPort {
-                app: Some(app.to_string()),
-                bay: None,
+                app: app.to_string(),
                 name,
                 vm,
                 host,
@@ -222,15 +221,12 @@ fn bay_ports(
             if let Some(other) = ports.iter().find(|o| o.name == port.name) {
                 bail!(
                     "bay {bay}: apps {} and {} both publish a port named {}",
-                    other.app.as_deref().unwrap_or_default(),
+                    other.app,
                     app.name,
                     port.name
                 );
             }
-            ports.push(PublishedPort {
-                bay: Some(bay.to_string()),
-                ..port.clone()
-            });
+            ports.push(port.clone());
         }
     }
     for (name, host) in host_ports {

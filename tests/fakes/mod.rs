@@ -1,20 +1,16 @@
 //! Test doubles: a fake `msb` (shell script, state in files).
 
-#![expect(dead_code, reason = "rewrite in progress; removed in Task 16")]
-
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 
 const FAKE_MSB: &str = include_str!("msb.sh");
 
-/// One isolated machine: HOME, the hangar state, the fakes' files and bin.
+/// One isolated machine: HOME, the fakes' files and bin.
 pub struct Machine {
     pub home: PathBuf,
-    pub state: PathBuf,
     pub fake: PathBuf,
 }
 
@@ -24,7 +20,6 @@ impl Machine {
             .join(format!("hangar-cli-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         let machine = Self {
-            state: home.join("state"),
             fake: home.join("fake"),
             home,
         };
@@ -46,12 +41,6 @@ impl Machine {
         fs::write(self.fake.join(format!("fail-{what}")), why).unwrap();
     }
 
-    pub fn config(&self, json: &str) -> PathBuf {
-        let path = self.home.join("hangar.json");
-        fs::write(&path, json).unwrap();
-        path
-    }
-
     pub fn msb_log(&self) -> String {
         fs::read_to_string(self.fake.join("msb.log")).unwrap_or_default()
     }
@@ -64,38 +53,6 @@ impl Machine {
     /// first), the fakes' and coverage variables, plus `env`.
     pub fn hangar(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         self.command(args, env).output().unwrap()
-    }
-
-    /// Like `hangar`, with `input` on stdin.
-    pub fn hangar_with_stdin(
-        &self,
-        args: &[&str],
-        env: &[(&str, &str)],
-        input: &str,
-    ) -> Output {
-        let mut child = self
-            .command(args, env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    }
-
-    /// Like `hangar`, running in the background with stderr piped.
-    pub fn spawn(&self, args: &[&str], env: &[(&str, &str)]) -> Child {
-        self.command(args, env)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {

@@ -94,17 +94,12 @@ pub(crate) fn with_hangar(
     all
 }
 
-/// `mounts` targets don't nest or cover the home mount, and no `files`
-/// target is inside, above or at one. Files may land in the home mount: they're copied into its host
-/// folder.
-pub(crate) fn check_targets<'a>(
+/// `mounts` targets don't nest or cover the home mount.
+pub(crate) fn check_targets(
     mounts: &BTreeMap<String, MountSpec>,
-    home: bool,
-    files: impl IntoIterator<Item = &'a String>,
 ) -> Result<()> {
-    if let Some(vm) = mounts
-        .keys()
-        .find(|vm| home && Path::new(VM_HOME).starts_with(vm))
+    if let Some(vm) =
+        mounts.keys().find(|vm| Path::new(VM_HOME).starts_with(vm))
     {
         return Err(Error::with_hint(
             format!(
@@ -119,14 +114,6 @@ pub(crate) fn check_targets<'a>(
             return Err(Error::with_hint(
                 format!("mounts: {a} and {b} overlap"),
                 HINT,
-            ));
-        }
-    }
-    for file in files {
-        if let Some(mount) = mount_at(file, mounts) {
-            return Err(Error::with_hint(
-                format!("files.{file} overlaps the mount at {mount}"),
-                "a VM path is either copied or mounted, not both",
             ));
         }
     }
@@ -347,24 +334,6 @@ fn check_source(
     Ok(())
 }
 
-/// An existing bay's recorded mounts, against today's rules: a root may
-/// have moved since the VM was created.
-pub(crate) fn recheck(lines: &[String], roots: &Roots) -> Result<()> {
-    for line in lines {
-        let mut fields = line.split('\t');
-        let (Some(vm), Some(host), Some(mode)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let host = Path::new(host);
-        check_source(host, mode.ends_with("rw"), roots).map_err(|why| {
-            refuse(&format!("the bay's mount at {vm}"), host, why)
-        })?;
-    }
-    Ok(())
-}
-
 fn refuse(context: &str, host: &Path, why: &str) -> Error {
     Error::with_hint(format!("{context}: {} {why}", host.display()), HINT)
 }
@@ -466,7 +435,7 @@ pub(crate) fn status(
 mod tests {
     use super::{
         Mode, MountKind, MountSpec, MountStatus, check_source, check_targets,
-        lines, overlaps, recheck, status, with_hangar,
+        lines, overlaps, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
     use crate::testing::{roots, scratch_dir};
@@ -554,25 +523,13 @@ mod tests {
             ("/home/pilot/a", "~/a", false),
             ("/home/pilot/b", "~/b", true),
         ]);
-        let none: [String; 0] = [];
-        assert!(check_targets(&two, false, &none).is_ok());
+        assert!(check_targets(&two).is_ok());
         let nested = mounts(&[
             ("/home/pilot/a", "~/a", false),
             ("/home/pilot/a/b", "~/b", false),
         ]);
-        let error = check_targets(&nested, false, &none)
-            .unwrap_err()
-            .to_string();
+        let error = check_targets(&nested).unwrap_err().to_string();
         assert!(error.contains("overlap"), "{error}");
-        for file in ["/home/pilot/a/x", "/home/pilot/a", "/home/pilot"] {
-            let error = check_targets(&two, false, &[file.to_string()])
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("either copied or mounted"), "{error}");
-        }
-        assert!(
-            check_targets(&two, false, &["/home/pilot/c".to_string()]).is_ok()
-        );
     }
 
     #[test]
@@ -680,7 +637,6 @@ mod tests {
         let recorded = lines(&resolved);
         let shown = status(&set, None, None, &home, Some(&recorded));
         assert_eq!(shown[0].applied, Some(true));
-        assert!(recheck(&recorded, &roots).is_ok());
     }
 
     fn stowed(home: &Path, link_name: &str, target: &str, dir: bool) {
@@ -767,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_file_mount_records_file_rw_and_rechecks_as_writable() {
+    fn writable_file_mount_records_file_rw() {
         let home = fs::canonicalize(scratch_dir("mount-file-rw")).unwrap();
         let roots = roots(&home, "state", ".cache/hangar");
         fs::write(home.join("notes"), "x").unwrap();
@@ -777,13 +733,6 @@ mod tests {
         )]);
         let resolved = resolve(&set, &roots).unwrap();
         assert!(lines(&resolved)[0].ends_with("\tfile-rw"));
-        fs::create_dir_all(home.join(".config")).unwrap();
-        let moved = format!(
-            "/home/pilot/n\t{}\tfile-rw",
-            home.join(".config/x").display()
-        );
-        let error = recheck(&[moved], &roots).unwrap_err().to_string();
-        assert!(error.contains("keep config"), "{error}");
     }
 
     #[test]
@@ -803,12 +752,11 @@ mod tests {
 
     #[test]
     fn copy_and_live_mount_cannot_overlap() {
-        let none: [String; 0] = [];
         let set = BTreeMap::from([
             ("/home/pilot/a".to_string(), spec("~/a", Mode::Ro)),
             ("/home/pilot/a/b".to_string(), spec("~/b", Mode::Copy)),
         ]);
-        let error = check_targets(&set, false, &none).unwrap_err().to_string();
+        let error = check_targets(&set).unwrap_err().to_string();
         assert!(error.contains("overlap"), "{error}");
         assert_eq!(
             super::mount_at("/home/pilot/a/x", &super::live(&set)),
@@ -949,27 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn recorded_mounts_are_checked_again_against_todays_roots() {
-        let roots = bay_roots(STATE, CACHE);
-        let fine = [
-            format!("/home/pilot\t{STATE}/bays/default/home\trw"),
-            "/srv\t/srv/skills\tro".to_string(),
-            "unreadable".to_string(),
-        ];
-        assert!(recheck(&fine, &roots).is_ok());
-        // Allowed when created, but the state root has moved onto it.
-        let moved = bay_roots("/home/you/work", CACHE);
-        let error = recheck(&["/w\t/home/you/work/x\trw".into()], &moved)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "the bay's mount at /w: /home/you/work/x holds hangar's own \
-             state: see docs/configuration.md, \"Mounting folders\""
-        );
-    }
-
-    #[test]
     fn bay_home_mounts_the_vm_home_writable_next_to_user_mounts() {
         let set =
             mounts(&[("/home/pilot/.cache/skills", "/srv/skills", false)]);
@@ -999,24 +926,17 @@ mod tests {
 
     #[test]
     fn mounts_may_sit_under_the_home_mount_but_not_cover_it() {
-        let none: [String; 0] = [];
         let below =
             mounts(&[("/home/pilot/.claude/skills", "~/skills", false)]);
-        assert!(check_targets(&below, true, &none).is_ok());
+        assert!(check_targets(&below).is_ok());
         for vm in ["/home/pilot", "/home", "/"] {
             let error =
-                check_targets(&mounts(&[(vm, "~/x", true)]), true, &none)
-                    .unwrap_err()
-                    .to_string();
-            assert!(error.contains("bay's home is mounted"), "{vm}: {error}");
+                check_targets(&mounts(&[(vm, "~/x", true)])).unwrap_err();
             assert!(
-                check_targets(&mounts(&[(vm, "~/x", true)]), false, &none)
-                    .is_ok()
+                error.to_string().contains("bay's home is mounted"),
+                "{vm}: {error}"
             );
         }
-        // Copied files may land in the home mount: only mounts conflict.
-        let files = ["/home/pilot/.claude/CLAUDE.md".to_string()];
-        assert!(check_targets(&BTreeMap::new(), true, &files).is_ok());
     }
 
     #[test]
