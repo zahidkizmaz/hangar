@@ -601,15 +601,19 @@ pub(crate) fn setup_done(
 /// record is kept: the check is the truth, so a wiped home asks for setup
 /// again.
 fn check_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
+    let names = needing_setup(hangar, bay)?;
+    for name in &names {
+        warn!("{name} needs setup: run 'hangar setup {} {name}'", bay.name);
+    }
+    Ok(names)
+}
+
+pub(crate) fn needing_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for app in &bay.settings.apps {
         if let Some(setup) = &app.setup
             && !setup_done(hangar.sandbox.as_ref(), &bay.vm, &setup.check)?
         {
-            warn!(
-                "{} needs setup: run 'hangar setup {} {}'",
-                app.name, bay.name, app.name
-            );
             names.push(app.name.clone());
         }
     }

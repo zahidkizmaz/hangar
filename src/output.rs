@@ -93,7 +93,10 @@ pub(crate) fn emit(format: Format, result: &Outcome) {
 pub(crate) fn emit_error(format: Format, error: &Error) {
     match format {
         Format::Human => log::error!("{error}"),
-        Format::Json => eprintln!("{}", json::stringify(&error_json(error))),
+        Format::Json => {
+            log::error!(target: logger::REPORT, "{error}");
+            eprintln!("{}", json::stringify(&error_json(error)));
+        }
     }
 }
 

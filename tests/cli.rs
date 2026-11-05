@@ -548,6 +548,37 @@ fn ps_exits_3_on_event_and_logs_it() {
 }
 
 #[test]
+fn ps_points_at_setup_for_an_app_that_needs_it() {
+    let machine = with_bay("ps-setup", r#", "apps": ["web"]"#, WEB_APP);
+    run(&machine, &["up"]);
+    let output = machine.hangar(&["ps"], &[]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr(&output)
+            .contains("app web needs setup; run 'hangar setup default web'"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("isn't running"));
+}
+
+#[test]
+fn json_errors_reach_the_log_and_a_planted_log_symlink_is_ignored() {
+    let machine = with_bay("log-json-err", "", "");
+    let log = machine.home.join(".local/state/hangar/hangar.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let victim = machine.home.join("victim");
+    fs::write(&victim, "keep").unwrap();
+    std::os::unix::fs::symlink(&victim, &log).unwrap();
+    let output = machine.hangar(&["rm", "nope", "--json"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(read(&victim), "keep");
+    fs::remove_file(&log).unwrap();
+    failed(&machine.hangar(&["rm", "nope", "--json"], &[]));
+    assert!(hangar_log(&machine).contains("error no bay or proxy nope"));
+}
+
+#[test]
 fn ps_exits_3_for_a_leftover() {
     let machine = with_bay("ps-leftover", "", "");
     fs::create_dir_all(data(&machine).join("bays/old")).unwrap();

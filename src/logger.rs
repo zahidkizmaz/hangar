@@ -2,9 +2,9 @@
 //! above in the persistent, timestamped log file. Stdout is for command
 //! output only.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,13 +79,16 @@ impl Logger {
 
 fn append(path: &Path, line: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
+    // Trap: never follow a symlink planted at the log's path.
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(format!("{line}\n").as_bytes())
 }
 
@@ -247,6 +250,28 @@ mod tests {
         let logger = Logger::new(LevelFilter::Info, false, Some(path.clone()));
         write(&logger, Level::Info, REPORT, "default: created");
         assert!(fs::read_to_string(&path).unwrap().contains("created"));
+    }
+
+    #[test]
+    fn a_planted_symlink_is_not_followed_and_a_loose_file_is_tightened() {
+        let path = scratch("symlink");
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        let target = dir.join("victim");
+        fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let logger = Logger::new(LevelFilter::Info, false, Some(path.clone()));
+        write(&logger, Level::Info, "hangar", "x");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write(&logger, Level::Info, "hangar", "x");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = fs::metadata(dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o755, "pre-existing dir is left alone");
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub(crate) struct Overview {
 pub(crate) enum RunState {
     Running,
     Exited,
+    /// Never launched: its setup check fails.
+    NeedsSetup,
 }
 
 impl RunState {
@@ -27,6 +29,7 @@ impl RunState {
         match self {
             Self::Running => "running",
             Self::Exited => "exited",
+            Self::NeedsSetup => "needs-setup",
         }
     }
 }
@@ -143,8 +146,10 @@ fn bay_status(hangar: &Hangar, bay: &Bay) -> BayStatus {
 }
 
 fn app_states(hangar: &Hangar, bay: &Bay) -> Vec<(String, RunState)> {
-    let active = match bay::active_runs(hangar, bay) {
-        Ok(active) => active,
+    let probed = bay::active_runs(hangar, bay)
+        .and_then(|active| Ok((active, bay::needing_setup(hangar, bay)?)));
+    let (active, unset) = match probed {
+        Ok(probed) => probed,
         Err(error) => {
             log::warn!("bay {}: apps: {error}", bay.name);
             return Vec::new();
@@ -156,6 +161,8 @@ fn app_states(hangar: &Hangar, bay: &Bay) -> Vec<(String, RunState)> {
         .map(|name| {
             let state = if active.contains(name) {
                 RunState::Running
+            } else if unset.contains(name) {
+                RunState::NeedsSetup
             } else {
                 RunState::Exited
             };
@@ -193,16 +200,20 @@ fn vm_state(hangar: &Hangar, vm: &str) -> Option<BoxState> {
 /// exit 3.
 pub(crate) fn events(overview: &Overview) -> Vec<String> {
     let apps = overview.bays.iter().flat_map(|bay| {
-        bay.apps
-            .iter()
-            .filter(|(_, state)| *state == RunState::Exited)
-            .map(|(app, _)| {
-                let name = &bay.name;
-                format!(
+        bay.apps.iter().filter_map(|(app, state)| {
+            let name = &bay.name;
+            match state {
+                RunState::Running => None,
+                RunState::Exited => Some(format!(
                     "bay {name}: app {app} isn't running; \
                      see 'hangar logs {name} {app}'"
-                )
-            })
+                )),
+                RunState::NeedsSetup => Some(format!(
+                    "bay {name}: app {app} needs setup; \
+                     run 'hangar setup {name} {app}'"
+                )),
+            }
+        })
     });
     let proxies = overview.proxies.iter().filter_map(|proxy| {
         let Some(Health::Down(why)) = &proxy.health else {
@@ -269,6 +280,16 @@ mod tests {
             events(&overview(vec![bay(apps)], vec![], vec![])),
             ["bay work: app paperclip isn't running; \
               see 'hangar logs work paperclip'"]
+        );
+    }
+
+    #[test]
+    fn app_needing_setup_is_an_event_pointing_at_setup() {
+        let apps = vec![("paperclip".to_string(), RunState::NeedsSetup)];
+        assert_eq!(
+            events(&overview(vec![bay(apps)], vec![], vec![])),
+            ["bay work: app paperclip needs setup; \
+              run 'hangar setup work paperclip'"]
         );
     }
 
