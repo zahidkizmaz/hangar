@@ -7,11 +7,17 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
+use crate::sandbox::Egress;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VmRecord {
     pub(crate) image: Option<String>,
-    /// The one host port the VM may reach.
-    pub(crate) egress: Option<u16>,
+    /// `Egress::record()`: what the VM may reach.
+    pub(crate) egress: Option<String>,
+    /// `cpus=4 memory=6G disk=40G`.
+    pub(crate) resources: Option<String>,
+    /// Managed proxies only: what their image and settings hash to.
+    pub(crate) fingerprint: Option<String>,
     /// `(name, host, vm)`.
     pub(crate) ports: Vec<(String, u16, u16)>,
     /// `vm\thost\tro|rw`, as `mounts::lines` writes them; none means the
@@ -33,7 +39,12 @@ impl VmRecord {
         {
             match key {
                 "image" => record.image = Some(value.to_string()),
-                "egress" => record.egress = value.parse().ok(),
+                "egress" => {
+                    record.egress =
+                        Egress::from_record(value).map(Egress::record);
+                }
+                "resources" => record.resources = Some(value.to_string()),
+                "fingerprint" => record.fingerprint = Some(value.to_string()),
                 "port" => record.ports.extend(port(value)),
                 "mount" => record.mounts.push(value.to_string()),
                 _ => {}
@@ -47,8 +58,14 @@ impl VmRecord {
         if let Some(image) = &self.image {
             let _ = writeln!(text, "image\t{image}");
         }
-        if let Some(port) = self.egress {
-            let _ = writeln!(text, "egress\t{port}");
+        for (key, value) in [
+            ("egress", &self.egress),
+            ("resources", &self.resources),
+            ("fingerprint", &self.fingerprint),
+        ] {
+            if let Some(value) = value {
+                let _ = writeln!(text, "{key}\t{value}");
+            }
         }
         for (name, host, vm) in &self.ports {
             let _ = writeln!(text, "port\t{name}\t{host}\t{vm}");
@@ -76,23 +93,31 @@ mod tests {
     fn record() -> VmRecord {
         VmRecord {
             image: Some("example/agent:1".into()),
-            egress: Some(14322),
+            egress: Some("host:14322".into()),
+            resources: Some("cpus=4 memory=6G disk=40G".into()),
+            fingerprint: Some("abc123".into()),
             ports: vec![("paperclip".into(), 3100, 3100)],
             mounts: vec!["/home/pilot\t/home/you/hangar/home\trw".into()],
         }
     }
 
     #[test]
-    fn a_record_reads_back_what_was_written() {
+    fn round_trips_every_line() {
         let text = record().render();
         assert_eq!(
             text,
-            "image\texample/agent:1\negress\t14322\n\
+            "image\texample/agent:1\negress\thost:14322\n\
+             resources\tcpus=4 memory=6G disk=40G\nfingerprint\tabc123\n\
              port\tpaperclip\t3100\t3100\n\
              mount\t/home/pilot\t/home/you/hangar/home\trw\n"
         );
         assert_eq!(VmRecord::parse(&text), record());
         assert_eq!(VmRecord::parse(""), VmRecord::default());
+    }
+
+    #[test]
+    fn numeric_egress_is_unknown() {
+        assert_eq!(VmRecord::parse("egress\t14322\n").egress, None);
     }
 
     #[test]

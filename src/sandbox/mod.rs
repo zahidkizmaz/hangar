@@ -106,12 +106,26 @@ impl PublishedPort {
     }
 }
 
+/// A bay's named data volume: outlives the VM it is mounted in.
+pub(crate) fn data_volume(bay: &str) -> String {
+    format!("hangar-bay-{bay}-data")
+}
+
 pub(crate) struct Mount<'a> {
     pub(crate) host: &'a Path,
     pub(crate) guest: &'a str,
     pub(crate) mode: MountMode,
     /// `(uid, gid)` the files appear as in the VM.
     pub(crate) owner: Option<(u32, u32)>,
+    /// A single file, not a folder.
+    pub(crate) file: bool,
+}
+
+/// A disk volume that outlives the VM it is mounted in.
+pub(crate) struct Volume<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) guest: &'a str,
+    pub(crate) size: &'a str,
 }
 
 pub(crate) struct VmSpec<'a> {
@@ -119,12 +133,13 @@ pub(crate) struct VmSpec<'a> {
     pub(crate) image: &'a str,
     pub(crate) cpus: u32,
     pub(crate) memory: &'a str,
-    /// Persistent root disk size; the image's layers when `None`. Each
-    /// `native_fs` folder gets a disk of the same size.
+    /// Persistent root disk size; the image's layers when `None`.
     pub(crate) disk: Option<&'a str>,
+    /// Replaces the image's entrypoint.
+    pub(crate) entrypoint: Option<&'a str>,
     /// Folders that need a filesystem of their own, never an overlay
-    /// (Docker's storage stacks overlays).
-    pub(crate) native_fs: &'a [&'a str],
+    /// (Docker's storage stacks overlays); created by `ensure_volume`.
+    pub(crate) volumes: &'a [Volume<'a>],
     /// Takes over as PID 1 once the VM is set up, on a `/run` of the
     /// sandbox's own; `None` runs the image's entrypoint.
     pub(crate) init: Option<&'a str>,
@@ -149,6 +164,16 @@ pub(crate) trait Sandbox {
     fn start(&self, vm: &str) -> Result<()>;
     fn stop(&self, vm: &str) -> Result<()>;
     fn remove(&self, vm: &str) -> Result<()>;
+
+    /// Creates the disk volume `name` unless it exists; true when created
+    /// now.
+    fn ensure_volume(&self, name: &str, size: &str) -> Result<bool>;
+
+    /// A missing volume is fine.
+    fn remove_volume(&self, name: &str) -> Result<()>;
+
+    /// Copies `guest` out of the running `vm` to `host`.
+    fn copy_out(&self, vm: &str, guest: &str, host: &Path) -> Result<()>;
 
     /// Runs `command` in `vm` as `user` (`None`: the image's default);
     /// returns its stdout. Secrets go in `stdin` only, and a failure's
@@ -184,7 +209,12 @@ pub(crate) trait Sandbox {
 
 #[cfg(test)]
 mod tests {
-    use super::Egress;
+    use super::{Egress, data_volume};
+
+    #[test]
+    fn data_volume_is_named_after_the_bay() {
+        assert_eq!(data_volume("work"), "hangar-bay-work-data");
+    }
 
     #[test]
     fn egress_record_round_trips() {
