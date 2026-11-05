@@ -155,7 +155,8 @@ pub(crate) fn build_proxies(
 }
 
 /// No two things take the same host port: proxies (where they listen or
-/// publish) and bays.
+/// publish) and bays. Only external proxies may share one, e.g. two
+/// vaults on one Agent Vault server.
 pub(crate) fn check_ports(
     settings: &Settings,
     proxies: &BTreeMap<String, Box<dyn Proxy>>,
@@ -166,21 +167,26 @@ pub(crate) fn check_ports(
             Egress::Open => None,
         };
         let published = proxy.managed().map(|managed| managed.vm().publish.0);
+        let shareable = published.is_none();
         let mut ports: Vec<u16> = egress.into_iter().chain(published).collect();
         ports.dedup();
         ports
             .into_iter()
-            .map(move |port| (port, format!("proxy {name}")))
+            .map(move |port| (port, format!("proxy {name}"), shareable))
     });
     let bays = settings.bays.iter().flat_map(|bay| {
-        bay.ports
-            .iter()
-            .map(|port| (port.host, format!("{}/{}", bay.name, port.name)))
+        bay.ports.iter().map(|port| {
+            (port.host, format!("{}/{}", bay.name, port.name), false)
+        })
     });
-    let mut owners = BTreeMap::new();
-    for (port, owner) in proxies.chain(bays) {
-        if let Some(first) = owners.insert(port, owner.clone()) {
-            bail!("port {port}: {first} and {owner}");
+    let mut owners: BTreeMap<u16, (String, bool)> = BTreeMap::new();
+    for (port, owner, shareable) in proxies.chain(bays) {
+        match owners.get(&port) {
+            Some((_, true)) if shareable => {}
+            Some((first, _)) => bail!("port {port}: {first} and {owner}"),
+            None => {
+                owners.insert(port, (owner, shareable));
+            }
         }
     }
     Ok(())
@@ -308,11 +314,20 @@ mod tests {
             error_at(3100).as_deref(),
             Some("port 3100: proxy p and work/paperclip")
         );
-        assert_eq!(
-            error_at(3200).as_deref(),
-            Some("port 3200: proxy p and proxy q")
-        );
+        assert_eq!(error_at(3200), None);
         assert_eq!(error_at(3300), None);
+        let shared = settings(
+            r#"{"proxies": {"e": {"kind": "fake", "url": "x", "port": 3400},
+            "m": {"kind": "fake", "run": "managed", "managed": true,
+            "port": 3400}}, "bays": [{"name": "work", "proxy": "e"}]}"#,
+        );
+        let state = StateDir::new(scratch_dir("hangar-managed-port"));
+        let proxies =
+            build_proxies(&shared, &state, Path::new("/home/u")).unwrap();
+        assert_eq!(
+            check_ports(&shared, &proxies).unwrap_err().to_string(),
+            "port 3400: proxy e and proxy m"
+        );
         let open = crate::proxy::fake::FakeProxy {
             egress: crate::sandbox::Egress::Open,
             ..crate::proxy::fake::FakeProxy::at(1)
