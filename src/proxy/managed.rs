@@ -92,7 +92,11 @@ fn reconcile(
             "proxy {name} didn't come up; see 'hangar logs {name}'"
         )));
     }
-    Ok(created.unwrap_or_else(|| Outcome::Updated(vec!["started".into()])))
+    Ok(created.unwrap_or_else(started))
+}
+
+fn started() -> Outcome {
+    Outcome::Updated(vec!["started".into()])
 }
 
 /// Mount sources live under the proxy's own folder, so a kind can't
@@ -167,8 +171,8 @@ pub(crate) fn wanted_record(vm: &ManagedVm) -> VmRecord {
     }
 }
 
-/// The VM's outcome when it was created or recreated; `None` when the
-/// existing one is used.
+/// The VM's outcome when it was created, recreated or started; `None`
+/// when the running one is used.
 fn ensure_vm(
     hangar: &Hangar,
     name: &str,
@@ -196,7 +200,10 @@ fn ensure_vm(
             let reasons = reasons.into_iter().map(String::from).collect();
             Ok(Some(Outcome::Recreated(reasons)))
         }
-        Plan::Start => sandbox.start(&vm_name).map(|()| None),
+        Plan::Start => {
+            sandbox.start(&vm_name)?;
+            Ok(Some(started()))
+        }
         Plan::Keep => Ok(None),
     }
 }
@@ -424,13 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_vm_is_started_then_its_proxy_started() {
+    fn a_stopped_vm_started_is_reported_started_even_when_already_up() {
         let state = scratch_dir("managed-stopped");
         let sandbox = Rc::new(FakeSandbox::default());
         let proxy = managed(8080);
         assert_eq!(run(&state, &sandbox, &proxy), "Created");
         sandbox.set(&proxy_vm("p"), BoxState::Stopped);
-        assert_eq!(run(&state, &sandbox, &proxy), "Unchanged");
+        assert_eq!(run(&state, &sandbox, &proxy), r#"Updated(["started"])"#);
+        assert_eq!(starts(&proxy), 0);
         assert_eq!(sandbox.states.borrow()[&proxy_vm("p")], BoxState::Running);
     }
 
