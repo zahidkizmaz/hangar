@@ -6,11 +6,11 @@ in
   imports = [ ./module.nix ];
 
   config = lib.mkIf cfg.enable {
-    # msb on PATH too, for `msb ls` and friends.
+    # The backend's CLI on PATH too, for `msb ls` and friends.
     environment.systemPackages = [
       cfg.package
     ]
-    ++ lib.optional (cfg.msbPackage != null) cfg.msbPackage;
+    ++ lib.optional (cfg.sandbox.package != null) cfg.sandbox.package;
 
     systemd.user.services.hangar = lib.mkIf cfg.autoStart {
       description = "hangar: sandboxed bays for AI agents";

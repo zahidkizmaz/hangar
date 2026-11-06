@@ -14,8 +14,9 @@ Each backend is one file, `src/sandbox/<backend>.rs`, and only that file
 knows its CLI, flags, status strings, host alias and traps. Today there is
 one, msb (microsandbox, `src/sandbox/msb.rs`), selected by
 `"sandbox": {"backend": "msb"}` (the default); `Hangar::load` holds the
-only `match` on the value, and an unknown one fails at load. The msb-only
-Nix bits (`msbPackage`, `nix/microsandbox.nix`) stay msb-specific.
+only `match` on the value, and an unknown one fails at load. In Nix,
+`sandbox.package` puts the backend's CLI on hangar's `PATH`; only msb's
+default, `nix/microsandbox.nix`, is packaged here.
 
 The core doesn't trust a backend with the security-critical parts: it
 records what it created each VM with (`bays/<name>/vm`,

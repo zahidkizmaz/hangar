@@ -548,7 +548,7 @@ fn render_env(env: &BTreeMap<String, String>) -> String {
         .collect()
 }
 
-/// `msb exec` is no login: nothing points pilot's `systemctl --user` at
+/// A sandbox exec is no login: nothing points pilot's `systemctl --user` at
 /// its user manager.
 const USER_MANAGER: &str = "export XDG_RUNTIME_DIR=/run/user/1000\n";
 

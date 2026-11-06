@@ -53,14 +53,14 @@ options and renders them 1:1 into `hangar.json`:
   open internet;
 - `apps`: your own apps, free-form (every app key);
 - `sandbox.backend`;
+- `sandbox.package`: the backend's CLI (default for msb: the packaged
+  microsandbox release; `null` uses the one on `PATH`);
 
 plus:
 
 - `enable`: install `hangar`;
 - `autoStart`: run `hangar up` at login (default `false`), see
   [Autostart](#autostart);
-- `msbPackage`: microsandbox (default: the packaged release; `null` uses
-  `msb` from `PATH`);
 - `cli`: the `hangar` package the module wraps.
 
 Each option's description is in `nix/module.nix`. With the module,

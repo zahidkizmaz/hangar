@@ -11,6 +11,7 @@ let
   inherit (lib) mkOption types;
 
   msb = pkgs.callPackage ./microsandbox.nix { };
+  usesMsb = cfg.sandbox.backend == null || cfg.sandbox.backend == "msb";
 
   nonEmpty = lib.filterAttrs (_: value: value != null && value != [ ] && value != { });
 
@@ -234,13 +235,6 @@ in
       description = "Run `hangar up` at login (off by default: it boots VMs).";
     };
 
-    msbPackage = mkOption {
-      type = types.nullOr types.package;
-      default = if msb.meta.available then msb else null;
-      defaultText = lib.literalExpression "hangar's packaged microsandbox release";
-      description = "microsandbox package; null uses `msb` from PATH.";
-    };
-
     # Free-form: each kind checks its own keys when hangar loads.
     proxies = mkOption {
       type = types.attrsOf (types.attrsOf types.anything);
@@ -312,6 +306,13 @@ in
       description = "The sandbox backend. Null: the CLI's default (`msb`).";
     };
 
+    sandbox.package = mkOption {
+      type = types.nullOr types.package;
+      default = if usesMsb && msb.meta.available then msb else null;
+      defaultText = lib.literalExpression "hangar's packaged microsandbox release, for the msb backend";
+      description = "The backend's CLI, put on hangar's PATH; null uses the one on PATH.";
+    };
+
     cli = mkOption {
       type = types.package;
       default = pkgs.callPackage ./cli.nix { };
@@ -337,7 +338,7 @@ in
           ''
             makeWrapper ${lib.getExe cfg.cli} $out/bin/hangar \
               --set HANGAR_NIX_CONFIG ${json} \
-              ${lib.optionalString (cfg.msbPackage != null) "--prefix PATH : ${cfg.msbPackage}/bin"}
+              ${lib.optionalString (cfg.sandbox.package != null) "--prefix PATH : ${cfg.sandbox.package}/bin"}
           '';
     };
   };

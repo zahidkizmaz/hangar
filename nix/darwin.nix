@@ -6,11 +6,11 @@ in
   imports = [ ./module.nix ];
 
   config = lib.mkIf cfg.enable {
-    # msb on PATH too, for `msb ls` and friends.
+    # The backend's CLI on PATH too, for `msb ls` and friends.
     environment.systemPackages = [
       cfg.package
     ]
-    ++ lib.optional (cfg.msbPackage != null) cfg.msbPackage;
+    ++ lib.optional (cfg.sandbox.package != null) cfg.sandbox.package;
 
     launchd.user.agents.hangar = lib.mkIf cfg.autoStart {
       serviceConfig = {
@@ -20,7 +20,7 @@ in
           "up"
         ];
         RunAtLoad = true;
-        # launchd starts with a bare PATH; only matters when msbPackage = null.
+        # launchd starts with a bare PATH; only matters when sandbox.package = null.
         EnvironmentVariables.PATH = lib.concatStringsSep ":" [
           "/opt/homebrew/bin"
           "/run/current-system/sw/bin"
