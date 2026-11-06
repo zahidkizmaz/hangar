@@ -34,6 +34,7 @@ The core never trusts a kind with the security-critical parts:
 | managed proxies in their own VM | `proxy::managed` creates `hangar-proxy-<name>` from `Managed::vm()`; its mounts must resolve under the proxy's data folder |
 | the CA a bay trusts | `proxy::access` checks it is exactly one PEM certificate (`ca::verify`), pinned when the kind sets `sha256` |
 | secrets off argv, env and logs | logins and URLs are `Secret`s; tokens go on `exec` stdin; `VmSpec.env` is non-secret |
+| proxy tokens off disk | `keychain` keeps them in the OS keychain (tool by absolute path, token on its stdin); `proxy::Secrets` reads them when needed |
 | remote proxies | `proxy::loopback_port` refuses a non-loopback `url` |
 
 Kinds and how to add one: [proxy-kinds.md](proxy-kinds.md).
@@ -73,7 +74,8 @@ create failed has no record, so the next `up` recreates it.
 ### A managed proxy
 
 `proxy::managed::up`: plan and create the VM (`Managed::vm()`; the record
-holds the fingerprint, e.g. a hash of the proxy token), and if the proxy
+holds `Managed::fingerprint()`, e.g. a hash of the proxy token, and a new
+one recreates the VM with empty mounts), and if the proxy
 doesn't answer yet (`health`), wait until exec works, run
 `Managed::start` and wait up to 60 seconds for it to come up. An external
 proxy is only health-checked.

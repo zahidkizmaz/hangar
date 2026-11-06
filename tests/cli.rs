@@ -683,13 +683,11 @@ fn switching_bay_proxy_recreates() {
 fn bay_through_agent_vault_gets_token_url_on_stdin_only() {
     let (_proxy, port) = listener();
     let machine = Machine::new("agent-vault");
-    let token = machine.home.join("av-token");
-    fs::write(&token, "av_SECRET-9\n").unwrap();
+    machine.keychain_set("p/token", "av_SECRET-9");
     let ca = concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/testdata/ca.pem");
     let proxy = format!(
         r#"{{"kind": "agent-vault", "url": "http://127.0.0.1:{port}",
-            "ca": {{"file": "{ca}"}}, "tokenFile": "{}"}}"#,
-        token.display()
+            "ca": {{"file": "{ca}"}}}}"#
     );
     let config = format!(
         r#"{{"proxies": {{"p": {proxy}}}, "bays": [{{"name": "default",
@@ -747,13 +745,12 @@ fn infisical_machine(name: &str) -> (Machine, u16) {
         listener,
         machine.fake.join("proxy-up-hangar-proxy-infi"),
     );
-    fs::write(machine.home.join("proxy-token"), "pt-SECRET-1\n").unwrap();
-    fs::write(machine.home.join("session-token"), "st-SECRET-2\n").unwrap();
+    machine.keychain_set("infi/proxy-token", "pt-SECRET-1");
+    machine.keychain_set("infi/session-token", "st-SECRET-2");
     fs::write(machine.fake.join("setup-check"), "done").unwrap();
     let config = format!(
         r#"{{"proxies": {{"infi": {{"kind": "infisical", "run": "managed",
-              "proxyTokenFile": "~/proxy-token",
-              "sessionTokenFile": "~/session-token", "hostPort": {port}}}}},
+              "hostPort": {port}}}}},
             "bays": [{{"name": "work", "proxy": "infi",
                        "image": "example/bay:1", "apps": ["web"]}}]{WEB_APP}}}"#
     );
@@ -815,7 +812,7 @@ fn managed_infisical_then_bay() {
 fn renewed_session_token_updates_bays_in_place() {
     let (machine, _) = infisical_machine("infisical-session");
     up_keeping_tokens_secret(&machine);
-    fs::write(machine.home.join("session-token"), "st-SECRET-3\n").unwrap();
+    machine.keychain_set("infi/session-token", "st-SECRET-3");
     assert_eq!(
         up_keeping_tokens_secret(&machine),
         "infi: unchanged\nwork: updated (proxy login; restarted web)\n"
@@ -833,8 +830,8 @@ fn rotated_proxy_token_recreates_the_proxy_only() {
     let (machine, _) = infisical_machine("infisical-rotate");
     up_keeping_tokens_secret(&machine);
     let data = data(&machine).join("proxies/infi/data/data");
-    fs::write(data.join("kept"), "x").unwrap();
-    fs::write(machine.home.join("proxy-token"), "pt-SECRET-4\n").unwrap();
+    fs::write(data.join("old"), "x").unwrap();
+    machine.keychain_set("infi/proxy-token", "pt-SECRET-4");
     assert_eq!(
         up_keeping_tokens_secret(&machine),
         "infi: recreated (fingerprint)\nwork: unchanged\n"
@@ -846,7 +843,57 @@ fn rotated_proxy_token_recreates_the_proxy_only() {
         "{created:?}"
     );
     assert_eq!(machine.fake_file("hangar-infisical"), "pt-SECRET-4\n");
-    assert!(data.join("kept").exists());
+    assert!(!data.join("old").exists());
+}
+
+#[test]
+fn secret_set_stores_piped_tokens_in_the_keychain() {
+    let (machine, _) = infisical_machine("secret-set");
+    let output = machine
+        .hangar_with_stdin(&["secret", "set", "infi"], "pt-new\nst-new\n");
+    assert_eq!(
+        stdout(ok(&output)),
+        "infi: updated (proxy-token saved; session-token saved)\n"
+    );
+    assert_eq!(machine.keychain_get("infi/proxy-token").unwrap(), "pt-new");
+    assert_eq!(
+        machine.keychain_get("infi/session-token").unwrap(),
+        "st-new"
+    );
+    let calls = machine.fake_file("keychain.log");
+    assert!(!calls.contains("pt-new"), "{calls}");
+    let error = failed(
+        &machine.hangar_with_stdin(&["secret", "set", "infi"], "has space\n"),
+    );
+    assert!(error.contains("can't hold spaces"), "{error}");
+    assert_eq!(machine.keychain_get("infi/proxy-token").unwrap(), "pt-new");
+}
+
+#[test]
+fn a_missing_token_without_a_terminal_says_how_to_set_it() {
+    let (machine, _) = infisical_machine("secret-missing");
+    fs::remove_dir_all(machine.fake.join("keychain")).unwrap();
+    let output = machine.hangar(&["up"], &[]);
+    failed(&output);
+    let said = stdout(&output);
+    assert!(
+        said.contains(
+            "infi: failed: proxy infi: token: no proxy-token for \
+                       proxy infi in"
+        ) && said.contains("hangar secret set infi"),
+        "{said}"
+    );
+    assert!(said.contains("work: failed: proxy infi failed"), "{said}");
+    assert_eq!(calls(&machine, "create "), Vec::<String>::new());
+    ok(&machine.hangar(&["down"], &[]));
+}
+
+#[test]
+fn rm_data_on_a_proxy_forgets_its_tokens() {
+    let (machine, _) = infisical_machine("secret-rm");
+    ok(&machine.hangar(&["rm", "infi", "--data", "--yes"], &[]));
+    assert_eq!(machine.keychain_get("infi/proxy-token"), None);
+    assert_eq!(machine.keychain_get("infi/session-token"), None);
 }
 
 #[test]

@@ -13,9 +13,10 @@ use crate::dirs::{self, Base};
 use crate::error::{Context, Error, Result, bail};
 use crate::files;
 use crate::json;
+use crate::keychain::{Keychain, OsKeychain};
 use crate::lifecycle::Resource;
 use crate::mounts;
-use crate::proxy::{self, Proxy, Spec};
+use crate::proxy::{self, Proxy, Secrets, Spec};
 use crate::sandbox::{Egress, Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
 
@@ -29,6 +30,8 @@ pub(crate) struct Hangar {
     /// The user's `$HOME`, which the mount rules protect.
     pub(crate) host_home: PathBuf,
     pub(crate) sandbox: Rc<dyn Sandbox>,
+    /// Where the proxies' tokens live.
+    pub(crate) keychain: Rc<dyn Keychain>,
     pub(crate) proxies: BTreeMap<String, Box<dyn Proxy>>,
 }
 
@@ -52,8 +55,10 @@ impl Hangar {
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
         let host_home = files::host_home()?;
-        let proxies =
-            build_proxies(&settings, &state, &host_home).context(&invalid)?;
+        let service = env_var("HANGAR_KEYCHAIN_SERVICE");
+        let keychain: Rc<dyn Keychain> = Rc::new(OsKeychain::new(service)?);
+        let proxies = build_proxies(&settings, &state, &host_home, &keychain)
+            .context(&invalid)?;
         check_ports(&settings, &proxies).context(&invalid)?;
         Ok(Self {
             settings,
@@ -62,8 +67,21 @@ impl Hangar {
             state_root: dirs::hangar_dir(Base::State, &env_var)?,
             host_home,
             sandbox,
+            keychain,
             proxies,
         })
+    }
+
+    /// The tokens of proxy `name`, as its config says to find them.
+    pub(crate) fn secrets(&self, name: &str) -> Result<Secrets> {
+        let entry = self
+            .settings
+            .proxies
+            .get(name)
+            .ok_or_else(|| Error::new(format!("no proxy {name}")))?;
+        let fields =
+            config::Fields::new(&entry.raw, &format!("proxies.{name}"))?;
+        Secrets::new(name, self.keychain.clone(), &fields)
     }
 
     pub(crate) fn bay(&self, name: &str) -> Option<Bay<'_>> {
@@ -137,14 +155,17 @@ pub(crate) fn build_proxies(
     settings: &Settings,
     state: &StateDir,
     home: &Path,
+    keychain: &Rc<dyn Keychain>,
 ) -> Result<BTreeMap<String, Box<dyn Proxy>>> {
     settings
         .proxies
         .values()
         .map(|entry| {
             let path = format!("proxies.{}", entry.name);
+            let fields = config::Fields::new(&entry.raw, &path)?;
             let spec = Spec {
-                fields: config::Fields::new(&entry.raw, &path)?,
+                secrets: Secrets::new(&entry.name, keychain.clone(), &fields)?,
+                fields,
                 location: entry.location.clone(),
                 home,
                 data: state.proxy(&entry.name).data(),
@@ -224,7 +245,7 @@ mod tests {
     use crate::lifecycle::Resource;
     use crate::sandbox::fake::FakeSandbox;
     use crate::state::StateDir;
-    use crate::testing::{hangar_with, scratch_dir, settings};
+    use crate::testing::{hangar_with, no_keychain, scratch_dir, settings};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
@@ -274,6 +295,7 @@ mod tests {
             &settings,
             &crate::state::StateDir::new(state),
             Path::new("/home/u"),
+            &no_keychain(),
         )
         .unwrap();
         let error = check_ports(&settings, &proxies).unwrap_err();
@@ -286,6 +308,7 @@ mod tests {
             &settings,
             &crate::state::StateDir::new(scratch_dir("hangar-ports-ok")),
             Path::new("/home/u"),
+            &no_keychain(),
         )
         .unwrap();
         assert!(check_ports(&settings, &proxies).is_ok());
@@ -304,8 +327,13 @@ mod tests {
         let error_at = |port: u16| {
             let settings = settings(&config(port));
             let state = StateDir::new(scratch_dir("hangar-external-port"));
-            let proxies =
-                build_proxies(&settings, &state, Path::new("/home/u")).unwrap();
+            let proxies = build_proxies(
+                &settings,
+                &state,
+                Path::new("/home/u"),
+                &no_keychain(),
+            )
+            .unwrap();
             check_ports(&settings, &proxies)
                 .err()
                 .map(|e| e.to_string())
@@ -322,8 +350,13 @@ mod tests {
             "port": 3400}}, "bays": [{"name": "work", "proxy": "e"}]}"#,
         );
         let state = StateDir::new(scratch_dir("hangar-managed-port"));
-        let proxies =
-            build_proxies(&shared, &state, Path::new("/home/u")).unwrap();
+        let proxies = build_proxies(
+            &shared,
+            &state,
+            Path::new("/home/u"),
+            &no_keychain(),
+        )
+        .unwrap();
         assert_eq!(
             check_ports(&shared, &proxies).unwrap_err().to_string(),
             "port 3400: proxy e and proxy m"
@@ -383,7 +416,8 @@ mod tests {
                 "bays": [{"name": "work", "proxy": null}]}"#,
         );
         let state = StateDir::new(scratch_dir("hangar-kind-options"));
-        let error = build_proxies(&settings, &state, Path::new("/home/u"))
+        let home = Path::new("/home/u");
+        let error = build_proxies(&settings, &state, home, &no_keychain())
             .err()
             .unwrap();
         assert_eq!(error.to_string(), "proxies.p.zzz: unknown setting");

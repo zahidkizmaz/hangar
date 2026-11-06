@@ -1,12 +1,21 @@
-//! Test doubles: a fake `msb` (shell script, state in files).
+//! Test doubles: a fake `msb` and a fake keychain tool (shell scripts,
+//! state in files).
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const FAKE_MSB: &str = include_str!("msb.sh");
+const FAKE_KEYCHAIN: &str = include_str!("keychain.sh");
+// Only a debug hangar takes the fake keychain: a release build would call
+// the real one, so the CLI tests don't even compile there.
+const _: () = assert!(
+    cfg!(debug_assertions),
+    "the CLI tests need a debug build (the fake keychain)"
+);
 
 /// One isolated machine: HOME, the fakes' files and bin.
 pub struct Machine {
@@ -26,7 +35,27 @@ impl Machine {
         fs::create_dir_all(machine.home.join("bin")).unwrap();
         fs::create_dir_all(&machine.fake).unwrap();
         machine.script("msb", FAKE_MSB);
+        // `security` exits 44 for a missing item, `secret-tool` 1.
+        let missing = if cfg!(target_os = "macos") { 44 } else { 1 };
         machine
+            .script("keychain", &format!("missing={missing}\n{FAKE_KEYCHAIN}"));
+        machine
+    }
+
+    fn keychain_file(&self, account: &str) -> PathBuf {
+        self.fake.join("keychain").join(account.replace('/', "%"))
+    }
+
+    /// Puts `token` in the fake keychain as `account`.
+    pub fn keychain_set(&self, account: &str, token: &str) {
+        fs::create_dir_all(self.fake.join("keychain")).unwrap();
+        fs::write(self.keychain_file(account), format!("{token}\n")).unwrap();
+    }
+
+    /// The fake keychain's `account`, without its line end.
+    pub fn keychain_get(&self, account: &str) -> Option<String> {
+        let text = fs::read_to_string(self.keychain_file(account)).ok()?;
+        Some(text.trim_end_matches('\n').to_string())
     }
 
     /// An executable in the machine's bin, first on PATH.
@@ -50,9 +79,28 @@ impl Machine {
     }
 
     /// Runs hangar with a clean environment: only HOME, PATH (machine bin
-    /// first), the fakes' and coverage variables, plus `env`.
+    /// first), the fakes' and coverage variables, the fake keychain under
+    /// a test-only service name, plus `env`.
     pub fn hangar(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         self.command(args, env).output().unwrap()
+    }
+
+    /// Like `hangar`, with `input` on stdin.
+    pub fn hangar_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut child = self
+            .command(args, &[])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
@@ -64,6 +112,8 @@ impl Machine {
             .env("HOME", &self.home)
             .env("PATH", path)
             .env("HANGAR_FAKE", &self.fake)
+            .env("HANGAR_KEYCHAIN_SERVICE", "hangar-test")
+            .env("HANGAR_TEST_KEYCHAIN_TOOL", self.home.join("bin/keychain"))
             .envs(env.iter().copied());
         // Lets `cargo llvm-cov` count the binary's runs.
         if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {

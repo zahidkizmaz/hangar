@@ -9,8 +9,8 @@ pub(crate) mod fake;
 mod http;
 mod infisical;
 pub(crate) mod managed;
+mod secrets;
 
-use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,7 +21,9 @@ use crate::config::Fields;
 use crate::error::{Context, Error, Result, bail};
 use crate::http::{http_authority, is_loopback_host};
 use crate::sandbox::{Egress, MountMode, Sandbox};
-use crate::secret::{Secret, trim_line_end};
+use crate::secret::Secret;
+
+pub(crate) use secrets::{Secrets, Slot};
 
 pub(crate) struct Login {
     pub(crate) user: Secret,
@@ -42,15 +44,17 @@ pub(crate) trait Proxy {
     fn managed(&self) -> Option<&dyn Managed> {
         None
     }
-    /// Host files that hold the proxy's own credentials: no bay may
-    /// mount or copy them.
-    fn host_secrets(&self) -> Vec<PathBuf> {
-        Vec::new()
+    /// The tokens the kind reads from its [`Secrets`].
+    fn secrets(&self) -> &'static [Slot] {
+        &[]
     }
 }
 
 pub(crate) trait Managed {
     fn vm(&self) -> ManagedVm;
+    /// Changes whenever the VM must be recreated with a fresh data dir,
+    /// e.g. a hash of the token it enrols with.
+    fn fingerprint(&self) -> Result<String>;
     fn start(&self, sandbox: &dyn Sandbox, vm: &str) -> Result<()>;
     fn log_file(&self) -> PathBuf;
 }
@@ -62,7 +66,6 @@ pub(crate) struct ManagedVm {
     pub(crate) memory: String,
     pub(crate) publish: (u16, u16),
     pub(crate) mounts: Vec<(PathBuf, String, MountMode)>,
-    pub(crate) fingerprint: String,
     /// An `--entrypoint` override, for images that need one.
     pub(crate) entrypoint: Option<String>,
 }
@@ -78,10 +81,11 @@ pub(crate) struct Spec<'a> {
     pub(crate) location: Location,
     pub(crate) home: &'a Path,
     pub(crate) data: PathBuf,
+    pub(crate) secrets: Secrets,
 }
 
 /// The keys every kind accepts; a kind adds its own to [`only`].
-pub(crate) const CORE_KEYS: [&str; 3] = ["kind", "run", "url"];
+pub(crate) const CORE_KEYS: [&str; 4] = ["kind", "run", "url", "secrets"];
 
 /// Refuses any key that is neither a core key nor one of `own`.
 pub(crate) fn only(fields: &Fields, own: &[&str]) -> Result<()> {
@@ -129,7 +133,9 @@ pub(crate) fn check_kind(fields: &Fields) -> Result<Build> {
 }
 
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
-    check_kind(&spec.fields)?(spec)
+    let proxy = check_kind(&spec.fields)?(spec)?;
+    spec.secrets.check(proxy.secrets(), spec.fields.path())?;
+    Ok(proxy)
 }
 
 /// Where a proxy runs: `"run": "managed"` here, or a `url`.
@@ -166,16 +172,6 @@ pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
             spec.fields.path()
         ),
     }
-}
-
-/// A token file without its line end; an empty one is an error.
-pub(crate) fn read_token(path: &Path) -> Result<Secret> {
-    let text = fs::read_to_string(path).context(path.display())?;
-    let token = trim_line_end(&text);
-    if token.trim().is_empty() {
-        bail!("{} is empty", path.display());
-    }
-    Ok(Secret::new(token.to_string()))
 }
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -253,11 +249,14 @@ mod tests {
     use crate::json;
     use crate::proxy::fake::FakeProxy;
     use crate::sandbox::Egress;
+    use crate::testing::no_secrets;
 
     fn built(text: &str) -> Result<Box<dyn Proxy>> {
         let value = json::parse(text).unwrap();
+        let fields = Fields::new(&value, "proxies.p")?;
         let spec = Spec {
-            fields: Fields::new(&value, "proxies.p")?,
+            secrets: no_secrets(&fields),
+            fields,
             location: Location::Managed,
             home: Path::new("/home/u"),
             data: PathBuf::from("/data/p"),
@@ -287,6 +286,17 @@ mod tests {
         assert_eq!(
             error,
             r#"proxies.p.kind: unknown kind "socks"; known: agent-vault, fake, http, infisical"#
+        );
+    }
+
+    #[test]
+    fn a_secrets_entry_the_kind_does_not_take_is_refused() {
+        let error = error_of(built(
+            r#"{"kind": "fake", "secrets": {"token": {"command": ["x"]}}}"#,
+        ));
+        assert_eq!(
+            error,
+            "proxies.p.secrets.token: unknown token; known: none"
         );
     }
 

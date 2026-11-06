@@ -21,8 +21,10 @@ let
     proxies.vault = {
       kind = "infisical";
       run = "managed";
-      proxyTokenFile = "/run/secrets/infisical-proxy-token";
-      sessionTokenFile = "/run/secrets/infisical-session-token";
+      secrets.session-token.command = [
+        "cat"
+        "/run/secrets/session"
+      ];
     };
     defaults.proxy = "vault";
     apps.web.ports = [

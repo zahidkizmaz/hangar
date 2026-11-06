@@ -1,9 +1,9 @@
 //! A kind for tests: every answer is a field, nothing runs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use super::{Health, Login, Managed, ManagedVm, Proxy, Spec};
+use super::{Health, Login, Managed, ManagedVm, Proxy, Slot, Spec};
 use crate::error::Result;
 use crate::sandbox::{Egress, Sandbox};
 use crate::secret::Secret;
@@ -14,13 +14,20 @@ pub(crate) struct FakeProxy {
     pub(crate) login: Option<(String, String)>,
     pub(crate) up: bool,
     pub(crate) managed: Option<FakeManaged>,
-    pub(crate) secrets: Vec<PathBuf>,
+    pub(crate) slots: &'static [Slot],
 }
 
 pub(crate) struct FakeManaged {
     pub(crate) vm: ManagedVm,
+    pub(crate) fingerprint: RefCell<String>,
     pub(crate) starts: Cell<u32>,
 }
+
+/// What a fake proxy with `"token": true` takes.
+pub(crate) const TOKEN: &[Slot] = &[Slot {
+    key: "token",
+    about: "the fake token",
+}];
 
 impl FakeProxy {
     pub(crate) fn at(port: u16) -> Self {
@@ -30,7 +37,7 @@ impl FakeProxy {
             login: None,
             up: true,
             managed: None,
-            secrets: Vec::new(),
+            slots: &[],
         }
     }
 }
@@ -43,11 +50,11 @@ impl FakeManaged {
             memory: "256M".into(),
             publish: (port, port),
             mounts: Vec::new(),
-            fingerprint: "fake".into(),
             entrypoint: None,
         };
         Self {
             vm,
+            fingerprint: RefCell::new("fake".into()),
             starts: Cell::new(0),
         }
     }
@@ -85,14 +92,18 @@ impl Proxy for FakeProxy {
         self.managed.as_ref().map(|managed| managed as &dyn Managed)
     }
 
-    fn host_secrets(&self) -> Vec<PathBuf> {
-        self.secrets.clone()
+    fn secrets(&self) -> &'static [Slot] {
+        self.slots
     }
 }
 
 impl Managed for FakeManaged {
     fn vm(&self) -> ManagedVm {
         self.vm.clone()
+    }
+
+    fn fingerprint(&self) -> Result<String> {
+        Ok(self.fingerprint.borrow().clone())
     }
 
     fn start(&self, _sandbox: &dyn Sandbox, _vm: &str) -> Result<()> {
@@ -106,10 +117,11 @@ impl Managed for FakeManaged {
 }
 
 /// Reads `port` (default 3128), `ca` (PEM text), `login` (`user:password`),
-/// `managed` (a flag) and `secret` (a host path).
+/// `managed` and `token` (flags: the latter makes it take a `token`
+/// secret).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
-    super::only(fields, &["port", "ca", "login", "managed", "secret"])?;
+    super::only(fields, &["port", "ca", "login", "managed", "token"])?;
     let port = if fields.map.contains_key("port") {
         fields.number("port")?
     } else {
@@ -125,12 +137,11 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
         managed: fields
             .flag_or("managed", false)?
             .then(|| FakeManaged::new(port)),
-        secrets: fields
-            .optional_string("secret")?
-            .map(|path| crate::files::host_path(&path, spec.home))
-            .transpose()?
-            .into_iter()
-            .collect(),
+        slots: if fields.flag_or("token", false)? {
+            TOKEN
+        } else {
+            &[]
+        },
         ..FakeProxy::at(port)
     }))
 }

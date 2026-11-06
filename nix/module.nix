@@ -250,20 +250,13 @@ in
           vault = {
             kind = "infisical";
             run = "managed";
-            # NixOS, agenix with `owner` set to your user:
-            proxyTokenFile = "/run/agenix/infisical-proxy-token";
-            sessionTokenFile = "/run/agenix/infisical-session-token";
-            # nix-darwin, plain files (chmod 600):
-            # proxyTokenFile = "~/.secrets/infisical-proxy-token";
-            # sessionTokenFile = "~/.secrets/infisical-session-token";
           };
         }
       '';
       description = ''
-        Proxies by name (see docs/proxy-kinds.md). Token files are strings,
-        never paths, so the secrets stay out of the Nix store. hangar runs
-        as your user and must read them: agenix's default files are root
-        0400, unreadable by the user agent.
+        Proxies by name (see docs/proxy-kinds.md). Their tokens never go
+        here: hangar keeps them in the OS keychain, or runs the command a
+        proxy's `secrets` names.
       '';
     };
 

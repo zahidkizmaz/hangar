@@ -1,15 +1,16 @@
 //! Infisical's Agent Vault proxy, managed in its own VM. It enrols with a
 //! proxy token on every start; a bay logs in with a session token:
-//! `http://x-agent-vault:<session token>@host`.
+//! `http://x-agent-vault:<session token>@host`. Both are the proxy's
+//! [`Secrets`].
 
 use std::path::PathBuf;
 
 use super::ca::{CaSource, CaSpec, sha256_hex};
 use super::{
-    Health, Location, Login, Managed, ManagedVm, Proxy, Spec, only, read_token,
+    Health, Location, Login, Managed, ManagedVm, Proxy, Secrets, Slot, Spec,
+    only,
 };
 use crate::error::{Result, bail};
-use crate::files;
 use crate::http;
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
@@ -25,6 +26,18 @@ const MEMORY: &str = "512M";
 const DATA: &str = "/data";
 /// The image's entrypoint runs `infisical`; a shell keeps the VM idle.
 const ENTRYPOINT: &str = "/bin/sh";
+const PROXY_TOKEN: &str = "proxy-token";
+const SESSION_TOKEN: &str = "session-token";
+const SLOTS: &[Slot] = &[
+    Slot {
+        key: PROXY_TOKEN,
+        about: "the proxy token from Infisical's proxy setup",
+    },
+    Slot {
+        key: SESSION_TOKEN,
+        about: "the session token the bays log in with",
+    },
+];
 
 /// The token comes on stdin, never argv: the proxy reads it from the
 /// environment only. `$1` is the optional domain. The log is moved aside
@@ -41,9 +54,7 @@ struct Infisical {
     image: String,
     host_port: u16,
     domain: String,
-    proxy_token: Secret,
-    proxy_token_file: PathBuf,
-    session_token_file: PathBuf,
+    secrets: Secrets,
     data: PathBuf,
 }
 
@@ -72,7 +83,7 @@ impl Proxy for Infisical {
     fn login(&self, _bay: &str) -> Result<Option<Login>> {
         Ok(Some(Login {
             user: Secret::new(USER.into()),
-            password: read_token(&self.session_token_file)?,
+            password: self.secrets.get(SESSION_TOKEN)?,
         }))
     }
 
@@ -88,11 +99,8 @@ impl Proxy for Infisical {
         Some(self)
     }
 
-    fn host_secrets(&self) -> Vec<PathBuf> {
-        vec![
-            self.proxy_token_file.clone(),
-            self.session_token_file.clone(),
-        ]
+    fn secrets(&self) -> &'static [Slot] {
+        SLOTS
     }
 }
 
@@ -108,13 +116,18 @@ impl Managed for Infisical {
                 DATA.into(),
                 MountMode::ReadWrite,
             )],
-            fingerprint: sha256_hex(self.proxy_token.expose().as_bytes()),
             entrypoint: Some(ENTRYPOINT.into()),
         }
     }
 
+    fn fingerprint(&self) -> Result<String> {
+        let token = self.secrets.get(PROXY_TOKEN)?;
+        Ok(sha256_hex(token.expose().as_bytes()))
+    }
+
     fn start(&self, sandbox: &dyn Sandbox, vm: &str) -> Result<()> {
-        let token = format!("{}\n", self.proxy_token.expose());
+        let token = self.secrets.get(PROXY_TOKEN)?;
+        let token = format!("{}\n", token.expose());
         let command =
             ["/bin/sh", "-c", START, "hangar-infisical", &self.domain];
         sandbox.exec(vm, None, &command, Some(token.as_bytes()))?;
@@ -126,48 +139,36 @@ impl Managed for Infisical {
     }
 }
 
-/// Reads `proxyTokenFile` and `sessionTokenFile` (required), `domain`,
-/// `hostPort` (default 17323) and `image`.
+/// Reads `domain`, `hostPort` (default 17323) and `image`.
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
     if let Location::External(_) = spec.location {
         bail!("{}: kind infisical runs only managed in v1", fields.path());
     }
-    only(
-        fields,
-        &[
-            "proxyTokenFile",
-            "sessionTokenFile",
-            "domain",
-            "hostPort",
-            "image",
-        ],
-    )?;
-    let path = |key| files::host_path(&fields.string(key)?, spec.home);
+    only(fields, &["domain", "hostPort", "image"])?;
     let host_port = if fields.map.contains_key("hostPort") {
         fields.number("hostPort")?
     } else {
         PORT
     };
-    let proxy_token_file = path("proxyTokenFile")?;
     Ok(Box::new(Infisical {
         image: fields.optional_string("image")?.unwrap_or(IMAGE.into()),
         host_port,
         domain: fields.optional_string("domain")?.unwrap_or_default(),
-        proxy_token: read_token(&proxy_token_file)?,
-        proxy_token_file,
-        session_token_file: path("sessionTokenFile")?,
+        secrets: spec.secrets.clone(),
         data: spec.data.clone(),
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    use std::rc::Rc;
 
     use super::*;
     use crate::config::Fields;
     use crate::json;
+    use crate::keychain::fake::FakeKeychain;
     use crate::proxy::Location;
     use crate::proxy::managed::wanted_record;
     use crate::sandbox::fake::FakeSandbox;
@@ -175,29 +176,33 @@ mod tests {
 
     const PEM: &str = include_str!("testdata/ca.pem");
 
-    struct Files {
-        dir: PathBuf,
+    struct Setup {
+        dir: std::path::PathBuf,
+        keychain: Rc<FakeKeychain>,
     }
 
-    impl Files {
+    impl Setup {
         fn new(name: &str) -> Self {
-            let dir = scratch_dir(name);
-            std::fs::write(dir.join("proxy"), "pt-SECRET-1\n").unwrap();
-            std::fs::write(dir.join("session"), "st-SECRET-2\n").unwrap();
-            Self { dir }
-        }
-
-        fn fields(&self, extra: &str) -> String {
-            format!(
-                r#"{{"kind": "infisical", "run": "managed",
-                    "proxyTokenFile": "{}", "sessionTokenFile": "{}"{extra}}}"#,
-                self.dir.join("proxy").display(),
-                self.dir.join("session").display()
-            )
+            Self {
+                dir: scratch_dir(name),
+                keychain: Rc::new(FakeKeychain::holding(&[
+                    ("infi/proxy-token", "pt-SECRET-1"),
+                    ("infi/session-token", "st-SECRET-2"),
+                ])),
+            }
         }
 
         fn built(&self, extra: &str) -> Result<Box<dyn Proxy>> {
-            built(&self.fields(extra), Location::Managed, &self.dir)
+            let fields =
+                format!(r#"{{"kind": "infisical", "run": "managed"{extra}}}"#);
+            built(&fields, Location::Managed, &self.dir, &self.keychain)
+        }
+
+        fn set(&self, account: &str, value: &str) {
+            self.keychain
+                .items
+                .borrow_mut()
+                .insert(account.into(), value.into());
         }
     }
 
@@ -205,15 +210,18 @@ mod tests {
         fields: &str,
         location: Location,
         data: &Path,
+        keychain: &Rc<FakeKeychain>,
     ) -> Result<Box<dyn Proxy>> {
         let value = json::parse(fields).unwrap();
+        let fields = Fields::new(&value, "proxies.infi")?;
         let spec = Spec {
-            fields: Fields::new(&value, "proxies.infi")?,
+            secrets: Secrets::new("infi", keychain.clone(), &fields)?,
+            fields,
             location,
             home: Path::new("/home/u"),
             data: data.join("data"),
         };
-        build(&spec)
+        super::super::build(&spec)
     }
 
     fn started(proxy: &dyn Proxy) -> FakeSandbox {
@@ -224,8 +232,8 @@ mod tests {
 
     #[test]
     fn infisical_token_only_on_stdin() {
-        let files = Files::new("infisical-stdin");
-        let proxy = files.built("").unwrap();
+        let setup = Setup::new("infisical-stdin");
+        let proxy = setup.built("").unwrap();
         let sandbox = started(proxy.as_ref());
         assert_eq!(*sandbox.stdins.borrow(), [b"pt-SECRET-1\n".to_vec()]);
         let calls = sandbox.calls.borrow();
@@ -237,11 +245,11 @@ mod tests {
 
     #[test]
     fn infisical_domain_is_an_argument_not_a_secret() {
-        let files = Files::new("infisical-domain");
-        let plain = started(files.built("").unwrap().as_ref());
+        let setup = Setup::new("infisical-domain");
+        let plain = started(setup.built("").unwrap().as_ref());
         assert!(plain.calls.borrow()[0].ends_with(" hangar-infisical "));
         let domain = r#", "domain": "https://eu.infisical.com""#;
-        let proxy = files.built(domain).unwrap();
+        let proxy = setup.built(domain).unwrap();
         let sandbox = started(proxy.as_ref());
         let call = &sandbox.calls.borrow()[0];
         assert!(
@@ -260,8 +268,8 @@ mod tests {
 
     #[test]
     fn infisical_vm_spec_open_egress_data_mount_publish() {
-        let files = Files::new("infisical-vm");
-        let proxy = files.built(r#", "hostPort": 27323"#).unwrap();
+        let setup = Setup::new("infisical-vm");
+        let proxy = setup.built(r#", "hostPort": 27323"#).unwrap();
         assert_eq!(proxy.kind(), "infisical");
         assert_eq!(proxy.egress(), Egress::HostPort(27323));
         let managed = proxy.managed().unwrap();
@@ -270,34 +278,35 @@ mod tests {
         assert_eq!((vm.cpus, vm.memory.as_str()), (1, "512M"));
         assert_eq!(vm.publish, (27323, 17323));
         assert_eq!(vm.entrypoint.as_deref(), Some("/bin/sh"));
-        let data = files.dir.join("data/data");
+        let data = setup.dir.join("data/data");
         let mount = (data.clone(), "/data".into(), MountMode::ReadWrite);
         assert_eq!(vm.mounts, [mount]);
         assert_eq!(managed.log_file(), data.join("proxy.log"));
-        assert_eq!(wanted_record(&vm).egress.as_deref(), Some("open"));
+        let record = wanted_record(&vm, "f");
+        assert_eq!(record.egress.as_deref(), Some("open"));
         let image = r#", "image": "infisical/cli:9""#;
-        let other = files.built(image).unwrap();
+        let other = setup.built(image).unwrap();
         assert_eq!(other.managed().unwrap().vm().image, "infisical/cli:9");
         assert_eq!(other.egress(), Egress::HostPort(17323));
     }
 
     #[test]
     fn infisical_token_change_changes_fingerprint() {
-        let files = Files::new("infisical-fingerprint");
-        let fingerprint =
-            || files.built("").unwrap().managed().unwrap().vm().fingerprint;
+        let setup = Setup::new("infisical-fingerprint");
+        let proxy = setup.built("").unwrap();
+        let fingerprint = || proxy.managed().unwrap().fingerprint().unwrap();
         let before = fingerprint();
         assert_eq!(before, sha256_hex(b"pt-SECRET-1"));
         assert_eq!(before.len(), 64);
-        std::fs::write(files.dir.join("proxy"), "pt-SECRET-1").unwrap();
+        setup.set("infi/session-token", "st-other");
         assert_eq!(fingerprint(), before);
-        std::fs::write(files.dir.join("proxy"), "pt-SECRET-3\n").unwrap();
+        setup.set("infi/proxy-token", "pt-SECRET-3");
         assert_ne!(fingerprint(), before);
     }
 
     #[test]
     fn infisical_ca_from_proxy_json() {
-        let files = Files::new("infisical-ca");
+        let setup = Setup::new("infisical-ca");
         let body = json::stringify(&json::object([(
             "certificate",
             json::string(PEM),
@@ -307,7 +316,7 @@ mod tests {
             ("200 OK", "{}"),
             ("503 Starting", ""),
         ]);
-        let proxy = files.built(&format!(r#", "hostPort": {port}"#)).unwrap();
+        let proxy = setup.built(&format!(r#", "hostPort": {port}"#)).unwrap();
         assert_eq!(proxy.ca().unwrap().unwrap(), PEM.as_bytes());
         assert!(matches!(proxy.health(), Health::Up));
         assert!(matches!(proxy.health(), Health::Down(_)));
@@ -322,45 +331,67 @@ mod tests {
 
     #[test]
     fn infisical_login_is_x_agent_vault_and_session_token() {
-        let files = Files::new("infisical-login");
-        let proxy = files.built("").unwrap();
+        let setup = Setup::new("infisical-login");
+        let proxy = setup.built("").unwrap();
         let login = proxy.login("work").unwrap().unwrap();
         assert_eq!(login.user.expose(), "x-agent-vault");
         assert_eq!(login.password.expose(), "st-SECRET-2");
-        std::fs::write(files.dir.join("session"), "\n").unwrap();
-        let error = proxy.login("work").err().unwrap().to_string();
-        assert!(error.ends_with("/session is empty"), "{error}");
     }
 
     #[test]
-    fn infisical_host_secrets_are_both_token_files() {
-        let files = Files::new("infisical-secrets");
-        let proxy = files.built("").unwrap();
-        assert_eq!(
-            proxy.host_secrets(),
-            [files.dir.join("proxy"), files.dir.join("session")]
+    fn infisical_tokens_are_read_only_when_needed() {
+        let setup = Setup::new("infisical-lazy");
+        setup.keychain.items.borrow_mut().clear();
+        let proxy = setup.built("").unwrap();
+        assert_eq!(proxy.secrets(), SLOTS);
+        let managed = proxy.managed().unwrap();
+        assert_eq!(managed.vm().publish, (17323, 17323));
+        let error = managed.fingerprint().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("no proxy-token for proxy infi in "),
+            "{error}"
+        );
+        assert_eq!(error.hint(), Some("run 'hangar secret set infi'"));
+        let error = proxy.login("work").err().unwrap().to_string();
+        assert!(
+            error.starts_with("no session-token for proxy infi"),
+            "{error}"
         );
     }
 
     #[test]
-    fn infisical_empty_proxy_token_is_an_error() {
-        let files = Files::new("infisical-empty");
-        std::fs::write(files.dir.join("proxy"), " \n").unwrap();
-        let error = files.built("").err().unwrap().to_string();
-        assert!(error.ends_with("/proxy is empty"), "{error}");
+    fn infisical_tokens_may_come_from_a_command() {
+        let setup = Setup::new("infisical-command");
+        let proxy = setup
+            .built(
+                r#", "secrets": {"session-token":
+                    {"command": ["/bin/sh", "-c", "echo st-from-cmd"]}}"#,
+            )
+            .unwrap();
+        let login = proxy.login("work").unwrap().unwrap();
+        assert_eq!(login.password.expose(), "st-from-cmd");
     }
 
     #[test]
     fn infisical_external_url_refused() {
-        let files = Files::new("infisical-external");
+        let setup = Setup::new("infisical-external");
         let fields = r#"{"kind": "infisical", "url": "http://127.0.0.1:1"}"#;
         let url = Location::External("http://127.0.0.1:1".into());
-        let error = built(fields, url, &files.dir).err().unwrap();
+        let error = built(fields, url, &setup.dir, &setup.keychain)
+            .err()
+            .unwrap();
         assert_eq!(
             error.to_string(),
             "proxies.infi: kind infisical runs only managed in v1"
         );
-        let error = files.built(r#", "vault": "x""#).err().unwrap();
+        let error = setup.built(r#", "vault": "x""#).err().unwrap();
         assert_eq!(error.to_string(), "proxies.infi.vault: unknown setting");
+        let error = setup.built(r#", "proxyTokenFile": "x""#).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "proxies.infi.proxyTokenFile: unknown setting"
+        );
     }
 }

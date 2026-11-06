@@ -13,6 +13,37 @@ trusts. Every entry under `proxies` has these keys:
 Set `run` or `url`, not both. The other keys belong to the kind; an
 unknown one is an error.
 
+## Proxy tokens
+
+A kind that needs tokens (to enrol, or for the bays to log in) reads
+them from the OS keychain: the macOS Keychain, or the Secret Service on
+Linux. Each is an item of service `hangar`, account `<proxy>/<token>`,
+e.g. `vault/session-token`.
+
+- `hangar up` asks for each token that's missing, typed unseen, and
+  stores it. Without a terminal it doesn't ask: the proxy fails with
+  `run 'hangar secret set <proxy>'`.
+- `hangar secret set <proxy> [token]` asks for one, or all of them
+  again. Piped, it reads one token per line, in the order listed below:
+  `op read op://… | hangar secret set vault session-token`.
+- `hangar rm <proxy> --data` deletes them.
+
+A token is read only when it's needed, so `ps`, `down` and `logs` work
+without them. It can't hold spaces, quotes or non-ASCII characters.
+
+To fetch a token from a password manager or a secrets file instead,
+name a command; its first line is the token, and it runs on every `up`:
+
+```json
+"vault": {
+  "kind": "infisical", "run": "managed",
+  "secrets": {
+    "session-token": { "command": ["op", "read", "op://Private/infisical/session"] },
+    "proxy-token": { "command": ["cat", "/run/agenix/infisical-proxy-token"] }
+  }
+}
+```
+
 ## `infisical`
 
 [Infisical Agent Vault](https://infisical.com/docs/documentation/platform/agent-vault/proxies)'s
@@ -21,8 +52,6 @@ proxy, managed by hangar in its own VM.
 | Key | Default |
 | --- | --- |
 | `run` | must be `"managed"` |
-| `proxyTokenFile` | required: a file holding the proxy token |
-| `sessionTokenFile` | required: a file holding the session token the bays log in with |
 | `domain` | none: your Infisical instance's URL, passed as `--domain` |
 | `hostPort` | `17323`: the host port the proxy is published on (`127.0.0.1` only) |
 | `image` | `infisical/cli:0.44.15`, pinned by digest |
@@ -36,23 +65,21 @@ trusts the CA the proxy serves at `/_agent-vault/ca`. `hangar logs NAME`
 shows the proxy's log, `data/proxy.log`; each start moves a log past
 10 MiB to `proxy.log.1`, keeping one old log.
 
-Both token files must stay present for every hangar command, since the
-proxy is built when the config loads. An empty file is an error.
+Tokens, in the order `secret set` asks for them: `proxy-token`, then
+`session-token`.
 
 ### Infisical setup
 
 1. Set up Agent Vault and create a proxy token, as
    [Infisical's proxy docs](https://infisical.com/docs/documentation/platform/agent-vault/proxies)
-   describe. Put it in a file only you can read, e.g.
-   `~/.secrets/infisical-proxy-token`.
+   describe.
 2. Create a session token, shown only once: in the dashboard, **Agent
    Vault > Sessions > Create Session**, or with
    [`infisical agent-vault run … --ttl never --keep-session`](https://infisical.com/docs/cli/commands/agent-vault).
    A `never` TTL lasts until you revoke the session
    ([sessions](https://infisical.com/docs/documentation/platform/agent-vault/sessions)).
-   Put it in `~/.secrets/infisical-session-token`.
-3. Point `proxyTokenFile` and `sessionTokenFile` at the two files and run
-   `hangar up`.
+   The proxy can't create one itself.
+3. Run `hangar up` and paste the two tokens when it asks.
 
 Which hosts a bay may reach, and which credential each gets, you set in
 Infisical. A bay needs at least:
@@ -66,13 +93,14 @@ Infisical. A bay needs at least:
 - Docker pulls, if you run Docker: `registry-1.docker.io`,
   `auth.docker.io`, `production.cloudflare.docker.com`.
 
-**Renewing the session token:** replace the file, then run `hangar up`.
-Each bay updates in place (`updated (proxy login)`) and its apps restart
-with the new login.
+**Renewing the session token:** `hangar secret set NAME session-token`,
+then `hangar up`. Each bay updates in place (`updated (proxy login)`)
+and its apps restart with the new login.
 
-**Rotating the proxy token:** replace the file, then run `hangar up`. The
-proxy's VM is recreated (`recreated (fingerprint)`); its data folder is
-kept.
+**Rotating the proxy token:** `hangar secret set NAME proxy-token`, then
+`hangar up`. The proxy's VM is recreated (`recreated (fingerprint)`)
+with an empty data folder, since what the proxy saved belongs to the
+old token.
 
 ## `agent-vault`
 
@@ -83,11 +111,10 @@ yourself on this machine.
 | --- | --- |
 | `url` | required: `http://127.0.0.1:<port>`, its proxy port |
 | `ca` | required: see [The `ca` object](#the-ca-object) |
-| `tokenFile` | required: a file holding the token the bays log in with |
 | `vault` | `"default"`: the vault name |
 
-A bay logs in with the token as the user and the vault name as the
-password. Health is a TCP connect to the port.
+A bay logs in with the proxy's `token` (the one you minted for the
+bays) as the user and the vault name as the password. Health is a TCP connect to the port.
 
 ## `http`
 
@@ -136,10 +163,12 @@ A kind is one file, `src/proxy/<kind>.rs`, plus one line in
 
 The file exports `build(&Spec) -> Result<Box<dyn Proxy>>`. `Spec` holds
 the entry's fields, where it runs (`Location`), your home (for `~` in
-paths) and the proxy's own data folder. `build` checks its keys with
-`proxy::only`, reads token files with `proxy::read_token`, and gets an
-external kind's port from `proxy::external_url` and
-`proxy::loopback_port`.
+paths), the proxy's own data folder and its `Secrets`. `build` checks
+its keys with `proxy::only` and gets an external kind's port from
+`proxy::external_url` and `proxy::loopback_port`. A kind that needs
+tokens lists them as `Slot`s from `Proxy::secrets` and reads each with
+`Secrets::get` when it needs it, never in `build`: the keychain, the
+prompts and `secret set` come from the core.
 
 The `Proxy` trait:
 
@@ -151,17 +180,19 @@ The `Proxy` trait:
 | `login` | the bay's login, or `None` |
 | `health` | `Up` or `Down(why)` |
 | `managed` | optional: `Some(self)` for a kind hangar runs |
+| `secrets` | optional: the tokens it reads from its `Secrets` |
 
 A managed kind implements `Managed`: `vm()` (image, CPUs, memory, the
-published port, mounts and a fingerprint), `start()` and `log_file()`.
+published port and mounts), `fingerprint()`, `start()` and
+`log_file()`. A new fingerprint recreates the VM with empty mounts.
 The core creates, recreates, starts and stops the VM. A capability a kind
 lacks is `None`, never an "unsupported" error.
 
 The security contract, which reviews check first:
 
-- Secrets travel on stdin only (`Sandbox::exec`'s `stdin`) or as
-  `Secret`s in `Login`. Never in argv, `VmSpec.env`, a log line or
-  `--json`.
+- Secrets travel on stdin only (`Sandbox::exec`'s `stdin`, the
+  keychain tool's) or as `Secret`s in `Login`. Never in argv,
+  `VmSpec.env`, a file, a log line or `--json`.
 - A bay gets only its login, inside its proxy env, written as root over
   stdin. Enrolment tokens and CA keys never enter a bay.
 - A managed proxy runs only in its own VM. Its mounts must be under its

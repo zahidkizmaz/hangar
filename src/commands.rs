@@ -16,7 +16,8 @@ use crate::error::{Context, Error, Result, bail};
 use crate::files::{self, Copied, Request};
 use crate::hangar::Hangar;
 use crate::lifecycle::{Change, Outcome, Resource};
-use crate::proxy::{Proxy, managed, proxy_vm};
+use crate::prompt::Prompt;
+use crate::proxy::{Proxy, Secrets, Slot, managed, proxy_vm};
 use crate::sandbox::{BoxState, bay_vm, data_volume};
 use crate::status::{self, Detail, Overview};
 use crate::{mounts, process};
@@ -137,8 +138,12 @@ fn change(name: &str, resource: Resource, outcome: Outcome) -> Change {
 }
 
 /// Proxies first, each once, then the bays; a bay whose proxy failed is
-/// left alone.
-pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
+/// left alone. Tokens missing from the keychain are asked for first.
+pub(crate) fn up(
+    hangar: &Hangar,
+    names: &[String],
+    prompt: &dyn Prompt,
+) -> Result<UpReport> {
     let mut selection = select(hangar, names)?;
     let used: Vec<_> = selection
         .bays
@@ -147,6 +152,13 @@ pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
         .collect();
     for (name, proxy) in used {
         selection.add_proxy(name, proxy);
+    }
+    if prompt.terminal() {
+        for (name, proxy) in &selection.proxies {
+            let secrets = hangar.secrets(name)?;
+            let missing = secrets.missing(proxy.secrets())?;
+            ask_for(name, &secrets, &missing, prompt)?;
+        }
     }
     let mut changes: Vec<Change> = selection
         .proxies
@@ -166,6 +178,56 @@ pub(crate) fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
         changes.push(change(bay.name, Resource::Bay, outcome));
     }
     Ok(UpReport { changes })
+}
+
+/// Stores each of `slots`, asked for one by one; what was saved.
+fn ask_for(
+    proxy: &str,
+    secrets: &Secrets,
+    slots: &[Slot],
+    prompt: &dyn Prompt,
+) -> Result<Vec<String>> {
+    slots
+        .iter()
+        .map(|slot| {
+            let question = format!("{proxy} {} ({})", slot.key, slot.about);
+            secrets.store(slot.key, &prompt.ask(&question)?)?;
+            info!("proxy {proxy}: {} saved", slot.key);
+            Ok(format!("{} saved", slot.key))
+        })
+        .collect()
+}
+
+/// Asks for `token` of proxy `name`, or every one it keeps in the
+/// keychain, and stores it.
+pub(crate) fn secret_set(
+    hangar: &Hangar,
+    name: &str,
+    token: Option<&str>,
+    prompt: &dyn Prompt,
+) -> Result<UpReport> {
+    let Target::Proxy(name, proxy) = target(hangar, name)? else {
+        bail!("{name} is a bay; only proxies have tokens");
+    };
+    let secrets = hangar.secrets(name)?;
+    let mut slots = secrets.settable(proxy.secrets());
+    if slots.is_empty() {
+        bail!("proxy {name} keeps no tokens in the keychain");
+    }
+    if let Some(token) = token {
+        let keys: Vec<&str> = slots.iter().map(|slot| slot.key).collect();
+        slots.retain(|slot| slot.key == token);
+        if slots.is_empty() {
+            return Err(Error::with_hint(
+                format!("proxy {name} keeps no {token} in the keychain"),
+                format!("it keeps: {}", keys.join(", ")),
+            ));
+        }
+    }
+    let saved = ask_for(name, &secrets, &slots, prompt)?;
+    Ok(UpReport {
+        changes: vec![change(name, Resource::Proxy, Outcome::Updated(saved))],
+    })
 }
 
 fn proxy_failed(changes: &[Change], proxy: &str) -> bool {
@@ -193,26 +255,37 @@ pub(crate) fn down(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
     })
 }
 
-pub(crate) fn restart(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
+pub(crate) fn restart(
+    hangar: &Hangar,
+    names: &[String],
+    prompt: &dyn Prompt,
+) -> Result<UpReport> {
     let mut report = down(hangar, names)?;
-    report.changes.extend(up(hangar, names)?.changes);
+    report.changes.extend(up(hangar, names, prompt)?.changes);
     Ok(report)
 }
 
-/// What `rm` deletes: the VM, and with `--data` the folder and the data
-/// volume.
+/// What `rm` deletes: the VM, and with `--data` the folder, the data
+/// volume and a configured proxy's tokens in the keychain.
 struct Doomed {
     resource: Resource,
     vm: String,
     folder: PathBuf,
     volume: Option<String>,
+    tokens: Option<(Secrets, Vec<Slot>)>,
 }
 
 /// Configured or left over: a leftover is only known by its folder.
 fn doomed(hangar: &Hangar, name: &str) -> Result<Doomed> {
+    let mut tokens = None;
     let resource = match target(hangar, name) {
         Ok(Target::Bay(_)) => Resource::Bay,
-        Ok(Target::Proxy(..)) => Resource::Proxy,
+        Ok(Target::Proxy(name, proxy)) => {
+            let secrets = hangar.secrets(name)?;
+            let slots = secrets.settable(proxy.secrets());
+            tokens = (!slots.is_empty()).then_some((secrets, slots));
+            Resource::Proxy
+        }
         Err(error) => hangar
             .leftovers()
             .into_iter()
@@ -225,12 +298,14 @@ fn doomed(hangar: &Hangar, name: &str) -> Result<Doomed> {
             vm: bay_vm(name),
             folder: hangar.state.bays().join(name),
             volume: Some(data_volume(name)),
+            tokens: None,
         },
         Resource::Proxy => Doomed {
             resource,
             vm: proxy_vm(name),
             folder: hangar.state.proxies().join(name),
             volume: None,
+            tokens,
         },
     })
 }
@@ -272,6 +347,9 @@ fn remove(hangar: &Hangar, doomed: &Doomed, data: bool) -> Result<()> {
     if doomed.folder.exists() {
         fs::remove_dir_all(&doomed.folder).context(doomed.folder.display())?;
     }
+    if let Some((secrets, slots)) = &doomed.tokens {
+        secrets.delete(slots)?;
+    }
     Ok(())
 }
 
@@ -288,7 +366,12 @@ fn confirm(name: &str, doomed: &Doomed) -> Result<bool> {
         .as_ref()
         .map(|volume| format!(" and the volume {volume}"))
         .unwrap_or_default();
-    eprint!("Delete {}{volume}? [y/N] ", doomed.folder.display());
+    let tokens = doomed
+        .tokens
+        .as_ref()
+        .map(|_| format!(" and its tokens in {}", crate::keychain::STORE))
+        .unwrap_or_default();
+    eprint!("Delete {}{volume}{tokens}? [y/N] ", doomed.folder.display());
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).context("terminal")?;
     let answer = answer.trim().to_ascii_lowercase();
@@ -571,16 +654,110 @@ fn app_setup<'a>(settings: &'a BaySettings, name: &str) -> Result<&'a Setup> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cp, down, exec, inspect, last_lines, logs, ps, restart, rm, setup,
-        tail, target, up,
+        UpReport, cp, down, exec, inspect, last_lines, logs, ps, rm,
+        secret_set, setup, tail, target,
     };
+    use crate::error::Result;
     use crate::hangar::Hangar;
+    use crate::keychain::fake::FakeKeychain;
+    use crate::prompt::fake::FakePrompt;
     use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
     use crate::status::Detail;
-    use crate::testing::{hangar_with, scratch_dir, settled};
+    use crate::testing::{hangar_holding, hangar_with, scratch_dir, settled};
     use std::fs;
     use std::rc::Rc;
+
+    fn up(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
+        super::up(hangar, names, &FakePrompt::default())
+    }
+
+    fn restart(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
+        super::restart(hangar, names, &FakePrompt::default())
+    }
+
+    const TOKENED: &str = r#"{"proxies": {
+        "t": {"kind": "fake", "run": "managed", "managed": true,
+              "token": true, "port": 3100},
+        "c": {"kind": "fake", "url": "http://127.0.0.1:3101", "port": 3101,
+              "token": true, "secrets": {"token":
+                  {"command": ["/bin/sh", "-c", "echo from-cmd"]}}}},
+        "bays": [{"name": "a", "proxy": "t"}, {"name": "b", "proxy": null}]}"#;
+
+    fn tokened(
+        name: &str,
+        items: &[(&str, &str)],
+    ) -> (Hangar, Rc<FakeKeychain>) {
+        let keychain = Rc::new(FakeKeychain::holding(items));
+        let state = scratch_dir(name);
+        let hangar =
+            hangar_holding(TOKENED, &state, settled(), keychain.clone());
+        (hangar, keychain)
+    }
+
+    #[test]
+    fn up_asks_for_missing_tokens_of_the_proxies_it_brings_up() {
+        let (hangar, keychain) = tokened("cmd-up-ask", &[]);
+        let prompt = FakePrompt::answering(&["tok-1"]);
+        super::up(&hangar, &names(&["a"]), &prompt).unwrap();
+        assert_eq!(*prompt.questions.borrow(), ["t token (the fake token)"]);
+        assert_eq!(keychain.items.borrow()["t/token"], "tok-1");
+        let again = FakePrompt::answering(&[]);
+        super::up(&hangar, &names(&["a", "b"]), &again).unwrap();
+        assert!(again.questions.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_without_a_terminal_never_asks() {
+        let (hangar, keychain) = tokened("cmd-up-no-ask", &[]);
+        let prompt = FakePrompt::default();
+        let report = super::up(&hangar, &names(&["t"]), &prompt).unwrap();
+        assert_eq!(summary(&report), ["t proxy Created"]);
+        assert!(prompt.questions.borrow().is_empty());
+        assert!(keychain.items.borrow().is_empty());
+    }
+
+    #[test]
+    fn secret_set_stores_each_keychain_token_of_a_proxy() {
+        let (hangar, keychain) =
+            tokened("cmd-secret-set", &[("t/token", "old")]);
+        let prompt = FakePrompt::answering(&["new"]);
+        let report = secret_set(&hangar, "t", None, &prompt).unwrap();
+        assert_eq!(summary(&report), [r#"t proxy Updated(["token saved"])"#]);
+        assert_eq!(keychain.items.borrow()["t/token"], "new");
+        let one = FakePrompt::answering(&["newer"]);
+        secret_set(&hangar, "t", Some("token"), &one).unwrap();
+        assert_eq!(keychain.items.borrow()["t/token"], "newer");
+        let error = secret_set(&hangar, "t", Some("nope"), &one).err().unwrap();
+        assert_eq!(error.message(), "proxy t keeps no nope in the keychain");
+        assert_eq!(error.hint(), Some("it keeps: token"));
+        let error = secret_set(&hangar, "c", None, &prompt).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "proxy c keeps no tokens in the keychain"
+        );
+        let error = secret_set(&hangar, "a", None, &prompt).err().unwrap();
+        assert_eq!(error.to_string(), "a is a bay; only proxies have tokens");
+        let bad = FakePrompt::answering(&["two words"]);
+        let error = secret_set(&hangar, "t", None, &bad)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.starts_with("proxy t: token: "), "{error}");
+        assert_eq!(keychain.items.borrow()["t/token"], "newer");
+    }
+
+    #[test]
+    fn rm_data_on_a_proxy_deletes_its_tokens_too() {
+        let (hangar, keychain) =
+            tokened("cmd-rm-tokens", &[("t/token", "x"), ("other/token", "y")]);
+        rm(&hangar, "t", false, true).unwrap();
+        assert!(keychain.items.borrow().contains_key("t/token"));
+        rm(&hangar, "t", true, true).unwrap();
+        assert!(!keychain.items.borrow().contains_key("t/token"));
+        assert!(keychain.items.borrow().contains_key("other/token"));
+        rm(&hangar, "c", true, true).unwrap();
+    }
 
     const PROXIED: &str = r#"{"proxies": {
         "p": {"kind": "fake", "run": "managed", "managed": true,

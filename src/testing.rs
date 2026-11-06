@@ -76,16 +76,6 @@ pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
 /// Roots for bay `default` in a scratch home, with `state` (created) and
 /// `cache` under it.
 pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
-    roots_guarding(home, state, cache, &[])
-}
-
-/// [`roots`] that also keep `secrets` (a proxy's token files) out.
-pub(crate) fn roots_guarding(
-    home: &Path,
-    state: &str,
-    cache: &str,
-    secrets: &[PathBuf],
-) -> Roots {
     let state = home.join(state);
     fs::create_dir_all(&state).unwrap();
     let cache = home.join(cache);
@@ -95,7 +85,6 @@ pub(crate) fn roots_guarding(
         &cache,
         &state.join("bays/default/home"),
         &cache.join("bays/default"),
-        secrets,
     )
     .unwrap()
 }
@@ -124,6 +113,16 @@ pub(crate) fn hangar_with(
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
 ) -> Hangar {
+    hangar_holding(config, state, sandbox, no_keychain())
+}
+
+/// [`hangar_with`], its proxies' tokens in `keychain`.
+pub(crate) fn hangar_holding(
+    config: &str,
+    state: &Path,
+    sandbox: Rc<dyn Sandbox>,
+    keychain: Rc<dyn crate::keychain::Keychain>,
+) -> Hangar {
     let settings = settings(config);
     let sibling = |suffix: &str| {
         let mut path = state.as_os_str().to_owned();
@@ -133,7 +132,8 @@ pub(crate) fn hangar_with(
     let host_home = sibling("-home");
     fs::create_dir_all(&host_home).unwrap();
     let state_dir = StateDir::new(state.to_path_buf());
-    let proxies = build_proxies(&settings, &state_dir, &host_home).unwrap();
+    let proxies =
+        build_proxies(&settings, &state_dir, &host_home, &keychain).unwrap();
     Hangar {
         settings,
         state: state_dir,
@@ -141,8 +141,14 @@ pub(crate) fn hangar_with(
         state_root: sibling("-state"),
         host_home,
         sandbox,
+        keychain,
         proxies,
     }
+}
+
+/// An empty fake keychain.
+pub(crate) fn no_keychain() -> Rc<dyn crate::keychain::Keychain> {
+    Rc::new(crate::keychain::fake::FakeKeychain::default())
 }
 
 /// A sandbox whose bays answer like ones that are already in line.
@@ -184,4 +190,12 @@ pub(crate) fn serve_each(
             .collect()
     });
     (port, server)
+}
+
+/// A proxy's secrets, read from an empty fake keychain.
+pub(crate) fn no_secrets(
+    fields: &crate::config::Fields,
+) -> crate::proxy::Secrets {
+    let keychain = Rc::new(crate::keychain::fake::FakeKeychain::default());
+    crate::proxy::Secrets::new("p", keychain, fields).unwrap()
 }

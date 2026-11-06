@@ -77,7 +77,11 @@ fn reconcile(
         mounts: resolve_mounts(hangar, name, &managed.vm().mounts)?,
         ..managed.vm()
     };
-    let created = step(&owner, "vm", || ensure_vm(hangar, name, &wanted_vm))?;
+    let fingerprint = step(&owner, "token", || managed.fingerprint())?;
+    let wanted = wanted_record(&wanted_vm, &fingerprint);
+    let created = step(&owner, "vm", || {
+        ensure_vm(hangar, name, &wanted_vm, &wanted)
+    })?;
     if matches!(proxy.health(), Health::Up) {
         return Ok(created.unwrap_or(Outcome::Unchanged));
     }
@@ -144,7 +148,7 @@ fn resolve_mounts(
 
 /// Sorted, so the same proxy always records the same VM. A changed
 /// entrypoint rides in the fingerprint: it recreates like any other.
-pub(crate) fn wanted_record(vm: &ManagedVm) -> VmRecord {
+pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
     let (host, guest) = vm.publish;
     let mut mounts: Vec<String> = vm
         .mounts
@@ -156,10 +160,8 @@ pub(crate) fn wanted_record(vm: &ManagedVm) -> VmRecord {
         .collect();
     mounts.sort();
     let fingerprint = match &vm.entrypoint {
-        Some(entrypoint) => {
-            format!("{} entrypoint={entrypoint}", vm.fingerprint)
-        }
-        None => vm.fingerprint.clone(),
+        Some(entrypoint) => format!("{fingerprint} entrypoint={entrypoint}"),
+        None => fingerprint.to_string(),
     };
     VmRecord {
         image: Some(vm.image.clone()),
@@ -177,16 +179,15 @@ fn ensure_vm(
     hangar: &Hangar,
     name: &str,
     vm: &ManagedVm,
+    wanted: &VmRecord,
 ) -> Result<Option<Outcome>> {
     let sandbox = hangar.sandbox.as_ref();
     let vm_name = proxy_vm(name);
     let record = hangar.state.proxy(name).vm();
-    let wanted = wanted_record(vm);
     let recorded = VmRecord::load(&record);
-    match lifecycle::plan(sandbox.state(&vm_name)?, recorded.as_ref(), &wanted)
-    {
+    match lifecycle::plan(sandbox.state(&vm_name)?, recorded.as_ref(), wanted) {
         Plan::Create => {
-            create(hangar, name, vm, &wanted)?;
+            create(hangar, name, vm, wanted)?;
             Ok(Some(Outcome::Created))
         }
         Plan::Recreate(reasons) => {
@@ -196,7 +197,10 @@ fn ensure_vm(
                 sandbox.stop(&vm_name)?;
             }
             sandbox.remove(&vm_name)?;
-            create(hangar, name, vm, &wanted)?;
+            if reasons.contains(&"fingerprint") {
+                empty_mounts(name, vm)?;
+            }
+            create(hangar, name, vm, wanted)?;
             let reasons = reasons.into_iter().map(String::from).collect();
             Ok(Some(Outcome::Recreated(reasons)))
         }
@@ -206,6 +210,18 @@ fn ensure_vm(
         }
         Plan::Keep => Ok(None),
     }
+}
+
+/// What a proxy saved belongs to the token it enrolled with: a new token
+/// starts from empty mounts. They are the resolved ones, inside the
+/// proxy's own folder.
+fn empty_mounts(name: &str, vm: &ManagedVm) -> Result<()> {
+    log::info!("proxy {name}: new fingerprint, emptying its data");
+    for (host, _, _) in &vm.mounts {
+        fs::remove_dir_all(host).context(host.display())?;
+        mounts::create(host).context(host.display())?;
+    }
+    Ok(())
 }
 
 /// A VM that fails to create is left without a record, so the next `up`
@@ -447,10 +463,12 @@ mod tests {
         let state = scratch_dir("managed-fingerprint");
         let data = state.join("proxies/p/data");
         let sandbox = Rc::new(FakeSandbox::default());
-        let mut proxy = with_mount(&data);
+        let proxy = with_mount(&data);
         assert_eq!(run(&state, &sandbox, &proxy), "Created");
-        fs::write(data.join("keep"), "x").unwrap();
-        proxy.managed.as_mut().unwrap().vm.fingerprint = "other".into();
+        fs::write(data.join("old"), "x").unwrap();
+        fs::create_dir(data.join("dir")).unwrap();
+        *proxy.managed.as_ref().unwrap().fingerprint.borrow_mut() =
+            "other".into();
         sandbox.calls.borrow_mut().clear();
         assert_eq!(
             run(&state, &sandbox, &proxy),
@@ -463,7 +481,77 @@ mod tests {
         let vm = proxy_vm("p");
         assert!(at(format!("stop {vm}")) < at(format!("remove {vm}")));
         assert!(at(format!("remove {vm}")) < at(format!("create {vm}")));
+        assert!(fs::read_dir(&data).unwrap().next().is_none());
+        let mode = fs::metadata(&data).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn other_changes_keep_the_proxy_data() {
+        let state = scratch_dir("managed-keep-data");
+        let data = state.join("proxies/p/data");
+        let sandbox = Rc::new(FakeSandbox::default());
+        let mut proxy = with_mount(&data);
+        assert_eq!(run(&state, &sandbox, &proxy), "Created");
+        fs::write(data.join("keep"), "x").unwrap();
+        proxy.managed.as_mut().unwrap().vm.image = "fake:2".into();
+        assert_eq!(run(&state, &sandbox, &proxy), r#"Recreated(["image"])"#);
         assert!(data.join("keep").exists());
+    }
+
+    #[test]
+    fn a_fingerprint_that_cannot_be_read_fails_before_any_vm_change() {
+        let state = scratch_dir("managed-no-fingerprint");
+        let sandbox = Rc::new(FakeSandbox::default());
+        let hangar = hangar_with(DIRECT, &state, sandbox.clone());
+        let base = managed(8080);
+        let proxy = NoToken(&base);
+        let outcome =
+            up_within(&hangar, "p", &proxy, Duration::ZERO, Duration::ZERO);
+        assert!(format!("{outcome:?}").contains("no token"), "{outcome:?}");
+        assert!(sandbox.created.borrow().is_empty());
+    }
+
+    struct NoToken<'a>(&'a FakeProxy);
+
+    impl Proxy for NoToken<'_> {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        fn egress(&self) -> Egress {
+            self.0.egress
+        }
+        fn ca(&self) -> crate::error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn login(&self, _: &str) -> crate::error::Result<Option<Login>> {
+            Ok(None)
+        }
+        fn health(&self) -> Health {
+            Health::Down("down".into())
+        }
+        fn managed(&self) -> Option<&dyn Managed> {
+            Some(self)
+        }
+    }
+
+    impl Managed for NoToken<'_> {
+        fn vm(&self) -> crate::proxy::ManagedVm {
+            self.0.managed.as_ref().unwrap().vm.clone()
+        }
+        fn fingerprint(&self) -> crate::error::Result<String> {
+            crate::error::bail!("no token")
+        }
+        fn start(
+            &self,
+            _: &dyn crate::sandbox::Sandbox,
+            _: &str,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn log_file(&self) -> std::path::PathBuf {
+            "p.log".into()
+        }
     }
 
     #[test]
@@ -546,6 +634,9 @@ mod tests {
     impl Managed for ComesUp<'_> {
         fn vm(&self) -> crate::proxy::ManagedVm {
             self.0.managed.as_ref().unwrap().vm.clone()
+        }
+        fn fingerprint(&self) -> crate::error::Result<String> {
+            Ok("fake".into())
         }
         fn start(
             &self,

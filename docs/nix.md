@@ -14,12 +14,6 @@ services.hangar = {
   proxies.vault = {
     kind = "infisical";
     run = "managed";
-    # NixOS with agenix (owner = your user, see below):
-    proxyTokenFile = "/run/agenix/infisical-proxy-token";
-    sessionTokenFile = "/run/agenix/infisical-session-token";
-    # nix-darwin: plain files only you can read (chmod 600):
-    # proxyTokenFile = "~/.secrets/infisical-proxy-token";
-    # sessionTokenFile = "~/.secrets/infisical-session-token";
   };
   defaults.proxy = "vault";
   bays = [
@@ -30,18 +24,18 @@ services.hangar = {
 };
 ```
 
-hangar runs as your user (a user service or agent), so it must be able
-to read the token files. agenix's default files are root-owned 0400,
-which it can't: on NixOS set `age.secrets.<name>.owner` to your user. On
-nix-darwin, keep plain files instead:
+The proxy's tokens never go in the Nix config: the first `hangar up`
+asks for them and keeps them in the OS keychain
+([proxy tokens](proxy-kinds.md#proxy-tokens)). On a NixOS machine
+without a keychain (no desktop session), read them from agenix files
+instead, owned by the user who runs hangar:
 
-```sh
-mkdir -p ~/.secrets && chmod 700 ~/.secrets
-# paste each token into its file, then:
-chmod 600 ~/.secrets/infisical-proxy-token ~/.secrets/infisical-session-token
+```nix
+proxies.vault.secrets = {
+  proxy-token.command = [ "cat" "/run/agenix/infisical-proxy-token" ];
+  session-token.command = [ "cat" "/run/agenix/infisical-session-token" ];
+};
 ```
-
-hangar never mounts or copies these files into a bay.
 
 ## Options
 
@@ -72,9 +66,6 @@ plus:
 Each option's description is in `nix/module.nix`. With the module,
 `hangar init` refuses to write a config: change `services.hangar` instead,
 or set `HANGAR_CONFIG` for a separate one.
-
-Token files are **strings**, never Nix paths, so the secrets stay out of
-the Nix store. Keep them readable by the user who runs hangar.
 
 To keep the config in `~/.config/hangar/hangar.json` instead, skip the
 module and install the package, which brings `msb` along:

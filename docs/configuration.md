@@ -53,12 +53,7 @@ other keys belong to the kind:
 ```json
 {
   "proxies": {
-    "vault": {
-      "kind": "infisical",
-      "run": "managed",
-      "proxyTokenFile": "~/.secrets/infisical-proxy-token",
-      "sessionTokenFile": "~/.secrets/infisical-session-token"
-    },
+    "vault": { "kind": "infisical", "run": "managed" },
     "corp": { "kind": "http", "url": "http://127.0.0.1:3128" }
   },
   "defaults": { "proxy": "vault" },
@@ -76,6 +71,10 @@ with no `proxy` and no `defaults.proxy` is an error, so nobody ends up
 direct by omission. The kinds and their keys are in
 [proxy-kinds.md](proxy-kinds.md).
 
+A proxy's own tokens never go in the config. They live in the OS
+keychain (see [Proxy tokens](proxy-kinds.md#proxy-tokens)): `hangar up`
+asks for a missing one, `hangar secret set NAME` replaces them.
+
 ## What `up` changes
 
 `hangar up` applies the config. Some changes need a new VM; `up` then
@@ -90,7 +89,9 @@ Everything else is applied to the running VM and printed as `updated
 
 A recreate keeps the bay's home, its package cache and its data volume.
 Changing `disk` replaces the data volume (`data disk replaced`). A
-managed proxy keeps its data folder.
+managed proxy keeps its data folder, except when its token changed
+(`recreated (fingerprint)`): what it saved belongs to the old token, so
+it starts empty.
 
 ## Where hangar keeps things
 

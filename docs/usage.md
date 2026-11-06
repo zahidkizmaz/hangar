@@ -98,6 +98,7 @@ namespace.
 | `logs [NAME [APP]] [-f]` | hangar's log, a bay's app journal, or a managed proxy's log |
 | `cp SRC DEST` | copies into or out of a running bay (`BAY:PATH` on one side) |
 | `setup BAY APP [--force]` | runs an app's one-time interactive setup |
+| `secret set PROXY [TOKEN]` | asks for a proxy's tokens and keeps them in the OS keychain |
 
 - **`up`** brings each selected bay's proxy up first. A bay whose proxy
   failed is left alone, and any failure makes `up` exit 1 while the rest
@@ -177,7 +178,10 @@ Never write the proxy URL (it carries the bay's login) into
 
 - `ps` exits 3: read its warnings; each names the command that fixes it.
 - `proxy NAME unreachable` or `didn't come up`: `hangar logs NAME` shows a
-  managed proxy's log. For `infisical`, check both token files.
+  managed proxy's log. For `infisical`, check both tokens
+  (`hangar secret set NAME`).
+- `no TOKEN for proxy NAME`: without a terminal, `up` doesn't ask; run
+  `hangar secret set NAME`, or pipe the token into it.
 - An image pull hangs on macOS: `msb` is waiting on
   `docker-credential-osxkeychain` from `~/.docker/config.json`. Run hangar
   with `DOCKER_CONFIG` set to a folder whose `config.json` is `{}`.

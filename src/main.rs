@@ -10,6 +10,7 @@ mod files;
 mod hangar;
 mod http;
 mod json;
+mod keychain;
 mod lifecycle;
 mod lock;
 mod logger;
@@ -17,6 +18,7 @@ mod mounts;
 mod output;
 mod packages;
 mod process;
+mod prompt;
 mod proxy;
 mod sandbox;
 mod secret;
@@ -36,6 +38,7 @@ use dirs::Base;
 use error::Result;
 use hangar::Hangar;
 use output::{Format, Outcome};
+use prompt::Terminal;
 
 /// Sandboxed workspaces for AI agents.
 #[derive(Debug, Parser)]
@@ -148,6 +151,9 @@ enum OnHangar {
         /// Host path or BAY:PATH
         dest: String,
     },
+    /// Manage a proxy's tokens in the OS keychain
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// Run an app's one-time interactive setup in a bay
     Setup {
         /// The bay
@@ -160,6 +166,20 @@ enum OnHangar {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SecretCommand {
+    /// Ask for a proxy's tokens and store them in the keychain
+    #[command(after_help = "Typed unseen on a terminal; otherwise one \
+                            token per line on stdin, in the order the \
+                            proxy kind lists them (docs/proxy-kinds.md).")]
+    Set {
+        /// The proxy
+        proxy: String,
+        /// Only this token, e.g. session-token (default: all)
+        token: Option<String>,
+    },
+}
+
 impl OnHangar {
     fn changes_state(&self) -> bool {
         matches!(
@@ -169,6 +189,7 @@ impl OnHangar {
                 | Self::Restart { .. }
                 | Self::Rm { .. }
                 | Self::Cp { .. }
+                | Self::Secret(_)
                 | Self::Setup { .. }
         )
     }
@@ -229,13 +250,21 @@ fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
     let hangar = &hangar;
     Ok(match command {
         OnHangar::Up { names } => {
-            Outcome::Changes(commands::up(hangar, &names)?)
+            Outcome::Changes(commands::up(hangar, &names, &Terminal)?)
         }
         OnHangar::Down { names } => {
             Outcome::Changes(commands::down(hangar, &names)?)
         }
         OnHangar::Restart { names } => {
-            Outcome::Changes(commands::restart(hangar, &names)?)
+            Outcome::Changes(commands::restart(hangar, &names, &Terminal)?)
+        }
+        OnHangar::Secret(SecretCommand::Set { proxy, token }) => {
+            Outcome::Changes(commands::secret_set(
+                hangar,
+                &proxy,
+                token.as_deref(),
+                &Terminal,
+            )?)
         }
         OnHangar::Rm { name, data, yes } => {
             Outcome::Changes(commands::rm(hangar, &name, data, yes)?)

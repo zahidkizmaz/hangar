@@ -38,18 +38,12 @@ cargo install --git https://github.com/zahidkizmaz/hangar
 hangar init # writes ~/.config/hangar/hangar.json
 ```
 
-Put each token in a file only you can read, then replace
-`~/.config/hangar/hangar.json` with:
+Replace `~/.config/hangar/hangar.json` with:
 
 ```json
 {
   "proxies": {
-    "vault": {
-      "kind": "infisical",
-      "run": "managed",
-      "proxyTokenFile": "~/.secrets/infisical-proxy-token",
-      "sessionTokenFile": "~/.secrets/infisical-session-token"
-    }
+    "vault": { "kind": "infisical", "run": "managed" }
   },
   "defaults": { "proxy": "vault" },
   "bays": [{ "name": "work", "apps": ["claude-code"] }]
@@ -63,7 +57,8 @@ must allow the hosts a bay fetches from
 ([list](docs/proxy-kinds.md#infisical-setup)).
 
 ```sh
-hangar up         # the proxy's VM, then the bay
+hangar up         # asks for the proxy's two tokens once (kept in the
+                  # OS keychain), then starts the proxy's VM and the bay
 hangar ps         # what runs, and anything wrong
 hangar exec work  # a shell in the bay
 ```

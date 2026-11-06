@@ -1,21 +1,26 @@
 //! An Agent Vault that already runs on the host. A bay logs in with a
-//! token the user minted and a vault name: `http://<token>:<vault>@host`.
-
-use std::path::PathBuf;
+//! token the user minted (the proxy's `token` secret) and a vault name:
+//! `http://<token>:<vault>@host`.
 
 use super::ca::CaSpec;
 use super::{
-    Health, Login, Proxy, Spec, external_url, loopback_port, only, read_token,
+    Health, Login, Proxy, Secrets, Slot, Spec, external_url, loopback_port,
+    only,
 };
 use crate::error::Result;
-use crate::files;
 use crate::sandbox::Egress;
 use crate::secret::Secret;
+
+const TOKEN: &str = "token";
+const SLOTS: &[Slot] = &[Slot {
+    key: TOKEN,
+    about: "the Agent Vault token the bays log in with",
+}];
 
 struct AgentVault {
     port: u16,
     ca: CaSpec,
-    token_file: PathBuf,
+    secrets: Secrets,
     vault: String,
 }
 
@@ -34,7 +39,7 @@ impl Proxy for AgentVault {
 
     fn login(&self, _bay: &str) -> Result<Option<Login>> {
         Ok(Some(Login {
-            user: read_token(&self.token_file)?,
+            user: self.secrets.get(TOKEN)?,
             password: Secret::new(self.vault.clone()),
         }))
     }
@@ -43,21 +48,20 @@ impl Proxy for AgentVault {
         super::tcp_health(self.port)
     }
 
-    fn host_secrets(&self) -> Vec<PathBuf> {
-        vec![self.token_file.clone()]
+    fn secrets(&self) -> &'static [Slot] {
+        SLOTS
     }
 }
 
-/// Reads `ca` (required), `tokenFile` and `vault` (default `default`).
+/// Reads `ca` (required) and `vault` (default `default`).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
-    only(fields, &["ca", "tokenFile", "vault"])?;
+    only(fields, &["ca", "vault"])?;
     let port = loopback_port(external_url(spec, "agent-vault")?)?;
-    let token_file = fields.string("tokenFile")?;
     Ok(Box::new(AgentVault {
         port,
         ca: CaSpec::parse(&fields.object("ca")?, spec.home)?,
-        token_file: files::host_path(&token_file, spec.home)?,
+        secrets: spec.secrets.clone(),
         vault: fields.optional_string("vault")?.unwrap_or("default".into()),
     }))
 }
@@ -65,26 +69,37 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     use super::*;
     use crate::config::Fields;
     use crate::json;
+    use crate::keychain::fake::FakeKeychain;
     use crate::proxy::{Health, Location};
     use crate::sandbox::Egress;
-    use crate::testing::scratch_dir;
 
     const CA: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/testdata/ca.pem");
 
-    fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {
+    fn built_with(
+        fields: &str,
+        location: Location,
+        keychain: Rc<FakeKeychain>,
+    ) -> Result<Box<dyn Proxy>> {
         let value = json::parse(fields).unwrap();
+        let fields = Fields::new(&value, "proxies.av")?;
         let spec = Spec {
-            fields: Fields::new(&value, "proxies.av")?,
+            secrets: Secrets::new("av", keychain, &fields)?,
+            fields,
             location,
             home: Path::new("/home/u"),
             data: PathBuf::from("/data/av"),
         };
-        build(&spec)
+        super::super::build(&spec)
+    }
+
+    fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {
+        built_with(fields, location, Rc::new(FakeKeychain::default()))
     }
 
     fn external() -> Location {
@@ -92,23 +107,22 @@ mod tests {
     }
 
     fn with_token(token: &str, extra: &str) -> Result<Box<dyn Proxy>> {
-        let file = scratch_dir("agent-vault-token").join("token");
-        std::fs::write(&file, token).unwrap();
-        built(
+        let keychain = FakeKeychain::holding(&[("av/token", token)]);
+        built_with(
             &format!(
-                r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}},
-                    "tokenFile": "{}"{extra}}}"#,
-                file.display()
+                r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}}{extra}}}"#
             ),
             external(),
+            Rc::new(keychain),
         )
     }
 
     #[test]
-    fn agent_vault_login_from_token_file() {
-        let proxy = with_token("av_tok-1\n", "").unwrap();
+    fn agent_vault_login_from_its_token() {
+        let proxy = with_token("av_tok-1", "").unwrap();
         assert_eq!(proxy.kind(), "agent-vault");
         assert_eq!(proxy.egress(), Egress::HostPort(14322));
+        assert_eq!(proxy.secrets(), SLOTS);
         let login = proxy.login("work").unwrap().unwrap();
         assert_eq!(login.user.expose(), "av_tok-1");
         assert!(!format!("{:?}", login.user).contains("av_tok"));
@@ -124,10 +138,9 @@ mod tests {
 
     #[test]
     fn agent_vault_requires_ca() {
-        let error =
-            built(r#"{"kind": "agent-vault", "tokenFile": "/t"}"#, external())
-                .err()
-                .unwrap();
+        let error = built(r#"{"kind": "agent-vault"}"#, external())
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), "proxies.av.ca: missing");
     }
 
@@ -143,37 +156,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_vault_token_file_missing_names_path() {
-        let proxy = built(
-            &format!(
-                r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}},
-                    "tokenFile": "/nope/token"}}"#
-            ),
-            external(),
-        )
-        .unwrap();
-        assert_eq!(proxy.host_secrets(), [PathBuf::from("/nope/token")]);
+    fn agent_vault_missing_token_says_how_to_set_it() {
+        let fields =
+            format!(r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}}}}"#);
+        let proxy = built(&fields, external()).unwrap();
         let error = proxy.login("work").err().unwrap();
-        assert!(error.to_string().starts_with("/nope/token: "), "{error}");
-    }
-
-    #[test]
-    fn agent_vault_empty_token_file_is_an_error() {
-        for empty in ["", "\n", " \r\n"] {
-            let proxy = with_token(empty, "").unwrap();
-            let error = proxy.login("work").err().unwrap().to_string();
-            assert!(error.ends_with("/token is empty"), "{error}");
-        }
+        assert!(
+            error.to_string().starts_with("no token for proxy av in "),
+            "{error}"
+        );
+        assert_eq!(error.hint(), Some("run 'hangar secret set av'"));
     }
 
     #[test]
     fn agent_vault_health_is_a_tcp_connect() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let fields = format!(
-            r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}},
-                "tokenFile": "/t"}}"#
-        );
+        let fields =
+            format!(r#"{{"kind": "agent-vault", "ca": {{"file": "{CA}"}}}}"#);
         let url = format!("http://127.0.0.1:{port}");
         let proxy = built(&fields, Location::External(url)).unwrap();
         assert!(matches!(proxy.health(), Health::Up));

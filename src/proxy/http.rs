@@ -63,8 +63,10 @@ mod tests {
 
     fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {
         let value = json::parse(fields).unwrap();
+        let fields = Fields::new(&value, "proxies.p")?;
         let spec = Spec {
-            fields: Fields::new(&value, "proxies.p")?,
+            secrets: crate::testing::no_secrets(&fields),
+            fields,
             location,
             home: Path::new("/home/u"),
             data: PathBuf::from("/data/p"),
@@ -90,7 +92,7 @@ mod tests {
         assert_eq!(proxy.kind(), "http");
         assert_eq!(proxy.egress(), Egress::HostPort(3128));
         assert!(proxy.managed().is_none());
-        assert_eq!(proxy.host_secrets(), Vec::<std::path::PathBuf>::new());
+        assert_eq!(proxy.secrets(), &[]);
     }
 
     #[test]

@@ -22,7 +22,7 @@ Everything here works without a terminal. Add `--json` to any command
 
 `exec` replaces hangar with the shell, so its exit code is the command's.
 
-`up`, `down`, `restart`, `rm`, `cp` and `setup` hold a lock
+`up`, `down`, `restart`, `rm`, `cp`, `secret` and `setup` hold a lock
 (`$XDG_STATE_HOME/hangar/lock`); a second one waits until the first is
 done. `ps`, `inspect`, `logs`, `exec` and `init` never wait.
 
@@ -34,7 +34,7 @@ order isn't significant.
 
 | Command | `--json` |
 | --- | --- |
-| `up`, `down`, `restart`, `rm` | the changes, below |
+| `up`, `down`, `restart`, `rm`, `secret set` | the changes, below |
 | `ps` | the overview, below |
 | `inspect NAME` | the detail, below |
 | `cp` | `{"version":1,"copied":[…],"removed":[…]}` |
@@ -146,7 +146,8 @@ An external proxy has `state`, `image`, `vm` and `log` `null`.
 ## Rules
 
 - Never pass a secret as an argument, in `env` or through a `copy` mount.
-  Secrets belong in the proxy, and token files stay on the host.
+  Secrets belong in the proxy; its own tokens stay in the host's
+  keychain.
 - Never mount a directory a host program reads config from as writable;
   hangar refuses the known ones, but a dedicated directory is the rule.
 - `rm --data` needs `--yes` without a terminal.
