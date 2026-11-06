@@ -25,17 +25,9 @@ services.hangar = {
 ```
 
 The proxy's tokens never go in the Nix config: the first `hangar up`
-asks for them and keeps them in the OS keychain
-([proxy tokens](proxy-kinds.md#proxy-tokens)). On a NixOS machine
-without a keychain (no desktop session), read them from agenix files
-instead, owned by the user who runs hangar:
-
-```nix
-proxies.vault.secrets = {
-  proxy-token.command = [ "cat" "/run/agenix/infisical-proxy-token" ];
-  session-token.command = [ "cat" "/run/agenix/infisical-session-token" ];
-};
-```
+asks for them and keeps them in the OS keychain. Without a keychain (no
+desktop session), a proxy's `secrets` can name a command that prints
+each token instead ([proxy tokens](proxy-kinds.md#proxy-tokens)).
 
 ## Options
 
@@ -93,7 +85,7 @@ either way. `HANGAR_LOG=debug` raises its level.
 ## Local images
 
 - Nix: a bay's `imagePackage = inputs.hangar.packages.${pkgs.system}.bay-image;`
-  builds the image and loads it into microsandbox once per build. The
+  builds the image and loads it into the sandbox once per build. The
   image is Linux only: on macOS use
   `inputs.hangar.packages.aarch64-linux.bay-image`, which needs a Linux
   builder, e.g. nix-darwin's `nix.linux-builder.enable = true;`.

@@ -2,7 +2,7 @@
 
 ## VMs and request flow
 
-Every VM is a microsandbox VM:
+Every VM runs on the sandbox backend, msb (microsandbox) by default:
 
 - `hangar-bay-<name>`, a bay, where agents run. With a proxy, its only
   outbound path is that proxy's port on the host's loopback: bay →
@@ -22,8 +22,8 @@ they answer.
 is one file, `src/proxy/<kind>.rs`; nothing else in `src/` names one
 (`no_core_module_names_a_kind`). `config.rs` checks each entry's `kind`
 and location; `Hangar::load` calls the kind's `build` with a `Spec` (the
-entry's fields, its location, the user's home and the proxy's data
-folder), so a kind checks its own keys when the config loads.
+entry's fields, its location, the user's home, the proxy's data folder
+and its `Secrets`), so a kind checks its own keys when the config loads.
 
 The core never trusts a kind with the security-critical parts:
 
@@ -42,10 +42,10 @@ Kinds and how to add one: [proxy-kinds.md](proxy-kinds.md).
 ## The egress spec
 
 `VmSpec.egress` is backend-neutral: `Egress::Open`, or
-`Egress::HostPort(port)`, one port on the host and nothing else. msb
-turns `HostPort` into `--no-net --net-rule allow@host:tcp:<port>`, plus an
-ingress rule per published port. The record stores it as `open` or
-`host:<port>`.
+`Egress::HostPort(port)`, one port on the host and nothing else. The
+msb backend turns `HostPort` into
+`--no-net --net-rule allow@host:tcp:<port>`, plus an ingress rule per
+published port. The record stores it as `open` or `host:<port>`.
 
 ## `hangar up`
 
@@ -66,7 +66,7 @@ egress, mounts, ports, resources and, for a managed proxy, a fingerprint.
 - any field differs → recreate, with the fields as reasons;
 - stopped → start; running → keep.
 
-A recreate stops the VM first (`msb rm` is a hard kill), removes it and
+A recreate stops the VM first (removing is a hard kill), removes it and
 creates it again. The home, the package cache and the bay's data volume
 outlive it; a changed `disk` also replaces the data volume. A VM whose
 create failed has no record, so the next `up` recreates it.
@@ -75,8 +75,8 @@ create failed has no record, so the next `up` recreates it.
 
 `proxy::managed::up`: plan and create the VM (`Managed::vm()`; the record
 holds `Managed::fingerprint()`, e.g. a hash of the proxy token, and a new
-one recreates the VM with empty mounts), and if the proxy
-doesn't answer yet (`health`), wait until exec works, run
+one recreates the VM with empty mounts), and if the proxy doesn't answer
+yet (`health`), wait until exec works, run
 `Managed::start` and wait up to 60 seconds for it to come up. An external
 proxy is only health-checked.
 
@@ -87,7 +87,7 @@ proxy is only health-checked.
 1. **vm**: resolve and check the mounts (see [Mounts](#mounts)), then
    plan. A new VM gets its image (loaded first through `imageLoader`
    when set), the data volume `hangar-bay-<name>-data` at
-   `/var/lib/pilot`, `--init /sbin/init`, the egress and the published
+   `/var/lib/pilot`, `/sbin/init` as its init, the egress and the published
    ports.
 2. **boot**: wait up to 2 minutes until systemd says `running` or
    `degraded`.
@@ -111,7 +111,7 @@ proxy is only health-checked.
 
 `down` stops bays, then proxies. `restart` is `down`, then `up`. `rm`
 stops and removes the VM; with `--data` it also deletes the bay's folder
-and data volume, or the proxy's folder.
+and data volume, or the proxy's folder and its keychain tokens.
 
 ### Package reconcile
 
@@ -186,7 +186,7 @@ DB) behind `/sbin/init`. Its `Env` is only
 `PATH=/run/wrappers/bin:/run/current-system/sw/bin`, the `PATH` of root's
 `sh -c` steps, so it never holds hangar's profile.
 
-- Boot: `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
+- Boot (msb): `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
   VM (mounts, network, `/etc/hosts`, `resolv.conf`), appends to
   `/etc/profile` and the CA bundle, then execs `/sbin/init`. Both
   appended files are copies, so the append never writes into the store.
@@ -197,7 +197,7 @@ DB) behind `/sbin/init`. Its `Env` is only
   unit watches that file and restarts both when hangar replaces it; it
   resets docker's start limit first, since boot and the first proxy env
   already use two of its three starts a minute.
-- Shells: `msb exec` is no PAM login, so `environment.extraInit` sets
+- Shells: a sandbox exec is no PAM login, so `environment.extraInit` sets
   `USER`, `LOGNAME` and `XDG_RUNTIME_DIR` and sources `proxy.env` and
   `bay.env` with `set -a`.
 - Privileges left: `newuidmap`/`newgidmap` for rootless Docker and
@@ -244,6 +244,9 @@ refuses two things publishing one host port. No code outside
   the log.
 - `src/secret.rs`: `Secret` (redacting `Debug`, no `Display`) and the
   secret scan `env` and copies share.
+- `src/keychain.rs`: the OS keychain (`security`, `secret-tool`);
+  `src/proxy/secrets.rs`: a proxy's tokens, from it or a command;
+  `src/prompt.rs`: asking for a token or a confirmation.
 - `src/http.rs`, `src/process.rs`, `src/json.rs`, `src/error.rs`: helpers.
 - `config/defaults.json`, `config/apps/*.json`: the only copy of the
   defaults and the built-in apps.

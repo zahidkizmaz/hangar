@@ -45,7 +45,8 @@ macOS). Raise the floor as tests are added; never lower it.
 
 ## Fakes
 
-No test touches a real VM, the network, `$HOME` or `~/.config`:
+No test touches a real VM, the network, `$HOME`, `~/.config` or the OS
+keychain:
 
 - `sandbox::fake::FakeSandbox`: an in-process sandbox that records every
   call, for the orchestration tests.
@@ -57,6 +58,11 @@ No test touches a real VM, the network, `$HOME` or `~/.config`:
   `fail-<step>` file triggers a failure. Tests assert on argv and files,
   so they also prove secrets stay off the command line. A real `msb` on
   `PATH` is hidden from them.
+- `keychain::fake::FakeKeychain` and `prompt::fake::FakePrompt`: an
+  in-memory keychain and scripted answers, for token handling.
+- `tests/fakes/keychain.sh`: stands in for `security` / `secret-tool` in
+  `tests/cli.rs`, keeping items as files. Only debug builds take it
+  (`HANGAR_TEST_KEYCHAIN_TOOL`); the release build checks that.
 - `testing::serve_each`: a loopback HTTP server answering one request per
   canned response, for CA downloads and health probes.
 - XDG variables point at a scratch dir in every test.
@@ -69,6 +75,7 @@ They need msb and must never touch real state or the user's VMs:
 export XDG_DATA_HOME=$(mktemp -d) XDG_CACHE_HOME=$(mktemp -d) \
   XDG_STATE_HOME=$(mktemp -d)
 export HANGAR_CONFIG=$XDG_DATA_HOME/hangar.json # a scratch config
+export HANGAR_KEYCHAIN_SERVICE=hangar-e2e # keeps test tokens apart
 hangar up && hangar ps
 hangar rm NAME --data --yes # for each bay and proxy
 ```
@@ -76,7 +83,7 @@ hangar rm NAME --data --yes # for each bay and proxy
 Use bay and proxy names no real config uses: VM names are
 `hangar-bay-<name>` and `hangar-proxy-<name>`. A bay boots its systemd, so
 it needs the bay image, published or through `imageLoader`. Use test
-tokens only.
+tokens only; `rm NAME --data` deletes them from the keychain again.
 
 ## Logging
 

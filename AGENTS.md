@@ -1,7 +1,7 @@
 # AGENTS.md
 
 hangar is a Rust CLI that runs AI coding agents in locked-down sandbox
-VMs (microsandbox), the bays. A bay's only way out is a named proxy
+VMs, the bays, on a pluggable backend (microsandbox by default). A bay's only way out is a named proxy
 (`src/proxy/<kind>.rs`), which holds the real credentials, or, with
 `"proxy": null`, the open internet. User docs: `README.md` (short
 overview), `docs/usage.md`, `docs/configuration.md`,
@@ -15,11 +15,14 @@ overview), `docs/usage.md`, `docs/configuration.md`,
 - A proxy's login reaches a bay only inside `/etc/hangar/proxy.env`,
   written as root over stdin (root:pilot 0640). Enrolment tokens and CA
   keys never enter a bay.
+- A proxy's own tokens live in the OS keychain (`src/keychain.rs`) or
+  come from a command the config names; never in the config, a file of
+  hangar's or a bay. Only debug builds accept a fake keychain tool.
 - Proxy kinds live only in `src/proxy/<kind>.rs` plus one line in
   `proxy::kinds()`. Nothing else in `src/` names a kind or branches on
   one (`no_core_module_names_a_kind`). Optional capabilities return
   `Option`, never an "unsupported" error.
-- Managed proxies run only in their own msb VM (`hangar-proxy-<name>`),
+- Managed proxies run only in their own VM (`hangar-proxy-<name>`),
   with mounts only under their own data folder.
 - One egress: a bay with a proxy is created with
   `Egress::HostPort(proxy.egress())` and nothing else; direct bays and
@@ -74,8 +77,9 @@ overview), `docs/usage.md`, `docs/configuration.md`,
 - Pure logic unit-tested, I/O at the edges; errors name the item and
   carry a hint.
 - Tests cover all code and use fakes only (`FakeSandbox`, `FakeProxy`,
-  `tests/fakes/msb.sh`, loopback servers, XDG in a scratch dir): never a
-  real VM, the network, `$HOME` or the user's config.
+  `FakeKeychain`, `FakePrompt`, `tests/fakes/msb.sh`,
+  `tests/fakes/keychain.sh`, loopback servers, XDG in a scratch dir):
+  never a real VM, the network, `$HOME`, the user's config or keychain.
 - Docs move with the code: a stale doc is a bug. `README.md` stays a
   short overview; no design docs in the repo.
 - Comments only for genuine traps; 80 columns.

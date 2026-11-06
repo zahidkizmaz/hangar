@@ -40,8 +40,7 @@ digits joined by single `-`, at most 32 characters.
 
 `env` keys are `UPPER_SNAKE_CASE`. hangar refuses the ones it sets itself
 (`PATH`, `HOME`, the proxy and CA variables, the `NIX_*` ones it uses,
-`HANGAR_*`)
-and values that look like real secrets.
+`HANGAR_*`) and values that look like real secrets.
 
 ## Proxies
 

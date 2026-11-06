@@ -1,6 +1,7 @@
 # Using hangar
 
-hangar runs [microsandbox](https://microsandbox.dev) VMs on your machine:
+hangar runs VMs on your machine, with
+[microsandbox](https://microsandbox.dev) by default:
 
 ```
  your machine (macOS / Linux)
@@ -44,8 +45,11 @@ blocked by the sandbox.
 On NixOS or nix-darwin, use the module: it installs hangar and
 microsandbox (see [nix.md](nix.md)).
 
-Otherwise install [microsandbox](https://microsandbox.dev) (`msb`); on
-Linux you also need access to `/dev/kvm`. hangar is a single binary.
+Otherwise install [microsandbox](https://microsandbox.dev) (`msb`). On
+Linux you also need access to `/dev/kvm` and, for proxy tokens,
+`/usr/bin/secret-tool` with a running Secret Service (a desktop session
+has one). Arch's `libsecret` ships it; on Debian and Ubuntu install
+`libsecret-tools`. hangar is a single binary.
 
 ```sh
 brew install superradcompany/tap/microsandbox # or see microsandbox.dev
@@ -75,7 +79,7 @@ hangar ps    # state, proxy and image of each bay and proxy
 ```
 vault: created
 work: recreated (image, mounts)
-docs: updated (packages nixpkgs#rtk; started paperclip)
+docs: updated (packages +rtk; started paperclip)
 scratch: unchanged
 ```
 
@@ -118,7 +122,7 @@ namespace.
   journal of its apps (the last 200 lines); with a managed proxy, its log.
   `-f` keeps following.
 
-`up`, `down`, `restart`, `rm`, `cp` and `setup` hold a lock
+`up`, `down`, `restart`, `rm`, `cp`, `secret set` and `setup` hold a lock
 (`$XDG_STATE_HOME/hangar/lock`); a second one logs `waiting for another
 hangar` and goes on once the first is done.
 

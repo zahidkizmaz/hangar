@@ -28,8 +28,8 @@ the bay holds placeholders.
 ## Quick start
 
 You need [microsandbox](https://microsandbox.dev) (`msb`); on Linux also
-access to `/dev/kvm`. You also need Infisical Agent Vault set up, with a
-proxy token and a session token (see
+access to `/dev/kvm` and `secret-tool` (libsecret). You also need
+Infisical Agent Vault set up, with a proxy token and a session token (see
 [docs/proxy-kinds.md](docs/proxy-kinds.md#infisical)).
 
 ```sh
