@@ -4,8 +4,8 @@ hangar talks to its sandbox only through the `Sandbox` trait in
 `src/sandbox/mod.rs`: `describe`/`state`, `create(&VmSpec)`, `start`,
 `stop`, `remove`, `ensure_volume`, `remove_volume`, `copy_out`, `exec`,
 `shell`, `image_present`, `load_image` and `host_address`. `VmSpec` says
-what a VM gets in backend-neutral terms: `Egress::HostPort(port)` or
-`Egress::Open`, published ports, mounts with a `MountMode` and an
+what a VM gets in backend-neutral terms: `Egress::HostPort(port)`,
+`Egress::Open` or `Egress::OpenAndHostPort(port)`, published ports, mounts with a `MountMode` and an
 optional owner, non-secret env, the root disk size, an entrypoint
 override, named volumes that need a filesystem of their own (not an
 overlay) and an `init` to hand PID 1 to.

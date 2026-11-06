@@ -29,7 +29,7 @@ The core never trusts a kind with the security-critical parts:
 
 | Invariant | Enforcement |
 | --- | --- |
-| one egress per bay | a bay with a proxy is created with `Egress::HostPort(proxy.egress())`; direct bays and managed proxies get `Egress::Open` |
+| one egress per bay | a bay with a proxy is created with `Egress::HostPort(proxy.egress())`; direct bays and managed proxies get `Egress::Open`, a managed proxy with an upstream on this machine `Egress::OpenAndHostPort(port)` |
 | egress fixed at create | the VM record holds the egress; a different one recreates the VM |
 | managed proxies in their own VM | `proxy::managed` creates `hangar-proxy-<name>` from `Managed::vm()`; its mounts must resolve under the proxy's data folder |
 | the CA a bay trusts | `proxy::access` checks it is exactly one PEM certificate (`ca::verify`), pinned when the kind sets `sha256` |
@@ -41,11 +41,13 @@ Kinds and how to add one: [proxy-kinds.md](proxy-kinds.md).
 
 ## The egress spec
 
-`VmSpec.egress` is backend-neutral: `Egress::Open`, or
-`Egress::HostPort(port)`, one port on the host and nothing else. The
-msb backend turns `HostPort` into
-`--no-net --net-rule allow@host:tcp:<port>`, plus an ingress rule per
-published port. The record stores it as `open` or `host:<port>`.
+`VmSpec.egress` is backend-neutral: `Egress::Open`,
+`Egress::HostPort(port)`, one port on the host and nothing else, or
+`Egress::OpenAndHostPort(port)`, both. The msb backend turns `HostPort`
+into `--no-net --net-rule allow@host:tcp:<port>`, plus an ingress rule
+per published port, and `OpenAndHostPort` into `allow@public` and that
+host rule. The record stores it as `open`, `host:<port>` or
+`open+host:<port>`.
 
 ## `hangar up`
 

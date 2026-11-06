@@ -185,7 +185,7 @@ pub(crate) fn check_ports(
     let proxies = proxies.iter().flat_map(|(name, proxy)| {
         let egress = match proxy.egress() {
             Egress::HostPort(port) => Some(port),
-            Egress::Open => None,
+            Egress::Open | Egress::OpenAndHostPort(_) => None,
         };
         let published = proxy.managed().map(|managed| managed.vm().publish.0);
         let shareable = published.is_none();

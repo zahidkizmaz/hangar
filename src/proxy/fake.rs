@@ -51,6 +51,7 @@ impl FakeManaged {
             publish: (port, port),
             mounts: Vec::new(),
             entrypoint: None,
+            host_port: None,
         };
         Self {
             vm,

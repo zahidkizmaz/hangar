@@ -68,6 +68,15 @@ pub(crate) struct ManagedVm {
     pub(crate) mounts: Vec<(PathBuf, String, MountMode)>,
     /// An `--entrypoint` override, for images that need one.
     pub(crate) entrypoint: Option<String>,
+    /// A port on the host it reaches besides the internet, for an
+    /// upstream on this machine.
+    pub(crate) host_port: Option<u16>,
+}
+
+impl ManagedVm {
+    pub(crate) fn egress(&self) -> Egress {
+        self.host_port.map_or(Egress::Open, Egress::OpenAndHostPort)
+    }
 }
 
 #[derive(Debug, Clone)]

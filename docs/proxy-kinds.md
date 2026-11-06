@@ -52,7 +52,7 @@ proxy, managed by hangar in its own VM.
 | Key | Default |
 | --- | --- |
 | `run` | must be `"managed"` |
-| `domain` | none: your Infisical instance's URL, passed as `--domain` |
+| `domain` | none: your Infisical instance's URL, passed as `--domain`; one on this machine (`http://127.0.0.1:<port>`) is reached through the host, and its VM may reach that port |
 | `hostPort` | `17323`: the host port the proxy is published on (`127.0.0.1` only) |
 | `image` | `infisical/cli:0.45.3`, pinned by digest |
 

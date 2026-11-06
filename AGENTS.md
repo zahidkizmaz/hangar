@@ -26,7 +26,8 @@ overview), `docs/usage.md`, `docs/configuration.md`,
   with mounts only under their own data folder.
 - One egress: a bay with a proxy is created with
   `Egress::HostPort(proxy.egress())` and nothing else; direct bays and
-  managed proxies get `Egress::Open`. Remote (non-loopback) proxies are
+  managed proxies get `Egress::Open`, plus one host port
+  (`OpenAndHostPort`) for a managed proxy whose upstream is local. Remote (non-loopback) proxies are
   refused until the egress spec supports them.
 - An existing VM whose record (`bays/<name>/vm`, `proxies/<name>/vm`)
   doesn't match is recreated, never used. `up` prints why. A VM-level

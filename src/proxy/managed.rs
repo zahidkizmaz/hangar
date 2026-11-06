@@ -11,7 +11,7 @@ use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::lifecycle::{self, Outcome, Plan, step};
 use crate::mounts;
-use crate::sandbox::{BoxState, Egress, Mount, MountMode, VmSpec};
+use crate::sandbox::{BoxState, Mount, MountMode, VmSpec};
 use crate::state::write_private;
 use crate::vm_record::VmRecord;
 
@@ -165,7 +165,7 @@ pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
     };
     VmRecord {
         image: Some(vm.image.clone()),
-        egress: Some(Egress::Open.record()),
+        egress: Some(vm.egress().record()),
         resources: Some(lifecycle::resources(vm.cpus, &vm.memory, None)),
         fingerprint: Some(fingerprint),
         ports: vec![("proxy".into(), host, guest)],
@@ -252,7 +252,7 @@ fn create(
         entrypoint: vm.entrypoint.as_deref(),
         volumes: &[],
         init: None,
-        egress: Egress::Open,
+        egress: vm.egress(),
         publish: &[vm.publish],
         mounts: &mounts,
         env: &[],
@@ -328,6 +328,22 @@ mod tests {
         let vm = &mut proxy.managed.as_mut().unwrap().vm;
         vm.mounts = vec![(host.into(), "/data".into(), MountMode::ReadWrite)];
         proxy
+    }
+
+    #[test]
+    fn a_managed_proxy_that_needs_a_host_port_gets_it_besides_the_internet() {
+        let state = scratch_dir("managed-host-port");
+        let sandbox = Rc::new(FakeSandbox::default());
+        let mut proxy = managed(8080);
+        proxy.managed.as_mut().unwrap().vm.host_port = Some(9000);
+        assert_eq!(run(&state, &sandbox, &proxy), "Created");
+        assert_eq!(
+            sandbox.created.borrow()[0].egress,
+            Egress::OpenAndHostPort(9000)
+        );
+        proxy.managed.as_mut().unwrap().vm.host_port = None;
+        assert_eq!(run(&state, &sandbox, &proxy), r#"Recreated(["proxy"])"#);
+        assert_eq!(sandbox.created.borrow()[1].egress, Egress::Open);
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub(crate) enum Egress {
     Open,
     /// Only this port on the host: a bay, to its proxy.
     HostPort(u16),
+    /// The internet plus this port on the host: a managed proxy whose
+    /// upstream runs on this machine.
+    OpenAndHostPort(u16),
 }
 
 impl Egress {
@@ -46,17 +49,21 @@ impl Egress {
         match self {
             Self::Open => "open".into(),
             Self::HostPort(port) => format!("host:{port}"),
+            Self::OpenAndHostPort(port) => format!("open+host:{port}"),
         }
     }
 
     pub(crate) fn from_record(text: &str) -> Option<Self> {
+        let port = |port: &str| {
+            port.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| port.parse().ok())
+                .flatten()
+        };
         match text.split_once(':') {
             None if text == "open" => Some(Self::Open),
-            Some(("host", port))
-                if port.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                port.parse().ok().map(Self::HostPort)
-            }
+            Some(("host", text)) => port(text).map(Self::HostPort),
+            Some(("open+host", text)) => port(text).map(Self::OpenAndHostPort),
             _ => None,
         }
     }
@@ -205,10 +212,24 @@ mod tests {
     fn egress_record_round_trips() {
         assert_eq!(Egress::Open.record(), "open");
         assert_eq!(Egress::HostPort(5).record(), "host:5");
-        for egress in [Egress::Open, Egress::HostPort(5)] {
+        assert_eq!(Egress::OpenAndHostPort(5).record(), "open+host:5");
+        for egress in [
+            Egress::Open,
+            Egress::HostPort(5),
+            Egress::OpenAndHostPort(5),
+        ] {
             assert_eq!(Egress::from_record(&egress.record()), Some(egress));
         }
-        for text in ["host:x", "host:+5", "host:", "remote:a:1", "", "host"] {
+        for text in [
+            "host:x",
+            "host:+5",
+            "host:",
+            "remote:a:1",
+            "",
+            "host",
+            "open+host:x",
+            "open+",
+        ] {
             assert_eq!(Egress::from_record(text), None, "{text}");
         }
     }

@@ -232,15 +232,26 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
     if let Some(disk) = spec.disk {
         args.extend(["--root-disk".into(), disk.into()]);
     }
-    if let Egress::HostPort(port) = spec.egress {
-        args.push("--no-net".into());
-        args.extend(["--net-rule".into(), format!("allow@host:tcp:{port}")]);
-        // Trap: forwarded connections don't count as `host`, so ingress to
-        // published ports must be `any`; they still bind to host loopback.
-        for (_, guest) in spec.publish {
-            args.push("--net-rule".into());
-            args.push(format!("allow:ingress@any:tcp:{guest}"));
+    match spec.egress {
+        Egress::Open => {}
+        Egress::HostPort(port) => {
+            args.push("--no-net".into());
+            args.extend(["--net-rule".into(), host_rule(port)]);
+            // Trap: forwarded connections don't count as `host`, so ingress
+            // to published ports must be `any`; they still bind to host
+            // loopback.
+            for (_, guest) in spec.publish {
+                args.push("--net-rule".into());
+                args.push(format!("allow:ingress@any:tcp:{guest}"));
+            }
         }
+        // Trap: any rule drops msb's implicit `allow@public`.
+        Egress::OpenAndHostPort(port) => args.extend([
+            "--net-rule".into(),
+            "allow@public".into(),
+            "--net-rule".into(),
+            host_rule(port),
+        ]),
     }
     for (host, guest) in spec.publish {
         args.extend(["-p".into(), format!("127.0.0.1:{host}:{guest}")]);
@@ -265,6 +276,10 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
         args.extend(["-e".into(), (*var).into()]);
     }
     args
+}
+
+fn host_rule(port: u16) -> String {
+    format!("allow@host:tcp:{port}")
 }
 
 fn named_volume(volume: &Volume) -> String {
@@ -442,6 +457,32 @@ mod tests {
             "--mount-file",
             "/h/.gitconfig:/home/pilot/.gitconfig:ro,uid=1000,gid=1000"
         ]));
+    }
+
+    #[test]
+    fn open_and_host_port_allows_the_internet_and_one_host_port() {
+        let spec = VmSpec {
+            name: "n",
+            image: "img",
+            cpus: 1,
+            memory: "1G",
+            disk: None,
+            entrypoint: None,
+            volumes: &[],
+            init: None,
+            egress: Egress::OpenAndHostPort(8080),
+            publish: &[(17323, 17323)],
+            mounts: &[],
+            env: &[],
+        };
+        let args = create_args(&spec);
+        let rules: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--net-rule")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(rules, ["allow@public", "allow@host:tcp:8080"]);
+        assert!(!args.contains(&"--no-net".to_string()));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::{
     Health, Location, Login, Managed, ManagedVm, Proxy, Secrets, Slot, Spec,
     only,
 };
-use crate::error::{Result, bail};
+use crate::error::{Context, Error, Result, bail};
 use crate::http;
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
@@ -54,6 +54,8 @@ struct Infisical {
     image: String,
     host_port: u16,
     domain: String,
+    /// The port of an Infisical on this machine (a loopback `domain`).
+    local_port: Option<u16>,
     secrets: Secrets,
     data: PathBuf,
 }
@@ -117,6 +119,7 @@ impl Managed for Infisical {
                 MountMode::ReadWrite,
             )],
             entrypoint: Some(ENTRYPOINT.into()),
+            host_port: self.local_port,
         }
     }
 
@@ -128,8 +131,11 @@ impl Managed for Infisical {
     fn start(&self, sandbox: &dyn Sandbox, vm: &str) -> Result<()> {
         let token = self.secrets.get(PROXY_TOKEN)?;
         let token = format!("{}\n", token.expose());
-        let command =
-            ["/bin/sh", "-c", START, "hangar-infisical", &self.domain];
+        let domain = match self.local_port {
+            Some(port) => format!("http://{}:{port}", sandbox.host_address()),
+            None => self.domain.clone(),
+        };
+        let command = ["/bin/sh", "-c", START, "hangar-infisical", &domain];
         sandbox.exec(vm, None, &command, Some(token.as_bytes()))?;
         Ok(())
     }
@@ -151,13 +157,28 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     } else {
         PORT
     };
+    let domain = fields.optional_string("domain")?.unwrap_or_default();
+    let local_port = local_port(&domain)
+        .map_err(|why| Error::new(format!("{}: {why}", fields.at("domain"))))?;
     Ok(Box::new(Infisical {
         image: fields.optional_string("image")?.unwrap_or(IMAGE.into()),
         host_port,
-        domain: fields.optional_string("domain")?.unwrap_or_default(),
+        domain,
+        local_port,
         secrets: spec.secrets.clone(),
         data: spec.data.clone(),
     }))
+}
+
+/// The port of a loopback `domain`, which the proxy's VM reaches on the
+/// host; `None` for any other.
+fn local_port(domain: &str) -> Result<Option<u16>> {
+    match http::http_authority(domain) {
+        Some((host, port)) if http::is_loopback_host(&host) => port
+            .context(format!("{domain}: expected http://127.0.0.1:<port>"))
+            .map(Some),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +262,30 @@ mod tests {
         assert!(calls[0].starts_with("exec vm /bin/sh -c "), "{calls:?}");
         assert!(!calls[0].contains("SECRET"), "{calls:?}");
         assert!(!calls[0].contains("--proxy-token"), "{calls:?}");
+    }
+
+    #[test]
+    fn a_local_infisical_is_reached_through_the_host_alias_and_its_port() {
+        let setup = Setup::new("infisical-local");
+        let domain = r#", "domain": "http://127.0.0.1:8080""#;
+        let proxy = setup.built(domain).unwrap();
+        assert_eq!(proxy.managed().unwrap().vm().host_port, Some(8080));
+        let sandbox = started(proxy.as_ref());
+        let call = &sandbox.calls.borrow()[0];
+        assert!(
+            call.ends_with(" hangar-infisical http://host.fake:8080"),
+            "{call}"
+        );
+        let remote = r#", "domain": "https://eu.infisical.com""#;
+        let proxy = setup.built(remote).unwrap();
+        assert_eq!(proxy.managed().unwrap().vm().host_port, None);
+        let portless = r#", "domain": "http://localhost""#;
+        let error = setup.built(portless).err().unwrap().to_string();
+        assert_eq!(
+            error,
+            "proxies.infi.domain: http://localhost: expected \
+             http://127.0.0.1:<port>"
+        );
     }
 
     #[test]
