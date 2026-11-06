@@ -1,3 +1,7 @@
+# shellcheck shell=sh
+# Run with a "#!/bin/sh" and "missing=<exit code>" line before it, the code
+# the real tool exits with when an item is not there (tests/fakes/mod.rs).
+# shellcheck disable=SC2154
 # A fake macOS `security` / Linux `secret-tool`: each item is a file in
 # $HANGAR_FAKE/keychain, named by its account with '/' as '%'.
 dir=$HANGAR_FAKE/keychain
