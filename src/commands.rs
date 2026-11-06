@@ -316,9 +316,10 @@ pub(crate) fn rm(
     name: &str,
     data: bool,
     yes: bool,
+    prompt: &dyn Prompt,
 ) -> Result<UpReport> {
     let doomed = doomed(hangar, name)?;
-    if data && !yes && !confirm(name, &doomed)? {
+    if data && !yes && !confirm(name, &doomed, prompt)? {
         bail!("not confirmed: nothing was removed");
     }
     let outcome = remove(hangar, &doomed, data)
@@ -353,9 +354,8 @@ fn remove(hangar: &Hangar, doomed: &Doomed, data: bool) -> Result<()> {
     Ok(())
 }
 
-/// The one prompt hangar shows; it goes to stderr like other diagnostics.
-fn confirm(name: &str, doomed: &Doomed) -> Result<bool> {
-    if !io::stdin().is_terminal() {
+fn confirm(name: &str, doomed: &Doomed, prompt: &dyn Prompt) -> Result<bool> {
+    if !prompt.terminal() {
         return Err(Error::with_hint(
             format!("refusing to delete {name}'s data without a terminal"),
             "add --yes",
@@ -371,11 +371,10 @@ fn confirm(name: &str, doomed: &Doomed) -> Result<bool> {
         .as_ref()
         .map(|_| format!(" and its tokens in {}", crate::keychain::STORE))
         .unwrap_or_default();
-    eprint!("Delete {}{volume}{tokens}? [y/N] ", doomed.folder.display());
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).context("terminal")?;
-    let answer = answer.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
+    prompt.confirm(&format!(
+        "Delete {}{volume}{tokens}?",
+        doomed.folder.display()
+    ))
 }
 
 pub(crate) fn ps(hangar: &Hangar) -> Overview {
@@ -661,8 +660,8 @@ mod tests {
     use crate::hangar::Hangar;
     use crate::keychain::fake::FakeKeychain;
     use crate::prompt::fake::FakePrompt;
-    use crate::sandbox::BoxState;
     use crate::sandbox::fake::FakeSandbox;
+    use crate::sandbox::{BoxState, data_volume};
     use crate::status::Detail;
     use crate::testing::{hangar_holding, hangar_with, scratch_dir, settled};
     use std::fs;
@@ -751,12 +750,12 @@ mod tests {
     fn rm_data_on_a_proxy_deletes_its_tokens_too() {
         let (hangar, keychain) =
             tokened("cmd-rm-tokens", &[("t/token", "x"), ("other/token", "y")]);
-        rm(&hangar, "t", false, true).unwrap();
+        rm(&hangar, "t", false, true, &no_prompt()).unwrap();
         assert!(keychain.items.borrow().contains_key("t/token"));
-        rm(&hangar, "t", true, true).unwrap();
+        rm(&hangar, "t", true, true, &no_prompt()).unwrap();
         assert!(!keychain.items.borrow().contains_key("t/token"));
         assert!(keychain.items.borrow().contains_key("other/token"));
-        rm(&hangar, "c", true, true).unwrap();
+        rm(&hangar, "c", true, true, &no_prompt()).unwrap();
     }
 
     const PROXIED: &str = r#"{"proxies": {
@@ -861,6 +860,42 @@ mod tests {
         assert!(sandbox.changes().contains(&"start hangar-bay-c".into()));
     }
 
+    fn no_prompt() -> FakePrompt {
+        FakePrompt::default()
+    }
+
+    #[test]
+    fn rm_data_asks_first_and_keeps_everything_unless_told_yes() {
+        let (hangar, keychain) = tokened("cmd-rm-confirm", &[("t/token", "x")]);
+        let no = FakePrompt::answering(&["n"]);
+        let error = rm(&hangar, "t", true, false, &no).err().unwrap();
+        assert_eq!(error.to_string(), "not confirmed: nothing was removed");
+        let question = &no.questions.borrow()[0];
+        assert!(question.starts_with("Delete "), "{question}");
+        assert!(question.contains(" and its tokens in "), "{question}");
+        assert!(keychain.items.borrow().contains_key("t/token"));
+        let yes = FakePrompt::answering(&["y"]);
+        rm(&hangar, "t", true, false, &yes).unwrap();
+        assert!(!keychain.items.borrow().contains_key("t/token"));
+        let bay = FakePrompt::answering(&["n"]);
+        rm(&hangar, "a", true, false, &bay).err().unwrap();
+        let question = &bay.questions.borrow()[0];
+        let volume = format!(" and the volume {}?", data_volume("a"));
+        assert!(question.ends_with(&volume), "{question}");
+    }
+
+    #[test]
+    fn rm_data_without_a_terminal_needs_yes() {
+        let (hangar, _) = tokened("cmd-rm-no-tty", &[]);
+        let error = rm(&hangar, "t", true, false, &no_prompt()).err().unwrap();
+        assert_eq!(
+            error.message(),
+            "refusing to delete t's data without a terminal"
+        );
+        assert_eq!(error.hint(), Some("add --yes"));
+        rm(&hangar, "t", false, false, &no_prompt()).unwrap();
+    }
+
     #[test]
     fn rm_data_on_a_proxy_deletes_its_vm_and_folder() {
         let sandbox = settled();
@@ -869,7 +904,7 @@ mod tests {
         up(&hangar, &names(&["p"])).unwrap();
         assert!(state.join("proxies/p").exists());
         sandbox.calls.borrow_mut().clear();
-        let report = rm(&hangar, "p", true, true).unwrap();
+        let report = rm(&hangar, "p", true, true, &no_prompt()).unwrap();
         assert_eq!(summary(&report), ["p proxy Removed"]);
         assert_eq!(
             sandbox.changes(),
@@ -887,7 +922,7 @@ mod tests {
             "no bay or proxy x: bays: a, b, c; proxies: ext, p"
         );
         assert!(up(&hangar, &names(&["x"])).is_err());
-        assert!(rm(&hangar, "x", false, true).is_err());
+        assert!(rm(&hangar, "x", false, true, &no_prompt()).is_err());
     }
 
     #[test]

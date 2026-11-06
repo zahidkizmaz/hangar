@@ -267,7 +267,7 @@ fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
             )?)
         }
         OnHangar::Rm { name, data, yes } => {
-            Outcome::Changes(commands::rm(hangar, &name, data, yes)?)
+            Outcome::Changes(commands::rm(hangar, &name, data, yes, &Terminal)?)
         }
         OnHangar::Ps => Outcome::Overview(commands::ps(hangar)),
         OnHangar::Inspect { name } => {

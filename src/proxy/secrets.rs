@@ -233,6 +233,7 @@ mod tests {
             ),
             ("echo 'two words'", "can't hold spaces"),
             ("true", "the token is empty"),
+            ("printf '\\\\377'", "printed something that isn't UTF-8"),
         ] {
             let secrets = secrets(
                 &format!(
