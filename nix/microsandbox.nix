@@ -9,20 +9,20 @@
 }:
 let
   # Renovate bumps the version; update the three hashes in the same PR.
-  version = "0.7.6";
+  version = "0.7.13";
 
   releases = {
     aarch64-darwin = {
       asset = "darwin-aarch64";
-      hash = "sha256-pPFyL+5kYNTigT5itg2uTAkgIdgSC3qqnC9LVnnZfYk=";
+      hash = "sha256-XrU8oda+s2yqZNGWAihLnON4cu/zQKjbBUKrkbWAjJY=";
     };
     x86_64-linux = {
       asset = "linux-x86_64";
-      hash = "sha256-2qacamRCibu374ib2GL/unrN35NNReck+hYO3NmlQOA=";
+      hash = "sha256-xBru/AUOl/Qs1VzlXME578E8buLcNx6NMMMlowWlw7E=";
     };
     aarch64-linux = {
       asset = "linux-aarch64";
-      hash = "sha256-R+R4dCOxL1byQRn2V8VJdLGGnAhTs9eghzFXZo0pqgM=";
+      hash = "sha256-vZX7xRlUwsIAd8eCJiFXv1rtF7NxfF1ElNnTQDXzQyw=";
     };
   };
 

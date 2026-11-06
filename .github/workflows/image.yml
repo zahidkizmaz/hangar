@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      - uses: DeterminateSystems/determinate-nix-action@16f94ba7aae399b9f9077c254b6719ec6de7e3e3 # v3.24.2
       # No Nix cache: a published image must not build from a cache that
       # pull requests can write to.
       - run: nix build ".#packages.$SYSTEM.bay-image"
@@ -44,7 +44,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: >-
           nix run --inputs-from . nixpkgs#sbomnix -- ./result --cdx "sbom-$ARCH.cdx.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ matrix.arch }}
           path: sbom-${{ matrix.arch }}.cdx.json
