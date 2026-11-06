@@ -9,6 +9,7 @@ trusts. Every entry under `proxies` has these keys:
 | `kind` | `infisical`, `agent-vault` or `http` |
 | `run` | `"managed"`: hangar runs it in its own VM, `hangar-proxy-<name>` |
 | `url` | it already runs: `http://127.0.0.1:<port>` |
+| `secrets` | optional: a command per token, see [Proxy tokens](#proxy-tokens) |
 
 Set `run` or `url`, not both. The other keys belong to the kind; an
 unknown one is an error.
@@ -31,15 +32,14 @@ e.g. `vault/session-token`.
 A token is read only when it's needed, so `ps`, `down` and `logs` work
 without them. It can't hold spaces, quotes or non-ASCII characters.
 
-To fetch a token from a password manager or a secrets file instead,
-name a command; its first line is the token, and it runs on every `up`:
+To fetch a token from a password manager instead, name a command; its
+first line is the token, and it runs on every `up`:
 
 ```json
 "vault": {
   "kind": "infisical", "run": "managed",
   "secrets": {
-    "session-token": { "command": ["op", "read", "op://Private/infisical/session"] },
-    "proxy-token": { "command": ["cat", "/run/agenix/infisical-proxy-token"] }
+    "session-token": { "command": ["op", "read", "op://Private/infisical/session"] }
   }
 }
 ```
@@ -54,7 +54,7 @@ proxy, managed by hangar in its own VM.
 | `run` | must be `"managed"` |
 | `domain` | none: your Infisical instance's URL, passed as `--domain` |
 | `hostPort` | `17323`: the host port the proxy is published on (`127.0.0.1` only) |
-| `image` | `infisical/cli:0.44.15`, pinned by digest |
+| `image` | `infisical/cli:0.45.3`, pinned by digest |
 
 On `up`, hangar creates the VM (1 CPU, 512M) with the proxy's data
 folder, `$XDG_DATA_HOME/hangar/proxies/<name>/data/data`, mounted at
@@ -114,7 +114,8 @@ yourself on this machine.
 | `vault` | `"default"`: the vault name |
 
 A bay logs in with the proxy's `token` (the one you minted for the
-bays) as the user and the vault name as the password. Health is a TCP connect to the port.
+bays) as the user and the vault name as the password. Health is a TCP
+connect to the port.
 
 ## `http`
 
@@ -149,11 +150,10 @@ it (`agent-vault`, `http`).
 ## Remote proxies
 
 Not supported yet: a `url` whose host isn't loopback is an error. A bay's
-egress is one port on the host. msb 0.7.6 accepts a per-domain egress
-rule, but TLS to the allowed host then fails (Spike A4), so remote
-proxies need IP and port rules: the sandbox's egress spec gets a variant
-for a remote address, which msb turns into a rule like today's
-`allow@host:tcp:<port>`.
+egress is one port on the host. A per-domain egress rule broke TLS to
+the allowed host when tried on msb, so remote proxies need IP and port
+rules: `Egress` gets a variant for a remote address, which each sandbox
+backend turns into its own rule.
 
 ## Adding a kind
 
@@ -200,4 +200,5 @@ The security contract, which reviews check first:
 - The fingerprint changes whenever the VM must be recreated. Derive it
   from a secret only through a hash (`ca::sha256_hex`), never the secret
   itself.
-- Tests use `FakeProxy`, `FakeSandbox` and loopback servers only.
+- Tests use `FakeProxy`, `FakeSandbox`, `FakeKeychain` and loopback
+  servers only.

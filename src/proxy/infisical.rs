@@ -16,7 +16,7 @@ use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
 
 /// One line, so Renovate can bump it.
-const IMAGE: &str = "infisical/cli:0.44.15@sha256:846fabd4c4a27e116fc8138f147d3029dd88662602b40373ff21d14b84e81783";
+const IMAGE: &str = "infisical/cli:0.45.3@sha256:9624fb475ae8a6d45ef815c7a16331c7b902fc429cfac67c70e94db0c8c3a975";
 const PORT: u16 = 17323;
 const USER: &str = "x-agent-vault";
 const CA_PATH: &str = "/_agent-vault/ca";

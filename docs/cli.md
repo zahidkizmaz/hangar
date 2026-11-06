@@ -70,7 +70,7 @@ order isn't significant.
       "apps": [ { "name": "paperclip", "state": "running" } ] } ],
   "proxies": [
     { "name": "vault", "kind": "infisical", "state": "running",
-      "image": "infisical/cli:0.44.15@sha256:…", "health": "up" },
+      "image": "infisical/cli:0.45.3@sha256:…", "health": "up" },
     { "name": "corp", "kind": "http", "state": null, "image": null,
       "health": "unreachable" } ],
   "leftovers": [ { "name": "old", "type": "bay" } ] }
@@ -111,7 +111,7 @@ A proxy:
 
 ```json
 { "version": 1, "name": "vault", "type": "proxy", "kind": "infisical",
-  "state": "running", "image": "infisical/cli:0.44.15@sha256:…",
+  "state": "running", "image": "infisical/cli:0.45.3@sha256:…",
   "vm": "hangar-proxy-vault",
   "data": "/home/you/.local/share/hangar/proxies/vault/data",
   "log": "/home/you/.local/share/hangar/proxies/vault/data/data/proxy.log" }
@@ -135,8 +135,9 @@ An external proxy has `state`, `image`, `vm` and `log` `null`.
   the warnings on stderr name the command.
 - **Change the config**: edit it, then `hangar up`. Read `reasons` to see
   whether a VM was recreated.
-- **Renew an Infisical session token**: replace the file, then `hangar
-  up` ([proxy-kinds.md](proxy-kinds.md#infisical-setup)).
+- **Renew an Infisical session token**: pipe it into `hangar secret set
+  NAME session-token`, then `hangar up`
+  ([proxy-kinds.md](proxy-kinds.md#infisical-setup)).
 - **Get config files into a bay**: a `copy` mount, then `hangar up`. Once:
   `hangar cp FILE BAY:~/path`. A refusal names the file and the rule; fix
   the config, never work around it.
