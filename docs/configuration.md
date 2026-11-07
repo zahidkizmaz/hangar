@@ -81,16 +81,18 @@ recreates it and prints why (`recreated (image, mounts)`):
 
 - a bay's `image`, `proxy`, `ro`/`rw` mounts, `ports`, `cpus`, `memory`
   or `disk`;
-- a managed proxy's image, port, or its token (the fingerprint).
+- a managed proxy's image, ports, or its fingerprint (for `infisical`,
+  its proxy token).
 
 Everything else is applied to the running VM and printed as `updated
 (…)`: `packages`, `env`, `copy` mounts, apps, and the proxy's CA or login.
 
 A recreate keeps the bay's home, its package cache and its data volume.
 Changing `disk` replaces the data volume (`data disk replaced`). A
-managed proxy keeps its data folder, except when its token changed
-(`recreated (fingerprint)`): what it saved belongs to the old token, so
-it starts empty.
+managed proxy keeps its data folder, except when its fingerprint
+changed (`recreated (fingerprint)`): what an `infisical` proxy saved
+belongs to the old token, so it starts empty. A managed `agent-vault`'s
+data is never emptied.
 
 ## Where hangar keeps things
 

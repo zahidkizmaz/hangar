@@ -17,6 +17,9 @@ use crate::secret::{Secret, trim_line_end};
 pub(crate) struct Slot {
     pub(crate) key: &'static str,
     pub(crate) about: &'static str,
+    /// Only the bays use it, so `up` asks for it when one of them comes
+    /// up; the proxy starts without it.
+    pub(crate) for_bays: bool,
 }
 
 #[derive(Clone)]
@@ -53,11 +56,23 @@ impl Secrets {
         })
     }
 
-    /// Refuses a `secrets` entry for a token the kind doesn't take.
-    pub(crate) fn check(&self, slots: &[Slot], path: &str) -> Result<()> {
-        let known = |key: &String| slots.iter().any(|slot| slot.key == key);
+    /// Refuses a `secrets` entry for a token the kind doesn't take: one of
+    /// `slots`, or a bay's own (`extra`).
+    pub(crate) fn check(
+        &self,
+        slots: &[Slot],
+        extra: &[String],
+        path: &str,
+    ) -> Result<()> {
+        let known = |key: &String| {
+            slots.iter().any(|slot| slot.key == key) || extra.contains(key)
+        };
         if let Some(key) = self.commands.keys().find(|key| !known(key)) {
-            let keys: Vec<&str> = slots.iter().map(|slot| slot.key).collect();
+            let keys: Vec<&str> = slots
+                .iter()
+                .map(|slot| slot.key)
+                .chain(extra.iter().map(String::as_str))
+                .collect();
             let keys = if keys.is_empty() {
                 "none".to_string()
             } else {
@@ -101,25 +116,15 @@ impl Secrets {
         Ok(Secret::new(token.to_string()))
     }
 
-    /// The keychain tokens of `slots` not stored yet; a token from a
-    /// command is never missing.
-    pub(crate) fn missing(&self, slots: &[Slot]) -> Result<Vec<Slot>> {
-        let mut missing = Vec::new();
-        for slot in slots {
-            let from_keychain = !self.commands.contains_key(slot.key);
-            if from_keychain
-                && self.keychain.lookup(&self.account(slot.key))?.is_none()
-            {
-                missing.push(*slot);
-            }
-        }
-        Ok(missing)
+    /// Whether `key` is there: from a command, or in the keychain.
+    pub(crate) fn has(&self, key: &str) -> Result<bool> {
+        Ok(self.commands.contains_key(key)
+            || self.keychain.lookup(&self.account(key))?.is_some())
     }
 
-    /// The tokens `secret set` asks for: those not from a command.
-    pub(crate) fn settable(&self, slots: &[Slot]) -> Vec<Slot> {
-        let settable = |slot: &&Slot| !self.commands.contains_key(slot.key);
-        slots.iter().filter(settable).copied().collect()
+    /// Whether `key` comes from a command, so `secret set` leaves it.
+    pub(crate) fn is_command(&self, key: &str) -> bool {
+        self.commands.contains_key(key)
     }
 
     pub(crate) fn store(&self, key: &str, token: &Secret) -> Result<()> {
@@ -129,9 +134,9 @@ impl Secrets {
         self.keychain.store(&self.account(key), token)
     }
 
-    pub(crate) fn delete(&self, slots: &[Slot]) -> Result<()> {
-        for slot in slots {
-            self.keychain.delete(&self.account(slot.key))?;
+    pub(crate) fn delete(&self, keys: &[String]) -> Result<()> {
+        for key in keys {
+            self.keychain.delete(&self.account(key))?;
         }
         Ok(())
     }
@@ -151,10 +156,12 @@ mod tests {
         Slot {
             key: "proxy-token",
             about: "the proxy token",
+            for_bays: false,
         },
         Slot {
             key: "session-token",
             about: "the session token",
+            for_bays: true,
         },
     ];
 
@@ -170,7 +177,7 @@ mod tests {
         let keychain = Rc::new(FakeKeychain::default());
         match Secrets::new("infi", keychain, &fields) {
             Ok(secrets) => secrets
-                .check(&SLOTS, "proxies.infi")
+                .check(&SLOTS, &[], "proxies.infi")
                 .unwrap_err()
                 .to_string(),
             Err(error) => error.to_string(),
@@ -183,16 +190,19 @@ mod tests {
             Rc::new(FakeKeychain::holding(&[("infi/proxy-token", "pt-1")]));
         let secrets = secrets("{}", &keychain);
         assert_eq!(secrets.get("proxy-token").unwrap().expose(), "pt-1");
-        assert_eq!(secrets.missing(&SLOTS).unwrap(), [SLOTS[1]]);
+        assert!(secrets.has("proxy-token").unwrap());
+        assert!(!secrets.has("session-token").unwrap());
         secrets
             .store("session-token", &Secret::new("st-2".into()))
             .unwrap();
-        assert_eq!(secrets.missing(&SLOTS).unwrap(), []);
+        assert!(secrets.has("session-token").unwrap());
         assert_eq!(
             keychain.items.borrow().get("infi/session-token").unwrap(),
             "st-2"
         );
-        secrets.delete(&SLOTS).unwrap();
+        let keys: Vec<String> =
+            SLOTS.iter().map(|slot| slot.key.to_string()).collect();
+        secrets.delete(&keys).unwrap();
         assert!(keychain.items.borrow().is_empty());
     }
 
@@ -218,9 +228,11 @@ mod tests {
             &keychain,
         );
         assert_eq!(secrets.get("session-token").unwrap().expose(), "st-cmd");
-        assert_eq!(secrets.missing(&SLOTS).unwrap(), [SLOTS[0]]);
-        assert_eq!(secrets.settable(&SLOTS), [SLOTS[0]]);
-        secrets.check(&SLOTS, "proxies.infi").unwrap();
+        assert!(secrets.has("session-token").unwrap());
+        assert!(secrets.is_command("session-token"));
+        assert!(!secrets.is_command("proxy-token"));
+        assert!(!secrets.has("proxy-token").unwrap());
+        secrets.check(&SLOTS, &[], "proxies.infi").unwrap();
     }
 
     #[test]
@@ -266,7 +278,7 @@ mod tests {
         let none =
             secrets(r#"{"secrets": {"x": {"command": ["y"]}}}"#, &keychain);
         assert_eq!(
-            none.check(&[], "proxies.p").unwrap_err().to_string(),
+            none.check(&[], &[], "proxies.p").unwrap_err().to_string(),
             "proxies.p.secrets.x: unknown token; known: none"
         );
     }

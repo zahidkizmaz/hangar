@@ -1,0 +1,29 @@
+# A self-hosted Infisical with Postgres and Redis.
+name: infisical
+services:
+  backend:
+    image: infisical/infisical:v0.167.6@sha256:ca5cbd14b2f170feaaca3fbe5b001b7594c8b9c0c62a491409910f10b05dbb2c
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    env_file: .env
+    environment: [NODE_ENV=production]
+    ports: ["8080:8080"]
+  redis:
+    image: redis:8-alpine@sha256:71885d8cc6e42f2bc0aa2eb853bfc4be200b5108a46ac50e117ae1df0531fb80
+    restart: unless-stopped
+    volumes: ['redis_data:/data']
+  db:
+    image: postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    restart: unless-stopped
+    env_file: .env
+    volumes: ['pg_data:/var/lib/postgresql']
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U infisical"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+volumes:
+  pg_data: {}
+  redis_data: {}

@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use super::{Health, Login, Managed, ManagedVm, Proxy, Slot, Spec};
+use super::{Health, Login, Managed, ManagedVm, Proxy, ProxyPort, Slot, Spec};
 use crate::error::Result;
 use crate::sandbox::{Egress, Sandbox};
 use crate::secret::Secret;
@@ -15,6 +15,8 @@ pub(crate) struct FakeProxy {
     pub(crate) up: bool,
     pub(crate) managed: Option<FakeManaged>,
     pub(crate) slots: &'static [Slot],
+    /// Bays with a token of their own (`token@<bay>`).
+    pub(crate) own: Vec<String>,
 }
 
 pub(crate) struct FakeManaged {
@@ -27,7 +29,18 @@ pub(crate) struct FakeManaged {
 pub(crate) const TOKEN: &[Slot] = &[Slot {
     key: "token",
     about: "the fake token",
+    for_bays: false,
 }];
+
+/// With `"bayToken": true` too: one more, only its bays need.
+const WITH_BAY_TOKEN: &[Slot] = &[
+    TOKEN[0],
+    Slot {
+        key: "bay-token",
+        about: "the fake bay token",
+        for_bays: true,
+    },
+];
 
 impl FakeProxy {
     pub(crate) fn at(port: u16) -> Self {
@@ -38,6 +51,7 @@ impl FakeProxy {
             up: true,
             managed: None,
             slots: &[],
+            own: Vec::new(),
         }
     }
 }
@@ -48,7 +62,8 @@ impl FakeManaged {
             image: "fake:1".into(),
             cpus: 1,
             memory: "256M".into(),
-            publish: (port, port),
+            publish: vec![ProxyPort::proxy(port, port)],
+            user: None,
             mounts: Vec::new(),
             entrypoint: None,
             host_port: None,
@@ -96,6 +111,13 @@ impl Proxy for FakeProxy {
     fn secrets(&self) -> &'static [Slot] {
         self.slots
     }
+
+    fn bay_tokens(&self) -> Vec<(String, String)> {
+        self.own
+            .iter()
+            .map(|bay| (bay.clone(), format!("token@{bay}")))
+            .collect()
+    }
 }
 
 impl Managed for FakeManaged {
@@ -122,7 +144,19 @@ impl Managed for FakeManaged {
 /// secret).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
-    super::only(fields, &["port", "ca", "login", "managed", "token"])?;
+    super::only(
+        fields,
+        &[
+            "port",
+            "ca",
+            "login",
+            "managed",
+            "token",
+            "bayToken",
+            "upstream",
+            "ownTokens",
+        ],
+    )?;
     let port = if fields.map.contains_key("port") {
         fields.number("port")?
     } else {
@@ -135,13 +169,27 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     Ok(Box::new(FakeProxy {
         ca: fields.optional_string("ca")?.map(String::into_bytes),
         login,
-        managed: fields
-            .flag_or("managed", false)?
-            .then(|| FakeManaged::new(port)),
-        slots: if fields.flag_or("token", false)? {
-            TOKEN
+        managed: if fields.flag_or("managed", false)? {
+            let mut managed = FakeManaged::new(port);
+            if fields.map.contains_key("upstream") {
+                managed.vm.host_port = Some(fields.number("upstream")?);
+            }
+            Some(managed)
         } else {
-            &[]
+            None
+        },
+        slots: match (
+            fields.flag_or("token", false)?,
+            fields.flag_or("bayToken", false)?,
+        ) {
+            (_, true) => WITH_BAY_TOKEN,
+            (true, false) => TOKEN,
+            (false, false) => &[],
+        },
+        own: if fields.map.contains_key("ownTokens") {
+            fields.strings("ownTokens")?
+        } else {
+            Vec::new()
         },
         ..FakeProxy::at(port)
     }))

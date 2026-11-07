@@ -89,7 +89,7 @@ tokens only; `rm NAME --data` deletes them from the keychain again.
 
 Diagnostics go through the `log` facade (`src/logger.rs`) to stderr and
 to `$XDG_STATE_HOME/hangar/hangar.log`. Levels: `-q` errors only, default
-info (`==>` progress), `-v` debug (every child command's argv), `-vv`
+info (progress), `-v` debug (every child command's argv), `-vv`
 trace. The file keeps info and above even under `-q`. Only hangar's own
 targets are logged; ureq's and rustls' lines are dropped, since they may
 name a request's headers. Never log headers, bodies or values: argv and

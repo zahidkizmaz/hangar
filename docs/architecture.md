@@ -51,9 +51,13 @@ host rule. The record stores it as `open`, `host:<port>` or
 
 ## `hangar up`
 
-`commands::up` selects the named bays and proxies (none: all), adds each
-selected bay's proxy, and brings the proxies up first, each once. A bay
-whose proxy failed is left alone. Every resource ends in one `Change`:
+`commands::up` selects the named bays and proxies (none: all) and what
+they need: a bay's proxy, and a managed proxy's upstream bay (the one
+publishing the host port of its `OpenAndHostPort` egress). It brings
+each up once, after what it needs; two that need each other are an
+error. A proxy's own tokens are asked for just before it starts, its
+bays' tokens just before the first of them. Whatever needs a failed one
+is left alone. Every resource ends in one `Change`:
 `created`, `recreated` (with reasons), `updated` (with what changed),
 `unchanged` or `failed`.
 

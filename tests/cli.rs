@@ -210,7 +210,7 @@ fn restart_is_down_then_up() {
     run(&machine, &["up"]);
     assert_eq!(
         run(&machine, &["restart", "default"]),
-        "default: stopped\ndefault: updated (started)\n"
+        "default: updated (started)\n"
     );
     let log = machine.msb_log();
     let stop = log.find("stop -q hangar-bay-default").unwrap();
@@ -539,9 +539,9 @@ fn json_on_every_command() {
     let out = run(&machine, &["up", "--json"]);
     assert_eq!(
         out,
-        "{\"changes\":[{\"error\":null,\"name\":\"default\",\
-         \"outcome\":\"created\",\"reasons\":[],\"type\":\"bay\"}],\
-         \"version\":1}\n"
+        "{\"changes\":[{\"addresses\":[],\"error\":null,\
+         \"name\":\"default\",\"outcome\":\"created\",\"reasons\":[],\
+         \"type\":\"bay\"}],\"version\":1}\n"
     );
 }
 
@@ -557,7 +557,12 @@ fn log_file_gets_every_line_timestamped() {
     assert!(log.lines().count() >= 2, "{log}");
     for line in log.lines() {
         let (stamp, rest) = line.split_once(' ').unwrap();
-        assert!(stamp.ends_with('Z') && stamp.len() == 20, "{line}");
+        // The local time with its offset: 2026-11-07T21:25:46+01:00.
+        let offset = stamp.as_bytes().get(19).copied();
+        assert!(
+            stamp.len() == 25 && matches!(offset, Some(b'+' | b'-')),
+            "{line}"
+        );
         assert!(rest.starts_with("info ") || rest.starts_with("warn "));
     }
     assert!(log.contains("default: vm"), "{log}");
@@ -983,4 +988,73 @@ fn a_missing_config_points_at_init() {
     let error = failed(&machine.hangar(&["ps"], &[]));
     assert!(error.contains("no config at"), "{error}");
     assert!(error.contains("hangar init"), "{error}");
+}
+
+#[test]
+fn config_show_prints_the_file_as_written() {
+    let machine = Machine::new("config-show");
+    let missing = failed(&machine.hangar(&["config", "show"], &[]));
+    assert!(missing.contains("no config at "), "{missing}");
+    assert!(missing.contains("hangar init"), "{missing}");
+    run(&machine, &["init"]);
+    let shown = run(&machine, &["config", "show"]);
+    assert_eq!(shown, fs::read_to_string(default_config(&machine)).unwrap());
+}
+
+#[test]
+fn config_edit_opens_the_editor_then_checks_the_file() {
+    let machine = with_bay("config-edit", "", "");
+    let editor = machine.home.join("bin/editor");
+    // Stands in for $EDITOR: replaces the file with $HANGAR_TEST_WRITE.
+    machine.script("editor", r#"printf '%s' "$HANGAR_TEST_WRITE" > "$1""#);
+    let editor = editor.to_str().unwrap();
+    let edit = |write: &str| {
+        machine.hangar(
+            &["config", "edit"],
+            &[("EDITOR", editor), ("HANGAR_TEST_WRITE", write)],
+        )
+    };
+    ok(&edit(r#"{"bays": [{"name": "x", "proxy": null}]}"#));
+    assert!(
+        fs::read_to_string(default_config(&machine))
+            .unwrap()
+            .contains(r#""name": "x""#)
+    );
+    let broken = failed(&edit(r#"{"bays": [{"name": "x", "nope": 1}]}"#));
+    assert!(broken.contains("nope"), "{broken}");
+    assert!(broken.contains("hangar config edit"), "{broken}");
+    let nix = machine.hangar(
+        &["config", "edit"],
+        &[
+            ("EDITOR", editor),
+            ("HANGAR_NIX_CONFIG", "/nix/hangar.json"),
+        ],
+    );
+    assert!(failed(&nix).contains("services.hangar"), "{}", stderr(&nix));
+}
+
+#[test]
+fn up_shows_a_heading_indented_progress_then_the_bays_state() {
+    let machine = with_bay("up-layout", "", "");
+    let output = machine.hangar(&["up"], &[]);
+    let said = stderr(ok(&output));
+    let mut lines = said.lines();
+    assert_eq!(lines.next(), Some("Starting default"), "{said}");
+    let progress: Vec<&str> =
+        lines.by_ref().take_while(|line| !line.is_empty()).collect();
+    assert!(!progress.is_empty(), "{said}");
+    assert!(
+        progress
+            .iter()
+            .all(|line| line.starts_with("  ") && !line.starts_with("   ")),
+        "{said}"
+    );
+    let table = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        table.starts_with("NAME     TYPE  STATE    PROXY   PORTS  RESULT\n"),
+        "{table}"
+    );
+    assert!(table.contains("default  bay   running  direct  -      created"));
+    let json = machine.hangar(&["up", "--json"], &[]);
+    assert!(!stderr(ok(&json)).contains("Starting"), "{}", stderr(&json));
 }

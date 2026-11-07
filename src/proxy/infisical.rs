@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use super::ca::{CaSource, CaSpec, sha256_hex};
 use super::{
-    Health, Location, Login, Managed, ManagedVm, Proxy, Secrets, Slot, Spec,
-    only,
+    Health, Location, Login, Managed, ManagedVm, Proxy, ProxyPort, Secrets,
+    Slot, Spec, only,
 };
 use crate::error::{Context, Error, Result, bail};
 use crate::http;
@@ -32,10 +32,12 @@ const SLOTS: &[Slot] = &[
     Slot {
         key: PROXY_TOKEN,
         about: "the proxy token from Infisical's proxy setup",
+        for_bays: false,
     },
     Slot {
         key: SESSION_TOKEN,
         about: "the session token the bays log in with",
+        for_bays: true,
     },
 ];
 
@@ -112,7 +114,8 @@ impl Managed for Infisical {
             image: self.image.clone(),
             cpus: CPUS,
             memory: MEMORY.into(),
-            publish: (self.host_port, PORT),
+            publish: vec![ProxyPort::proxy(self.host_port, PORT)],
+            user: None,
             mounts: vec![(
                 self.data.join("data"),
                 DATA.into(),
@@ -321,7 +324,7 @@ mod tests {
         let vm = managed.vm();
         assert_eq!(vm.image, IMAGE);
         assert_eq!((vm.cpus, vm.memory.as_str()), (1, "512M"));
-        assert_eq!(vm.publish, (27323, 17323));
+        assert_eq!(vm.publish, [ProxyPort::proxy(27323, 17323)]);
         assert_eq!(vm.entrypoint.as_deref(), Some("/bin/sh"));
         let data = setup.dir.join("data/data");
         let mount = (data.clone(), "/data".into(), MountMode::ReadWrite);
@@ -390,7 +393,7 @@ mod tests {
         let proxy = setup.built("").unwrap();
         assert_eq!(proxy.secrets(), SLOTS);
         let managed = proxy.managed().unwrap();
-        assert_eq!(managed.vm().publish, (17323, 17323));
+        assert_eq!(managed.vm().publish, [ProxyPort::proxy(17323, 17323)]);
         let error = managed.fingerprint().unwrap_err();
         assert!(
             error
@@ -438,5 +441,23 @@ mod tests {
             error.to_string(),
             "proxies.infi.proxyTokenFile: unknown setting"
         );
+    }
+
+    #[test]
+    fn the_local_infisical_example_comes_up_server_first() {
+        use crate::commands::{Step, plan_up};
+        use crate::testing::{hangar_with, settled};
+        let config = include_str!("../../examples/local-infisical/hangar.json");
+        let state = scratch_dir("infisical-example");
+        let hangar = hangar_with(config, &state, settled());
+        let order: Vec<&str> = plan_up(&hangar, &[])
+            .unwrap()
+            .iter()
+            .map(|step| match step {
+                Step::Proxy(name, _) => *name,
+                Step::Bay(bay) => bay.name,
+            })
+            .collect();
+        assert_eq!(order, ["infisical", "vault", "work"]);
     }
 }

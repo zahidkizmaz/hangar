@@ -133,8 +133,54 @@ fn tools_path(fakes: PathBuf) -> OsString {
     std::env::join_paths(std::iter::once(fakes).chain(tools)).unwrap()
 }
 
+/// Stdout, with a change table (`up`, `down`, `rm`, ...) read back into
+/// one `name: result (details)` line per change, which the tests compare.
 pub fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if text.starts_with("NAME")
+        && text.lines().next().unwrap().contains("RESULT")
+    {
+        change_lines(&text)
+    } else {
+        text
+    }
+}
+
+fn change_lines(table: &str) -> String {
+    let mut lines = table.lines();
+    let header = lines.next().unwrap();
+    let at = |name: &str| header.find(name);
+    let result = at("RESULT").unwrap();
+    let column = |line: &str, from: usize, to: usize| {
+        line.get(from..to.min(line.len()))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let mut out = String::new();
+    for line in lines.filter(|line| !line.starts_with(' ')) {
+        let name = column(line, 0, at("TYPE").unwrap());
+        // ps-style rows hold the whole result; the plain change table
+        // splits it into RESULT and DETAILS.
+        let entry = match at("DETAILS") {
+            None => column(line, result, usize::MAX),
+            Some(details) => {
+                let word = column(line, result, details);
+                let end = at("ADDRESS").unwrap_or(usize::MAX);
+                let what = column(line, details, end);
+                match (word.as_str(), what.is_empty()) {
+                    (_, true) => word,
+                    ("failed", false) => format!("failed: {what}"),
+                    (_, false) => format!("{word} ({what})"),
+                }
+            }
+        };
+        out.push_str(&name);
+        out.push_str(": ");
+        out.push_str(&entry);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn stderr(output: &Output) -> String {

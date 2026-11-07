@@ -45,6 +45,12 @@ pub(crate) trait Proxy {
         None
     }
     /// The tokens the kind reads from its [`Secrets`].
+    /// Bays with a token of their own, as `(bay, key)`; the others log in
+    /// with the `for_bays` ones.
+    fn bay_tokens(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     fn secrets(&self) -> &'static [Slot] {
         &[]
     }
@@ -64,13 +70,39 @@ pub(crate) struct ManagedVm {
     pub(crate) image: String,
     pub(crate) cpus: u32,
     pub(crate) memory: String,
-    pub(crate) publish: (u16, u16),
+    /// Published on the host's 127.0.0.1; the first is what bays use.
+    pub(crate) publish: Vec<ProxyPort>,
+    /// The `(uid, gid)` its process runs as, so its mounts look owned by
+    /// it; `None` when it runs as root.
+    pub(crate) user: Option<(u32, u32)>,
     pub(crate) mounts: Vec<(PathBuf, String, MountMode)>,
     /// An `--entrypoint` override, for images that need one.
     pub(crate) entrypoint: Option<String>,
     /// A port on the host it reaches besides the internet, for an
     /// upstream on this machine.
     pub(crate) host_port: Option<u16>,
+}
+
+/// A port a managed proxy publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProxyPort {
+    pub(crate) name: &'static str,
+    pub(crate) host: u16,
+    pub(crate) vm: u16,
+    /// Opened in a browser, so shown as a URL.
+    pub(crate) http: bool,
+}
+
+impl ProxyPort {
+    /// The bays' way in: plain HTTP proxying, not for a browser.
+    pub(crate) fn proxy(host: u16, vm: u16) -> Self {
+        Self {
+            name: "proxy",
+            host,
+            vm,
+            http: false,
+        }
+    }
 }
 
 impl ManagedVm {
@@ -143,7 +175,10 @@ pub(crate) fn check_kind(fields: &Fields) -> Result<Build> {
 
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let proxy = check_kind(&spec.fields)?(spec)?;
-    spec.secrets.check(proxy.secrets(), spec.fields.path())?;
+    let own: Vec<String> =
+        proxy.bay_tokens().into_iter().map(|(_, key)| key).collect();
+    spec.secrets
+        .check(proxy.secrets(), &own, spec.fields.path())?;
     Ok(proxy)
 }
 
@@ -331,7 +366,7 @@ mod tests {
         );
         assert!(matches!(proxy.health(), Health::Up));
         let managed = proxy.managed().unwrap();
-        assert_eq!(managed.vm().publish, (3128, 3128));
+        assert_eq!(managed.vm().publish, [super::ProxyPort::proxy(3128, 3128)]);
         assert_eq!(managed.log_file(), PathBuf::from("fake.log"));
         managed
             .start(&crate::sandbox::fake::FakeSandbox::default(), "vm")

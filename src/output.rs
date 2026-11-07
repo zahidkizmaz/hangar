@@ -14,7 +14,7 @@ use crate::json::{self, Json};
 use crate::lifecycle::{self, Change};
 use crate::logger;
 use crate::mounts::{Mode, MountKind, MountStatus};
-use crate::proxy::Health;
+use crate::proxy::{Health, ProxyPort};
 use crate::sandbox::{BoxState, PublishedPort};
 use crate::status::{
     self, BayDetail, BayStatus, Detail, Overview, ProxyDetail, ProxyStatus,
@@ -71,11 +71,19 @@ impl Outcome {
 }
 
 /// What changed goes to the log file too, so it stays a full record.
+/// The log file gets one `name: outcome` line per change.
 fn record(result: &Outcome) {
-    if matches!(result, Outcome::Changes(_) | Outcome::Copied(_)) {
-        for line in result.human().lines() {
-            log::info!(target: logger::REPORT, "{line}");
+    let lines: Vec<String> = match result {
+        Outcome::Changes(report) => {
+            report.changes.iter().map(change_line).collect()
         }
+        Outcome::Copied(_) => {
+            result.human().lines().map(String::from).collect()
+        }
+        _ => Vec::new(),
+    };
+    for line in lines {
+        log::info!(target: logger::REPORT, "{line}");
     }
 }
 
@@ -142,9 +150,10 @@ impl Render for Outcome {
     fn human(&self) -> String {
         match self {
             Self::Done | Self::Streamed => String::new(),
-            Self::Changes(report) => {
-                lines(report.changes.iter().map(change_line))
-            }
+            Self::Changes(report) => match &report.overview {
+                Some(overview) => lines(table(&state_rows(report, overview))),
+                None => lines(table(&change_rows(report))),
+            },
             Self::Overview { overview, wide } => {
                 lines(table(&overview_rows(overview, *wide)))
             }
@@ -170,7 +179,19 @@ impl Render for Outcome {
             Self::Streamed => Json::Null,
             Self::Changes(report) => document([(
                 "changes",
-                Json::Array(report.changes.iter().map(change_json).collect()),
+                Json::Array(
+                    report
+                        .changes
+                        .iter()
+                        .map(|change| {
+                            let addresses = report
+                                .addresses
+                                .get(&change.name)
+                                .map_or(&[][..], Vec::as_slice);
+                            change_json(change, addresses)
+                        })
+                        .collect(),
+                ),
             )]),
             Self::Overview { overview, .. } => overview_json(overview),
             Self::Detail(detail) => detail_json(detail),
@@ -203,22 +224,43 @@ fn outcome_parts(outcome: &lifecycle::Outcome) -> (&'static str, &[String]) {
 }
 
 fn change_line(change: &Change) -> String {
-    let (word, reasons) = outcome_parts(&change.outcome);
-    let what = match &change.outcome {
-        lifecycle::Outcome::Failed(error) => match error.hint() {
-            Some(hint) => format!("{word}: {} (try: {hint})", error.message()),
-            None => format!("{word}: {}", error.message()),
-        },
-        _ if reasons.is_empty() => word.to_string(),
-        lifecycle::Outcome::Recreated(_) => {
-            format!("{word} ({})", reasons.join(", "))
-        }
-        _ => format!("{word} ({})", reasons.join("; ")),
-    };
-    format!("{}: {what}", change.name)
+    format!("{}: {}", change.name, result_text(change))
 }
 
-fn change_json(change: &Change) -> Json {
+/// The changes as a table; ADDRESS, one per line, only when one has any.
+fn change_rows(report: &UpReport) -> Vec<Vec<String>> {
+    let addressed = report.addresses.values().any(|list| !list.is_empty());
+    let mut header =
+        vec![one("NAME"), one("TYPE"), one("RESULT"), one("DETAILS")];
+    if addressed {
+        header.push(one("ADDRESS"));
+    }
+    let rows = report.changes.iter().map(|change| {
+        let (word, reasons) = outcome_parts(&change.outcome);
+        let details = match &change.outcome {
+            lifecycle::Outcome::Failed(error) => match error.hint() {
+                Some(hint) => format!("{} (try: {hint})", error.message()),
+                None => error.message().to_string(),
+            },
+            lifecycle::Outcome::Recreated(_) => reasons.join(", "),
+            _ => reasons.join("; "),
+        };
+        let mut row = vec![
+            one(&change.name),
+            one(change.resource.as_str()),
+            one(word),
+            one(&details),
+        ];
+        if addressed {
+            let found = report.addresses.get(&change.name);
+            row.push(found.cloned().unwrap_or_else(|| one("")));
+        }
+        row
+    });
+    spread(std::iter::once(header).chain(rows).collect())
+}
+
+fn change_json(change: &Change, addresses: &[String]) -> Json {
     let (word, reasons) = outcome_parts(&change.outcome);
     let error = match &change.outcome {
         lifecycle::Outcome::Failed(error) => error_json(error),
@@ -230,27 +272,70 @@ fn change_json(change: &Change) -> Json {
         ("outcome", json::string(word)),
         ("reasons", strings(reasons)),
         ("error", error),
+        ("addresses", strings(addresses)),
     ])
 }
 
-fn overview_rows(overview: &Overview, wide: bool) -> Vec<Vec<String>> {
-    let mut header = cells(["NAME", "TYPE", "STATE", "PROXY", "PORTS"]);
-    if wide {
-        header.extend(cells(["IMAGE", "APPS", "MOUNTS"]));
+/// A table cell: its lines, `-` for none.
+fn cell(lines: impl IntoIterator<Item = String>) -> Vec<String> {
+    let lines: Vec<String> = lines.into_iter().collect();
+    if lines.is_empty() {
+        vec!["-".into()]
+    } else {
+        lines
     }
-    let bays = overview.bays.iter().flat_map(|bay| {
-        let proxy = bay.proxy.as_deref().unwrap_or("direct");
-        let ports = joined(bay.ports.iter().map(port_address));
-        let mut row = cells([&bay.name, "bay", state_word(bay.state), proxy]);
-        row.push(ports);
-        if !wide {
-            return vec![row];
-        }
+}
+
+fn one(text: &str) -> Vec<String> {
+    vec![text.to_string()]
+}
+
+/// Rows of multi-line cells as printed rows: a row takes as many lines as
+/// its tallest cell, the others left blank below their first line.
+fn spread(rows: Vec<Vec<Vec<String>>>) -> Vec<Vec<String>> {
+    rows.into_iter()
+        .flat_map(|row| {
+            let height = row.iter().map(Vec::len).max().unwrap_or(1);
+            (0..height)
+                .map(|line| {
+                    row.iter()
+                        .map(|cell| cell.get(line).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .collect::<Vec<Vec<String>>>()
+        })
+        .collect()
+}
+
+fn overview_header(wide: bool) -> Vec<Vec<String>> {
+    let mut header = vec![
+        one("NAME"),
+        one("TYPE"),
+        one("STATE"),
+        one("PROXY"),
+        one("PORTS"),
+    ];
+    if wide {
+        header.extend([one("IMAGE"), one("APPS"), one("MOUNTS")]);
+    }
+    header
+}
+
+fn bay_row(bay: &BayStatus, wide: bool) -> Vec<Vec<String>> {
+    let proxy = bay.proxy.as_deref().unwrap_or("direct");
+    let mut row = vec![
+        one(&bay.name),
+        one("bay"),
+        one(state_word(bay.state)),
+        one(proxy),
+        cell(bay.ports.iter().map(port_address)),
+    ];
+    if wide {
         let apps = bay
             .apps
             .iter()
             .map(|(app, state)| format!("{app}:{}", state.as_str()));
-        let mut mounts = bay
+        let mounts = bay
             .mounts
             .iter()
             .filter(|mount| mount.kind == MountKind::User)
@@ -262,51 +347,97 @@ fn overview_rows(overview: &Overview, wide: bool) -> Vec<Vec<String>> {
                     mount_mode(mount)
                 )
             });
-        let first = mounts.next().unwrap_or_else(|| "-".into());
-        row.extend([short_image(&bay.image), joined(apps), first]);
-        let width = row.len();
-        // One mount per line, under the bay's first.
-        std::iter::once(row)
-            .chain(mounts.map(|mount| {
-                let mut line = vec![String::new(); width - 1];
-                line.push(mount);
-                line
-            }))
-            .collect()
-    });
-    let proxies = overview.proxies.iter().map(|proxy| {
-        let state = proxy_state(proxy).unwrap_or("external");
-        let port = proxy.port.map_or("-".into(), loopback);
-        let mut row = cells([&proxy.name, "proxy", state, "-"]);
-        row.push(port);
-        if wide {
-            let image = proxy.image.as_deref().map_or("-".into(), short_image);
-            row.extend([image, "-".into(), "-".into()]);
-        }
-        row
-    });
-    let leftovers = overview.leftovers.iter().map(|(resource, name)| {
-        let mut row = cells([name, resource.as_str(), "leftover", "-", "-"]);
-        if wide {
-            row.extend(cells(["-", "-", "-"]));
-        }
-        row
-    });
-    std::iter::once(header)
-        .chain(bays)
-        .chain(proxies)
-        .chain(leftovers)
-        .collect()
+        row.extend([one(&short_image(&bay.image)), cell(apps), cell(mounts)]);
+    }
+    row
 }
 
-/// Items joined by `, `; `-` for none.
-fn joined(items: impl Iterator<Item = String>) -> String {
-    let items: Vec<String> = items.collect();
-    if items.is_empty() {
-        "-".into()
+fn proxy_row(proxy: &ProxyStatus, wide: bool) -> Vec<Vec<String>> {
+    let state = proxy_state(proxy).unwrap_or("external");
+    let ports = if proxy.published.is_empty() {
+        cell(proxy.port.map(loopback))
     } else {
-        items.join(", ")
+        cell(proxy.published.iter().map(proxy_address))
+    };
+    let mut row =
+        vec![one(&proxy.name), one("proxy"), one(state), one("-"), ports];
+    if wide {
+        let image = proxy.image.as_deref().map_or("-".into(), short_image);
+        row.extend([one(&image), one("-"), one("-")]);
     }
+    row
+}
+
+fn overview_rows(overview: &Overview, wide: bool) -> Vec<Vec<String>> {
+    let bays = overview.bays.iter().map(|bay| bay_row(bay, wide));
+    let proxies = overview.proxies.iter().map(|proxy| proxy_row(proxy, wide));
+    let leftovers = overview.leftovers.iter().map(|(resource, name)| {
+        let mut row = vec![
+            one(name),
+            one(resource.as_str()),
+            one("leftover"),
+            one("-"),
+            one("-"),
+        ];
+        if wide {
+            row.extend([one("-"), one("-"), one("-")]);
+        }
+        row
+    });
+    spread(
+        std::iter::once(overview_header(wide))
+            .chain(bays)
+            .chain(proxies)
+            .chain(leftovers)
+            .collect(),
+    )
+}
+
+/// What a change came to, with its reasons or error.
+fn result_text(change: &Change) -> String {
+    let (word, reasons) = outcome_parts(&change.outcome);
+    match &change.outcome {
+        lifecycle::Outcome::Failed(error) => match error.hint() {
+            Some(hint) => format!("{word}: {} (try: {hint})", error.message()),
+            None => format!("{word}: {}", error.message()),
+        },
+        _ if reasons.is_empty() => word.to_string(),
+        lifecycle::Outcome::Recreated(_) => {
+            format!("{word} ({})", reasons.join(", "))
+        }
+        _ => format!("{word} ({})", reasons.join("; ")),
+    }
+}
+
+/// `ps`'s rows for what the command touched, each with what it came to:
+/// a name changed twice (`restart`) shows its last change.
+fn state_rows(report: &UpReport, overview: &Overview) -> Vec<Vec<String>> {
+    let mut header = overview_header(false);
+    header.push(one("RESULT"));
+    let mut names: Vec<&str> = Vec::new();
+    for change in &report.changes {
+        if !names.contains(&change.name.as_str()) {
+            names.push(&change.name);
+        }
+    }
+    let rows = names.into_iter().map(|name| {
+        let last = report.changes.iter().rev().find(|c| c.name == name);
+        let mut row = if let Some(bay) =
+            overview.bays.iter().find(|bay| bay.name == name)
+        {
+            bay_row(bay, false)
+        } else if let Some(proxy) =
+            overview.proxies.iter().find(|proxy| proxy.name == name)
+        {
+            proxy_row(proxy, false)
+        } else {
+            let kind = last.map_or("-", |change| change.resource.as_str());
+            vec![one(name), one(kind), one("-"), one("-"), one("-")]
+        };
+        row.push(one(&last.map(result_text).unwrap_or_default()));
+        row
+    });
+    spread(std::iter::once(header).chain(rows).collect())
 }
 
 fn loopback(port: u16) -> String {
@@ -314,7 +445,7 @@ fn loopback(port: u16) -> String {
 }
 
 /// What to open: a URL for an HTTP port, else the address.
-fn port_address(port: &PublishedPort) -> String {
+pub(crate) fn port_address(port: &PublishedPort) -> String {
     if port.http {
         format!("http://{}", loopback(port.host))
     } else {
@@ -331,6 +462,14 @@ fn short_image(image: &str) -> String {
             format!("{name}@sha256:{}", &digest[..SHORT])
         }
         _ => image.into(),
+    }
+}
+
+pub(crate) fn proxy_address(port: &ProxyPort) -> String {
+    if port.http {
+        format!("http://{}", loopback(port.host))
+    } else {
+        loopback(port.host)
     }
 }
 
@@ -362,6 +501,7 @@ fn overview_json(overview: &Overview) -> Json {
             ("image", optional(proxy.image.as_deref())),
             ("health", optional(health_word(proxy))),
             ("port", proxy.port.map_or(Json::Null, number)),
+            ("published", proxy_ports_json(&proxy.published)),
         ])
     });
     let leftovers = overview.leftovers.iter().map(|(resource, name)| {
@@ -379,6 +519,22 @@ fn overview_json(overview: &Overview) -> Json {
 
 fn number(value: impl Into<u64>) -> Json {
     Json::Number(Number::U64(value.into()))
+}
+
+fn proxy_ports_json(ports: &[ProxyPort]) -> Json {
+    Json::Array(
+        ports
+            .iter()
+            .map(|port| {
+                json::object([
+                    ("name", json::string(port.name)),
+                    ("host", number(port.host)),
+                    ("vm", number(port.vm)),
+                    ("address", json::string(&proxy_address(port))),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn ports_json(ports: &[PublishedPort]) -> Json {
@@ -547,7 +703,15 @@ fn proxy_text(proxy: &ProxyDetail) -> Vec<String> {
             vec![proxy_state(status).unwrap_or("external").into()],
         ),
         field("health", vec![health]),
-        field("address", status.port.map(loopback).into_iter().collect()),
+        if status.published.is_empty() {
+            field("address", status.port.map(loopback).into_iter().collect())
+        } else {
+            let ports = status
+                .published
+                .iter()
+                .map(|port| format!("{}  {}", port.name, proxy_address(port)));
+            field("ports", ports.collect())
+        },
         field("bays", proxy.bays.clone()),
         field("tokens", tokens.collect()),
     ]
@@ -626,6 +790,7 @@ fn detail_json(detail: &Detail) -> Json {
                 ("health", optional(health_word(status))),
                 ("health_error", why),
                 ("port", status.port.map_or(Json::Null, number)),
+                ("published", proxy_ports_json(&status.published)),
                 ("url", optional(proxy.url.as_deref())),
                 ("image", optional(status.image.as_deref())),
                 ("vm", optional(proxy.vm.as_deref())),
@@ -666,10 +831,6 @@ fn table(rows: &[Vec<String>]) -> Vec<String> {
         .collect()
 }
 
-fn cells<const N: usize>(values: [&str; N]) -> Vec<String> {
-    values.map(String::from).to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Outcome, Render, error_json};
@@ -677,7 +838,7 @@ mod tests {
     use crate::error::Error;
     use crate::lifecycle::{self, Change, Resource};
     use crate::mounts::{Mode, MountKind, MountStatus};
-    use crate::proxy::Health;
+    use crate::proxy::{Health, ProxyPort};
     use crate::sandbox::{BoxState, PublishedPort};
     use crate::status::{
         BayDetail, BayStatus, Detail, Overview, ProxyDetail, ProxyStatus,
@@ -719,7 +880,16 @@ mod tests {
                 outcome,
             })
             .collect();
-        Outcome::Changes(UpReport { changes })
+        let addresses = [(
+            "p".to_string(),
+            vec!["127.0.0.1:3100".to_string(), "http://127.0.0.1:3101".into()],
+        )]
+        .into();
+        Outcome::Changes(UpReport {
+            changes,
+            addresses,
+            overview: None,
+        })
     }
 
     #[test]
@@ -727,19 +897,19 @@ mod tests {
         let outcome = changes();
         assert_eq!(
             outcome.human(),
-            "p: created\n\
-             a: recreated (image, ports)\n\
-             b: updated (env; copies +x)\n\
-             c: unchanged\n\
-             d: stopped\n\
-             e: removed\n\
-             f: failed: boom (try: retry)\n\
-             g: failed: bust"
+            "NAME  TYPE   RESULT     DETAILS            ADDRESS\n\
+             p     proxy  created                       127.0.0.1:3100\n\
+             \x20                                          http://127.0.0.1:3101\n\
+             a     bay    recreated  image, ports\n\
+             b     bay    updated    env; copies +x\n\
+             c     bay    unchanged\n\
+             d     bay    stopped\n\
+             e     bay    removed\n\
+             f     bay    failed     boom (try: retry)\n\
+             g     bay    failed     bust"
         );
         assert_eq!(outcome.exit_code(), 1);
-        let ok = Outcome::Changes(UpReport {
-            changes: Vec::new(),
-        });
+        let ok = Outcome::Changes(UpReport::default());
         assert_eq!(ok.exit_code(), 0);
         assert_eq!(Outcome::Done.exit_code(), 0);
     }
@@ -748,10 +918,10 @@ mod tests {
     fn up_json_shape() {
         let json = to_string(&changes().json());
         assert!(json.starts_with(
-            r#"{"changes":[{"error":null,"name":"p","outcome":"created","reasons":[],"type":"proxy"},{"error":null,"name":"a","outcome":"recreated","reasons":["image","ports"],"type":"bay"}"#
+            r#"{"changes":[{"addresses":["127.0.0.1:3100","http://127.0.0.1:3101"],"error":null,"name":"p","outcome":"created","reasons":[],"type":"proxy"},{"addresses":[],"error":null,"name":"a","outcome":"recreated","reasons":["image","ports"],"type":"bay"}"#
         ), "{json}");
         assert!(json.contains(
-            r#"{"error":{"error":"boom","hint":"retry"},"name":"f","outcome":"failed","reasons":[],"type":"bay"}"#
+            r#"{"addresses":[],"error":{"error":"boom","hint":"retry"},"name":"f","outcome":"failed","reasons":[],"type":"bay"}"#
         ), "{json}");
         assert!(json.ends_with(r#""version":1}"#), "{json}");
     }
@@ -765,6 +935,9 @@ mod tests {
             image: state.map(|_| "fake:1".into()),
             health: None,
             port: Some(3100),
+            published: state
+                .map(|_| vec![ProxyPort::proxy(3100, 3100)])
+                .unwrap_or_default(),
         }
     }
 
@@ -844,14 +1017,15 @@ mod tests {
         assert_eq!(
             overview(false).human(),
             "NAME  TYPE   STATE     PROXY  PORTS\n\
-             work  bay    running   p      http://127.0.0.1:3000, 127.0.0.1:5433\n\
+             work  bay    running   p      http://127.0.0.1:3000\n\
+             \x20                             127.0.0.1:5433\n\
              p     proxy  stopped   -      127.0.0.1:3100\n\
              ext   proxy  external  -      127.0.0.1:3100\n\
              gone  proxy  leftover  -      -"
         );
         assert_eq!(
             to_string(&overview(false).json()),
-            r#"{"bays":[{"apps":[{"name":"web","state":"exited"}],"image":"img:1","name":"work","ports":[{"address":"http://127.0.0.1:3000","app":"web","host":3000,"name":"ui","purpose":"Web UI","vm":3000},{"address":"127.0.0.1:5433","app":"web","host":5433,"name":"db","purpose":"Database","vm":5432}],"proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"health":null,"image":"fake:1","kind":"fake","name":"p","port":3100,"state":"stopped"},{"health":null,"image":null,"kind":"fake","name":"ext","port":3100,"state":null}],"version":1}"#
+            r#"{"bays":[{"apps":[{"name":"web","state":"exited"}],"image":"img:1","name":"work","ports":[{"address":"http://127.0.0.1:3000","app":"web","host":3000,"name":"ui","purpose":"Web UI","vm":3000},{"address":"127.0.0.1:5433","app":"web","host":5433,"name":"db","purpose":"Database","vm":5432}],"proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"health":null,"image":"fake:1","kind":"fake","name":"p","port":3100,"published":[{"address":"127.0.0.1:3100","host":3100,"name":"proxy","vm":3100}],"state":"stopped"},{"health":null,"image":null,"kind":"fake","name":"ext","port":3100,"published":[],"state":null}],"version":1}"#
         );
     }
 
@@ -864,7 +1038,11 @@ mod tests {
             rows[1].ends_with("img:1   web:exited  ~/notes:~/notes:ro"),
             "{wide}"
         );
-        assert_eq!(rows[2].trim_start(), "~/.gitconfig:~/.gitconfig:copy");
+        assert!(rows[2].trim_start().starts_with("127.0.0.1:5433"), "{wide}");
+        assert!(
+            rows[2].ends_with("~/.gitconfig:~/.gitconfig:copy"),
+            "{wide}"
+        );
         assert_eq!(rows[2].find('~'), rows[0].find("MOUNTS"), "{wide}");
         assert!(rows[3].ends_with("fake:1  -           -"), "{wide}");
         assert_eq!(
@@ -961,8 +1139,8 @@ mod tests {
                 log: vm.map(|_| PathBuf::from("/d/p.log")),
                 bays: vec!["work".into()],
                 tokens: vec![
-                    ("proxy-token", TokenSource::Keychain),
-                    ("session-token", TokenSource::Missing),
+                    ("proxy-token".into(), TokenSource::Keychain),
+                    ("session-token".into(), TokenSource::Missing),
                 ],
             })))
         };
@@ -977,7 +1155,7 @@ mod tests {
              kind:     fake, run by hangar\n  \
              state:    running\n  \
              health:   up\n  \
-             address:  127.0.0.1:3100\n  \
+             ports:    proxy  127.0.0.1:3100\n  \
              bays:     work\n  \
              tokens:   proxy-token (keychain)\n            \
              session-token (missing)\n  \

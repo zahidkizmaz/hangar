@@ -28,7 +28,6 @@ mod status;
 mod testing;
 mod vm_record;
 
-use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -73,17 +72,30 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Show or edit the config file
+    #[command(subcommand)]
+    Config(ConfigCommand),
     #[command(flatten)]
     OnHangar(OnHangar),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the config file as written
+    Show,
+    /// Open the config file in $VISUAL or $EDITOR (default: vi), then check
+    /// it
+    Edit,
 }
 
 /// The commands that act on the configured hangar.
 #[derive(Debug, Subcommand)]
 enum OnHangar {
     /// Create or start bays and proxies and apply the config
-    #[command(after_help = "Without NAME: every bay and proxy. A bay's \
-                            proxy comes up first; a bay whose proxy fails \
-                            is left alone. Exits 1 if anything failed.")]
+    #[command(after_help = "Without NAME: every bay and proxy. What they \
+                            need comes up first: a bay's proxy, and a \
+                            proxy's server bay. Whatever needs a failed \
+                            one is left alone. Exits 1 if anything failed.")]
     Up {
         /// Bays or proxies (default: all)
         names: Vec<String>,
@@ -204,16 +216,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let env = env_var("HANGAR_LOG");
     let level = logger::level(cli.quiet, cli.verbose.into(), env.as_deref());
-    // Color only on a terminal, and never with NO_COLOR set.
-    let color =
-        io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    logger::init(level, color, log_file());
+    logger::init(level, log_file());
     let format = if cli.json {
+        logger::without_headings();
         Format::Json
     } else {
         Format::Human
     };
-    match run(cli.command) {
+    let result = run(cli.command);
+    logger::end();
+    match result {
         Ok(outcome) => {
             output::emit(format, &outcome);
             ExitCode::from(outcome.exit_code())
@@ -234,14 +246,56 @@ fn run(command: Command) -> Result<Outcome> {
     let paths = Paths::locate(&env_var)?;
     match command {
         Command::Init { force } => {
+            logger::heading("Writing a starter config");
             commands::init(&paths, force)?;
+            Ok(Outcome::Done)
+        }
+        Command::Config(ConfigCommand::Show) => {
+            logger::heading(&format!("Reading {}", paths.config.display()));
+            commands::config_show(&paths)?;
+            Ok(Outcome::Streamed)
+        }
+        Command::Config(ConfigCommand::Edit) => {
+            logger::heading(&format!("Editing {}", paths.config.display()));
+            let editor = env_var("VISUAL").or_else(|| env_var("EDITOR"));
+            commands::config_edit(&paths, editor.as_deref())?;
             Ok(Outcome::Done)
         }
         Command::OnHangar(command) => on_hangar(&paths, command),
     }
 }
 
+/// What the command is about to do, for the line its progress goes under;
+/// `up`, `down` and `restart` say it once they know what they touch.
+fn heading(command: &OnHangar) -> Option<String> {
+    Some(match command {
+        OnHangar::Rm {
+            name, data: true, ..
+        } => {
+            format!("Removing {name} and its data")
+        }
+        OnHangar::Rm { name, .. } => format!("Removing {name}"),
+        OnHangar::Ps { .. } => "Checking bays and proxies".into(),
+        OnHangar::Inspect { name } => format!("Inspecting {name}"),
+        OnHangar::Cp { src, dest } => format!("Copying {src} to {dest}"),
+        OnHangar::Setup { bay, app, .. } => {
+            format!("Setting up {app} in {bay}")
+        }
+        OnHangar::Secret(SecretCommand::Set { proxy, .. }) => {
+            format!("Setting the tokens of {proxy}")
+        }
+        OnHangar::Up { .. }
+        | OnHangar::Down { .. }
+        | OnHangar::Restart { .. }
+        | OnHangar::Exec { .. }
+        | OnHangar::Logs { .. } => return None,
+    })
+}
+
 fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
+    if let Some(text) = heading(&command) {
+        logger::heading(&text);
+    }
     let hangar = Hangar::load(paths)?;
     let _lock = if command.changes_state() {
         let path = hangar.state_root.join("lock");

@@ -60,6 +60,7 @@ impl Hangar {
         let proxies = build_proxies(&settings, &state, &host_home, &keychain)
             .context(&invalid)?;
         check_ports(&settings, &proxies).context(&invalid)?;
+        check_bay_tokens(&settings, &proxies).context(&invalid)?;
         Ok(Self {
             settings,
             state,
@@ -175,6 +176,25 @@ pub(crate) fn build_proxies(
         .collect()
 }
 
+/// A proxy gives a bay a token of its own only when the bay goes through
+/// it: a misspelled or moved bay would otherwise get the shared one.
+pub(crate) fn check_bay_tokens(
+    settings: &Settings,
+    proxies: &BTreeMap<String, Box<dyn Proxy>>,
+) -> Result<()> {
+    for (name, proxy) in proxies {
+        for (bay, _) in proxy.bay_tokens() {
+            let uses = settings.bays.iter().any(|known| {
+                known.name == bay && known.proxy.as_deref() == Some(name)
+            });
+            if !uses {
+                bail!("proxies.{name}: bay {bay} doesn't go through {name}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// No two things take the same host port: proxies (where they listen or
 /// publish) and bays. Only external proxies may share one, e.g. two
 /// vaults on one Agent Vault server.
@@ -187,8 +207,14 @@ pub(crate) fn check_ports(
             Egress::HostPort(port) => Some(port),
             Egress::Open | Egress::OpenAndHostPort(_) => None,
         };
-        let published = proxy.managed().map(|managed| managed.vm().publish.0);
-        let shareable = published.is_none();
+        let published: Vec<u16> = proxy
+            .managed()
+            .map(|managed| managed.vm().publish)
+            .unwrap_or_default()
+            .iter()
+            .map(|port| port.host)
+            .collect();
+        let shareable = published.is_empty();
         let mut ports: Vec<u16> = egress.into_iter().chain(published).collect();
         ports.dedup();
         ports
@@ -245,7 +271,9 @@ mod tests {
     use crate::lifecycle::Resource;
     use crate::sandbox::fake::FakeSandbox;
     use crate::state::StateDir;
-    use crate::testing::{hangar_with, no_keychain, scratch_dir, settings};
+    use crate::testing::{
+        hangar_with, no_keychain, scratch_dir, settings, settled,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
@@ -286,6 +314,35 @@ mod tests {
     const MANAGED_AT_3100: &str = r#"{"proxies": {"p":
         {"kind": "fake", "run": "managed", "managed": true, "port": 3100}},
         "bays": [{"name": "work", "proxy": "p", "apps": ["paperclip"]}]}"#;
+
+    #[test]
+    fn a_bays_own_token_needs_that_bay_behind_the_proxy() {
+        use super::check_bay_tokens;
+        let config = |bays: &str| {
+            format!(
+                r#"{{"proxies": {{"v": {{"kind": "fake", "port": 3100,
+                    "url": "http://127.0.0.1:3100", "ownTokens": ["x"]}}}},
+                    "bays": [{bays}]}}"#
+            )
+        };
+        let check = |bays: &str| {
+            let config = config(bays);
+            let hangar =
+                hangar_with(&config, &scratch_dir("own-check"), settled());
+            check_bay_tokens(&hangar.settings, &hangar.proxies)
+        };
+        assert!(check(r#"{"name": "x", "proxy": "v"}"#).is_ok());
+        for bays in [
+            r#"{"name": "y", "proxy": "v"}"#,
+            r#"{"name": "x", "proxy": null}"#,
+        ] {
+            assert_eq!(
+                check(bays).unwrap_err().to_string(),
+                "proxies.v: bay x doesn't go through v",
+                "{bays}"
+            );
+        }
+    }
 
     #[test]
     fn published_ports_never_collide() {

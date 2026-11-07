@@ -6,7 +6,7 @@ use crate::bay::{self, Bay};
 use crate::hangar::Hangar;
 use crate::lifecycle::Resource;
 use crate::mounts::{self, MountStatus};
-use crate::proxy::{Health, Location, Managed, Proxy, proxy_vm};
+use crate::proxy::{Health, Location, Managed, Proxy, ProxyPort, proxy_vm};
 use crate::sandbox::{BoxState, Egress, PublishedPort, data_volume};
 use crate::vm_record::VmRecord;
 
@@ -59,6 +59,8 @@ pub(crate) struct ProxyStatus {
     pub(crate) health: Option<Health>,
     /// The host port its bays reach it on.
     pub(crate) port: Option<u16>,
+    /// What a managed one publishes on the host's 127.0.0.1.
+    pub(crate) published: Vec<ProxyPort>,
 }
 
 pub(crate) enum Detail {
@@ -93,7 +95,7 @@ pub(crate) struct ProxyDetail {
     pub(crate) log: Option<PathBuf>,
     /// The bays that go through it.
     pub(crate) bays: Vec<String>,
-    pub(crate) tokens: Vec<(&'static str, TokenSource)>,
+    pub(crate) tokens: Vec<(String, TokenSource)>,
 }
 
 /// Where a proxy's token comes from, checked without reading it out.
@@ -117,12 +119,32 @@ impl TokenSource {
     }
 }
 
+/// The state of the bays and proxies named, without asking a bay about
+/// its apps: what `up` and `down` show after they're done.
+pub(crate) fn of(hangar: &Hangar, names: &[&str]) -> Overview {
+    Overview {
+        bays: hangar
+            .bays()
+            .iter()
+            .filter(|bay| names.contains(&bay.name))
+            .map(|bay| bay_status(hangar, bay, false))
+            .collect(),
+        proxies: hangar
+            .proxies
+            .iter()
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .map(|(name, proxy)| proxy_status(hangar, name, proxy.as_ref()))
+            .collect(),
+        leftovers: Vec::new(),
+    }
+}
+
 pub(crate) fn collect(hangar: &Hangar) -> Overview {
     Overview {
         bays: hangar
             .bays()
             .iter()
-            .map(|bay| bay_status(hangar, bay))
+            .map(|bay| bay_status(hangar, bay, true))
             .collect(),
         proxies: hangar
             .proxies
@@ -143,7 +165,7 @@ pub(crate) fn bay_detail(hangar: &Hangar, bay: &Bay) -> Detail {
                 Egress::Open | Egress::OpenAndHostPort(_) => None,
             });
     Detail::Bay(BayDetail {
-        status: bay_status(hangar, bay),
+        status: bay_status(hangar, bay, true),
         vm: bay.vm.clone(),
         cpus: settings.cpus,
         memory: settings.memory.clone(),
@@ -186,44 +208,52 @@ pub(crate) fn proxy_detail(
     })
 }
 
+/// Each token's source, the bays' own last.
 fn tokens(
     hangar: &Hangar,
     name: &str,
     proxy: &dyn Proxy,
-) -> Vec<(&'static str, TokenSource)> {
-    let slots = proxy.secrets();
-    let found = hangar.secrets(name).and_then(|secrets| {
-        Ok((secrets.settable(slots), secrets.missing(slots)?))
-    });
-    let (settable, missing) = match found {
-        Ok(found) => found,
+) -> Vec<(String, TokenSource)> {
+    let keys: Vec<String> = proxy
+        .secrets()
+        .iter()
+        .map(|slot| slot.key.to_string())
+        .chain(proxy.bay_tokens().into_iter().map(|(_, key)| key))
+        .collect();
+    let secrets = match hangar.secrets(name) {
+        Ok(secrets) => secrets,
         Err(error) => {
             log::warn!("proxy {name}: tokens: {error}");
-            return slots
-                .iter()
-                .map(|slot| (slot.key, TokenSource::Unknown))
+            return keys
+                .into_iter()
+                .map(|key| (key, TokenSource::Unknown))
                 .collect();
         }
     };
-    slots
-        .iter()
-        .map(|slot| {
-            let source = if !settable.contains(slot) {
+    keys.into_iter()
+        .map(|key| {
+            let source = if secrets.is_command(&key) {
                 TokenSource::Command
-            } else if missing.contains(slot) {
-                TokenSource::Missing
             } else {
-                TokenSource::Keychain
+                match secrets.has(&key) {
+                    Ok(true) => TokenSource::Keychain,
+                    Ok(false) => TokenSource::Missing,
+                    Err(error) => {
+                        log::warn!("proxy {name}: {key}: {error}");
+                        TokenSource::Unknown
+                    }
+                }
             };
-            (slot.key, source)
+            (key, source)
         })
         .collect()
 }
 
-fn bay_status(hangar: &Hangar, bay: &Bay) -> BayStatus {
+/// `apps` asks the bay itself, so only `ps` and `inspect` do.
+fn bay_status(hangar: &Hangar, bay: &Bay, apps: bool) -> BayStatus {
     let state = vm_state(hangar, &bay.vm);
     let apps = match state {
-        Some(BoxState::Running) => app_states(hangar, bay),
+        Some(BoxState::Running) if apps => app_states(hangar, bay),
         _ => Vec::new(),
     };
     let (home, cache) = bay.own_mounts();
@@ -286,6 +316,9 @@ fn proxy_status(hangar: &Hangar, name: &str, proxy: &dyn Proxy) -> ProxyStatus {
             Egress::HostPort(port) => Some(port),
             Egress::Open | Egress::OpenAndHostPort(_) => None,
         },
+        published: managed
+            .map(|managed| managed.vm().publish)
+            .unwrap_or_default(),
     }
 }
 
@@ -362,6 +395,7 @@ mod tests {
             image: None,
             health,
             port: None,
+            published: Vec::new(),
         }
     }
 

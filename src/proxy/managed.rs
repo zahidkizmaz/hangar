@@ -149,7 +149,6 @@ fn resolve_mounts(
 /// Sorted, so the same proxy always records the same VM. A changed
 /// entrypoint rides in the fingerprint: it recreates like any other.
 pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
-    let (host, guest) = vm.publish;
     let mut mounts: Vec<String> = vm
         .mounts
         .iter()
@@ -168,7 +167,11 @@ pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
         egress: Some(vm.egress().record()),
         resources: Some(lifecycle::resources(vm.cpus, &vm.memory, None)),
         fingerprint: Some(fingerprint),
-        ports: vec![("proxy".into(), host, guest)],
+        ports: vm
+            .publish
+            .iter()
+            .map(|port| (port.name.into(), port.host, port.vm))
+            .collect(),
         mounts,
     }
 }
@@ -239,10 +242,12 @@ fn create(
             host,
             guest,
             mode: *mode,
-            owner: None,
+            owner: vm.user,
             file: false,
         })
         .collect();
+    let publish: Vec<(u16, u16)> =
+        vm.publish.iter().map(|port| (port.host, port.vm)).collect();
     hangar.sandbox.create(&VmSpec {
         name: &proxy_vm(name),
         image: &vm.image,
@@ -253,7 +258,7 @@ fn create(
         volumes: &[],
         init: None,
         egress: vm.egress(),
-        publish: &[vm.publish],
+        publish: &publish,
         mounts: &mounts,
         env: &[],
     })?;

@@ -22,7 +22,9 @@ Linux. Each is an item of service `hangar`, account `<proxy>/<token>`,
 e.g. `vault/session-token`.
 
 - `hangar up` asks for each token that's missing, typed unseen, and
-  stores it. Without a terminal it doesn't ask: the proxy fails with
+  stores it: a proxy's own just before it starts, the one its bays log
+  in with just before the first of them, when Enter skips it. Without a
+  terminal it doesn't ask: what needs the token fails with
   `run 'hangar secret set <proxy>'`.
 - `hangar secret set <proxy> [token]` asks for one, or all of them
   again. Piped, it reads one token per line, in the order listed below:
@@ -66,7 +68,8 @@ shows the proxy's log, `data/proxy.log`; each start moves a log past
 10 MiB to `proxy.log.1`, keeping one old log.
 
 Tokens, in the order `secret set` asks for them: `proxy-token`, then
-`session-token`.
+`session-token`. `up` asks for the session token when a bay behind the
+proxy comes up.
 
 ### Infisical setup
 
@@ -104,18 +107,62 @@ old token.
 
 ## `agent-vault`
 
-An [Agent Vault](https://github.com/Infisical/agent-vault) you run
-yourself on this machine.
+Infisical's open-source [Agent Vault](https://github.com/Infisical/agent-vault)
+server, with a free per-request log and OAuth credentials it refreshes
+itself. Infisical marks it deprecated, so pin it and keep an exit.
+
+Managed, `"run": "managed"`, hangar runs it in its own VM:
+
+| Key | Default |
+| --- | --- |
+| `hostPort` | `14322`: the proxy port the bays use (`127.0.0.1` only) |
+| `uiPort` | `14321`: its web UI and API (`127.0.0.1` only) |
+| `image` | `infisical/agent-vault:0.40.2`, pinned by digest |
+| `vault` | `"default"`: the vault the bays log in to |
+| `bays` | `{}`: bay → vault, for bays kept apart, see below |
+
+Its data, a SQLite database and its CA, lives in
+`$XDG_DATA_HOME/hangar/proxies/<name>/data/data` and is never emptied.
+`hangar up` starts it with the master password on stdin. The bays trust
+the CA it serves at `/v1/mitm/ca.pem`, and `hangar logs NAME` shows
+`server.log`.
+
+Tokens: `master-password`, asked on the first `up` of the proxy, and
+`token`, asked when a bay behind it first comes up. To set it up:
+
+1. `hangar up NAME`, and pick a master password. Changing it later
+   takes `agent-vault master-password change`, not `secret set`.
+2. Open the UI (`hangar ps` shows its URL), register (the first account
+   owns the server), and add services and credentials to the vault.
+   An OAuth credential's "Connect" runs in your browser, so no OAuth
+   token ever enters a bay.
+3. Create an agent token with the proxy role, then `hangar up` a bay
+   and paste it.
+
+One you run yourself, `"url"`:
 
 | Key | Default |
 | --- | --- |
 | `url` | required: `http://127.0.0.1:<port>`, its proxy port |
 | `ca` | required: see [The `ca` object](#the-ca-object) |
 | `vault` | `"default"`: the vault name |
+| `bays` | `{}`: bay → vault, as below |
 
-A bay logs in with the proxy's `token` (the one you minted for the
-bays) as the user and the vault name as the password. Health is a TCP
-connect to the port.
+Either way, a bay logs in with the proxy's `token` as the user and the
+vault name as the password. Health is a TCP connect to the proxy port.
+
+A bay listed in `bays` logs in to its own vault with its own token,
+`token@<bay>`, asked for when that bay first comes up:
+
+```json
+"av": { "kind": "agent-vault", "run": "managed",
+        "bays": { "oss": "oss-vault" } }
+```
+
+Give that token's agent the proxy role on that vault only. A shared
+token with access to several vaults isn't a boundary: any bay can name
+another vault in its login. Every bay not listed shares `vault` and
+`token`. A listed bay must go through this proxy.
 
 ## `http`
 
@@ -183,8 +230,10 @@ The `Proxy` trait:
 | `secrets` | optional: the tokens it reads from its `Secrets` |
 
 A managed kind implements `Managed`: `vm()` (image, CPUs, memory, the
-published port and mounts), `fingerprint()`, `start()` and
-`log_file()`. A new fingerprint recreates the VM with empty mounts.
+published ports, the user it runs as, mounts and an extra host port it
+may reach), `fingerprint()`, `start()` and `log_file()`. A new
+fingerprint recreates the VM with empty mounts, so a kind whose data
+must survive keeps it constant.
 The core creates, recreates, starts and stops the VM. A capability a kind
 lacks is `None`, never an "unsupported" error.
 

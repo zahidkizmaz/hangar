@@ -1,19 +1,19 @@
 //! Diagnostics through the `log` facade: on stderr, and every `info` and
-//! above in the persistent, timestamped log file. Stdout is for command
-//! output only.
+//! above in the persistent log file, each line with the local time.
+//! Stdout is for command output only.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use jiff::Zoned;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 struct Logger {
     stderr: LevelFilter,
-    color: bool,
     file: Option<PathBuf>,
 }
 
@@ -23,21 +23,46 @@ pub(crate) const REPORT: &str = "hangar::report";
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+/// Set once a [`heading`] is on stderr: the lines after it are indented,
+/// until [`end`].
+static UNDER_HEADING: AtomicBool = AtomicBool::new(false);
+
+/// A line naming what a command is about to do, unindented on stderr; the
+/// progress lines after it are indented under it.
+pub(crate) fn heading(text: &str) {
+    if HEADINGS.load(Ordering::Relaxed) {
+        log::info!(target: HEADING, "{text}");
+    }
+}
+
+/// Off for `--json`: machine-read stderr ends with the JSON error alone.
+static HEADINGS: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn without_headings() {
+    HEADINGS.store(false, Ordering::Relaxed);
+}
+
+/// Closes a [`heading`] with an empty line, so a result follows apart.
+pub(crate) fn end() {
+    if UNDER_HEADING.swap(false, Ordering::Relaxed) {
+        let _ = writeln!(io::stderr().lock());
+    }
+}
+
+/// Target of a [`heading`].
+const HEADING: &str = "hangar::heading";
+
 /// `file` is created on the first line written to it.
-pub(crate) fn init(level: LevelFilter, color: bool, file: Option<PathBuf>) {
-    let logger = LOGGER.get_or_init(|| Logger::new(level, color, file));
+pub(crate) fn init(level: LevelFilter, file: Option<PathBuf>) {
+    let logger = LOGGER.get_or_init(|| Logger::new(level, file));
     // Only fails when a logger is already set, which can't happen here.
     let _ = log::set_logger(logger);
     log::set_max_level(logger.max_level());
 }
 
 impl Logger {
-    fn new(stderr: LevelFilter, color: bool, file: Option<PathBuf>) -> Self {
-        Self {
-            stderr,
-            color,
-            file,
-        }
+    fn new(stderr: LevelFilter, file: Option<PathBuf>) -> Self {
+        Self { stderr, file }
     }
 
     /// The file keeps `info` even under `-q`: it's the record of what
@@ -58,8 +83,21 @@ impl Logger {
         if record.level() > self.stderr || record.target() == REPORT {
             return;
         }
-        let line = line(record.level(), &record.args().to_string(), self.color);
-        let _ = writeln!(io::stderr().lock(), "{line}");
+        let message = record.args().to_string();
+        let mut stderr = io::stderr().lock();
+        if record.target() == HEADING {
+            UNDER_HEADING.store(true, Ordering::Relaxed);
+            let _ = writeln!(stderr, "{message}");
+            return;
+        }
+        let line = line(&Zoned::now(), record.level(), &message);
+        // clap's indent, so progress lines up with `--help`.
+        let indent = if UNDER_HEADING.load(Ordering::Relaxed) {
+            "  "
+        } else {
+            ""
+        };
+        let _ = writeln!(stderr, "{indent}{line}");
     }
 
     fn write_file(&self, record: &Record) {
@@ -68,7 +106,7 @@ impl Logger {
             return;
         }
         let line = file_line(
-            SystemTime::now(),
+            &Zoned::now(),
             record.level(),
             &record.args().to_string(),
         );
@@ -92,34 +130,15 @@ fn append(path: &Path, line: &str) -> io::Result<()> {
     file.write_all(format!("{line}\n").as_bytes())
 }
 
-/// One line per event, even when the message spans several.
-fn file_line(now: SystemTime, level: Level, message: &str) -> String {
-    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+/// One line per event, even when the message spans several, stamped with
+/// the date, the local time and its offset from UTC.
+fn file_line(now: &Zoned, level: Level, message: &str) -> String {
     let level = level.as_str().to_lowercase();
-    format!("{} {level} {}", rfc3339(secs), message.replace('\n', " "))
-}
-
-/// UTC, from days since the epoch (Hinnant's civil-from-days).
-fn rfc3339(secs: u64) -> String {
-    let (days, rest) = (secs / 86_400, secs % 86_400);
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let day_of_era = z % 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        / 365;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    format!(
+        "{} {level} {}",
+        now.strftime("%Y-%m-%dT%H:%M:%S%:z"),
+        message.replace('\n', " ")
+    )
 }
 
 /// `-q` and `-v`/`-vv` win over `HANGAR_LOG`; info by default.
@@ -138,19 +157,10 @@ pub(crate) fn level(
     }
 }
 
-fn line(level: Level, message: &str, color: bool) -> String {
-    let (prefix, code) = match level {
-        Level::Error => ("error:", "31"),
-        Level::Warn => ("warning:", "33"),
-        Level::Info => ("==>", "1"),
-        Level::Debug => ("debug:", "2"),
-        Level::Trace => ("trace:", "2"),
-    };
-    if color {
-        format!("\x1b[{code}m{prefix}\x1b[0m {message}")
-    } else {
-        format!("{prefix} {message}")
-    }
+/// The local time and the level, in columns: plain, like clap's output.
+fn line(now: &Zoned, level: Level, message: &str) -> String {
+    let level = level.as_str().to_lowercase();
+    format!("{}  {level:<5}  {message}", now.strftime("%H:%M:%S"))
 }
 
 /// Trap: ureq and rustls log too, and their lines may name a request's
@@ -178,37 +188,35 @@ impl Log for Logger {
 
 #[cfg(test)]
 mod tests {
-    use super::{Logger, REPORT, file_line, level, line, ours, rfc3339};
+    use super::{Logger, REPORT, file_line, level, line, ours};
     use log::{Level, LevelFilter, Metadata, Record};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
 
-    fn at(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    use jiff::Timestamp;
+    use jiff::tz::{TimeZone, offset};
+
+    /// `secs` after the epoch, in a zone `hours` ahead of UTC.
+    fn at(secs: i64, hours: i8) -> jiff::Zoned {
+        Timestamp::from_second(secs)
+            .unwrap()
+            .to_zoned(TimeZone::fixed(offset(hours)))
     }
 
     #[test]
-    fn file_line_is_utc_rfc3339() {
+    fn file_lines_carry_the_local_time_and_its_offset_on_one_line() {
         assert_eq!(
-            file_line(at(0), Level::Info, "x"),
-            "1970-01-01T00:00:00Z info x"
+            file_line(&at(0, 0), Level::Info, "x"),
+            "1970-01-01T00:00:00+00:00 info x"
         );
         assert_eq!(
-            file_line(at(1_793_880_000), Level::Warn, "m"),
-            "2026-11-05T12:00:00Z warn m"
+            file_line(&at(1_793_880_000, 1), Level::Warn, "m"),
+            "2026-11-05T13:00:00+01:00 warn m"
         );
-        assert_eq!(rfc3339(1_835_481_599), "2028-02-29T23:59:59Z");
-        assert_eq!(rfc3339(1_835_481_600), "2028-03-01T00:00:00Z");
-        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn file_lines_stay_on_one_line() {
         assert_eq!(
-            file_line(at(0), Level::Error, "a\nb"),
-            "1970-01-01T00:00:00Z error a b"
+            file_line(&at(0, -5), Level::Error, "a\nb"),
+            "1969-12-31T19:00:00-05:00 error a b"
         );
     }
 
@@ -232,14 +240,13 @@ mod tests {
     #[test]
     fn quiet_still_writes_info_to_file() {
         let path = scratch("quiet");
-        let logger =
-            Logger::new(level(true, 0, None), false, Some(path.clone()));
+        let logger = Logger::new(level(true, 0, None), Some(path.clone()));
         assert!(!path.exists());
         write(&logger, Level::Info, "hangar", "default: vm");
         write(&logger, Level::Debug, "hangar", "run: msb");
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(text.ends_with("Z info default: vm\n"), "{text}");
+        assert!(text.ends_with(" info default: vm\n"), "{text}");
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -247,7 +254,7 @@ mod tests {
     #[test]
     fn reports_reach_the_file() {
         let path = scratch("report");
-        let logger = Logger::new(LevelFilter::Info, false, Some(path.clone()));
+        let logger = Logger::new(LevelFilter::Info, Some(path.clone()));
         write(&logger, Level::Info, REPORT, "default: created");
         assert!(fs::read_to_string(&path).unwrap().contains("created"));
     }
@@ -260,7 +267,7 @@ mod tests {
         let target = dir.join("victim");
         fs::write(&target, "keep").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        let logger = Logger::new(LevelFilter::Info, false, Some(path.clone()));
+        let logger = Logger::new(LevelFilter::Info, Some(path.clone()));
         write(&logger, Level::Info, "hangar", "x");
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
 
@@ -277,7 +284,7 @@ mod tests {
     #[test]
     fn verbose_adds_debug_to_the_file_and_appends() {
         let path = scratch("verbose");
-        let logger = Logger::new(LevelFilter::Debug, false, Some(path.clone()));
+        let logger = Logger::new(LevelFilter::Debug, Some(path.clone()));
         write(&logger, Level::Debug, "hangar::process", "run: msb");
         write(&logger, Level::Trace, "hangar", "too much");
         write(&logger, Level::Warn, "hangar", "again");
@@ -306,12 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn lines_carry_a_level_prefix_and_color_only_on_request() {
-        assert_eq!(line(Level::Info, "up", false), "==> up");
-        assert_eq!(line(Level::Warn, "x", false), "warning: x");
-        assert_eq!(line(Level::Error, "x", false), "error: x");
-        assert_eq!(line(Level::Debug, "x", false), "debug: x");
-        assert_eq!(line(Level::Trace, "x", false), "trace: x");
-        assert_eq!(line(Level::Error, "x", true), "\x1b[31merror:\x1b[0m x");
+    fn terminal_lines_carry_the_local_time_and_a_plain_prefix() {
+        let now = at(1_793_880_000, 1);
+        assert_eq!(line(&now, Level::Info, "up"), "13:00:00  info   up");
+        assert_eq!(line(&now, Level::Warn, "x"), "13:00:00  warn   x");
+        assert_eq!(line(&now, Level::Error, "x"), "13:00:00  error  x");
+        assert_eq!(line(&now, Level::Debug, "x"), "13:00:00  debug  x");
+        assert_eq!(line(&now, Level::Trace, "x"), "13:00:00  trace  x");
     }
 }

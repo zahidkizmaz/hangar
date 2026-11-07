@@ -1,0 +1,38 @@
+{
+  "proxies": {
+    "vault": {
+      "kind": "infisical",
+      "run": "managed",
+      "domain": "http://127.0.0.1:8080"
+    }
+  },
+  "defaults": { "proxy": "vault" },
+  "apps": {
+    "infisical": {
+      "packages": ["nixpkgs#docker-compose"],
+      "run": "sh ~/infisical/run.sh",
+      "ports": [
+        { "name": "infisical", "vm": 8080, "purpose": "Infisical", "http": true }
+      ]
+    }
+  },
+  "bays": [
+    {
+      "name": "infisical",
+      "proxy": null,
+      "apps": ["infisical"],
+      "disk": "20G",
+      "mounts": {
+        "~/infisical/compose.yml": {
+          "host": "~/.config/hangar/infisical/compose.yml",
+          "mode": "copy"
+        },
+        "~/infisical/run.sh": {
+          "host": "~/.config/hangar/infisical/run.sh",
+          "mode": "copy"
+        }
+      }
+    },
+    { "name": "work", "apps": ["claude-code"] }
+  ]
+}

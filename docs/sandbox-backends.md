@@ -5,10 +5,11 @@ hangar talks to its sandbox only through the `Sandbox` trait in
 `stop`, `remove`, `ensure_volume`, `remove_volume`, `copy_out`, `exec`,
 `shell`, `image_present`, `load_image` and `host_address`. `VmSpec` says
 what a VM gets in backend-neutral terms: `Egress::HostPort(port)`,
-`Egress::Open` or `Egress::OpenAndHostPort(port)`, published ports, mounts with a `MountMode` and an
-optional owner, non-secret env, the root disk size, an entrypoint
-override, named volumes that need a filesystem of their own (not an
-overlay) and an `init` to hand PID 1 to.
+`Egress::Open` or `Egress::OpenAndHostPort(port)`, published ports,
+mounts with a `MountMode` and an optional owner, non-secret env, the
+root disk size, an entrypoint override, named volumes that need a
+filesystem of their own (not an overlay) and an `init` to hand PID 1
+to.
 
 Each backend is one file, `src/sandbox/<backend>.rs`, and only that file
 knows its CLI, flags, status strings, host alias and traps. Today there is

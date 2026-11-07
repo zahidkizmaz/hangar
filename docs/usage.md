@@ -74,13 +74,21 @@ hangar up    # proxies first, then the bays
 hangar ps    # state, proxy and ports of each bay and proxy
 ```
 
-`up` prints one line per bay and proxy:
+Every command starts with a line saying what it does, indents its
+progress under it, and prints its result after an empty line. `up` ends
+with `ps` for what it touched, and what each came to:
 
 ```
-vault: created
-work: recreated (image, mounts)
-docs: updated (packages +rtk; started paperclip)
-scratch: unchanged
+Starting vault, work, docs, scratch
+  21:41:52  info   proxy vault: vm
+  21:41:53  info   bay work: vm
+  …
+
+NAME     TYPE   STATE    PROXY  PORTS                  RESULT
+vault    proxy  running  -      127.0.0.1:17323        created
+work     bay    running  vault  http://127.0.0.1:3100  recreated (image, mounts)
+docs     bay    running  vault  -                      updated (packages +rtk; started paperclip)
+scratch  bay    running  direct -                      unchanged
 ```
 
 ## Commands
@@ -92,6 +100,8 @@ namespace.
 | Command | Does |
 | --- | --- |
 | `init [--force]` | writes a starter config |
+| `config show` | prints the config file |
+| `config edit` | opens it in `$VISUAL` or `$EDITOR` (default `vi`), then checks it |
 | `up [NAME…]` | creates, starts, updates or recreates bays and proxies (default: all) |
 | `down [NAME…]` | stops them (bays first) |
 | `restart [NAME…]` | `down`, then `up` |
@@ -104,9 +114,11 @@ namespace.
 | `setup BAY APP [--force]` | runs an app's one-time interactive setup |
 | `secret set PROXY [TOKEN]` | asks for a proxy's tokens and keeps them in the OS keychain |
 
-- **`up`** brings each selected bay's proxy up first. A bay whose proxy
-  failed is left alone, and any failure makes `up` exit 1 while the rest
-  goes on. What `up` applies in place and what recreates a VM is in
+- **`up`** brings up what the named ones need too, in order: a bay after
+  its proxy, and a proxy whose server runs in a bay (a local `domain`)
+  after that bay. Whatever needs a failed one is left alone, and any
+  failure makes `up` exit 1 while the rest goes on. What `up` applies
+  in place and what recreates a VM is in
   [configuration.md](configuration.md#what-up-changes).
 - **`rm`** takes a configured name or a leftover (a folder in the data dir
   with no config entry). `--data` deletes a bay's home and data volume, or

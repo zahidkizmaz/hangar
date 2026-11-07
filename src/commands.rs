@@ -1,6 +1,7 @@
 //! What each command does. Commands return data for `output` to render;
 //! `main` only parses arguments and dispatches here.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -17,10 +18,10 @@ use crate::files::{self, Copied, Request};
 use crate::hangar::Hangar;
 use crate::lifecycle::{Change, Outcome, Resource};
 use crate::prompt::Prompt;
-use crate::proxy::{Proxy, Secrets, Slot, managed, proxy_vm};
-use crate::sandbox::{BoxState, bay_vm, data_volume};
+use crate::proxy::{Proxy, Secrets, managed, proxy_vm};
+use crate::sandbox::{BoxState, Egress, bay_vm, data_volume};
 use crate::status::{self, Detail, Overview};
-use crate::{mounts, process};
+use crate::{mounts, output, process};
 use log::info;
 
 /// hangar's own log, in `$XDG_STATE_HOME/hangar`.
@@ -34,11 +35,18 @@ pub(crate) enum Target<'a> {
     Proxy(&'a str, &'a dyn Proxy),
 }
 
+#[derive(Default)]
 pub(crate) struct UpReport {
     pub(crate) changes: Vec<Change>,
+    /// Where to reach what came up: name -> addresses on 127.0.0.1.
+    pub(crate) addresses: BTreeMap<String, Vec<String>>,
+    /// `ps` for what changed, shown with each result; `None` keeps the
+    /// plain change table (`rm`, `secret set`).
+    pub(crate) overview: Option<Overview>,
 }
 
-pub(crate) fn init(paths: &Paths, force: bool) -> Result<()> {
+/// The user's own config, or why the Nix module's is not theirs to write.
+fn writable_config(paths: &Paths) -> Result<&Path> {
     if paths.config != paths.user_config {
         return Err(Error::with_hint(
             format!(
@@ -49,7 +57,65 @@ pub(crate) fn init(paths: &Paths, force: bool) -> Result<()> {
              separate config",
         ));
     }
-    let path = &paths.user_config;
+    Ok(&paths.user_config)
+}
+
+fn no_config(path: &Path) -> Error {
+    Error::with_hint(
+        format!("no config at {}", path.display()),
+        "run 'hangar init'",
+    )
+}
+
+/// Prints the config file as written.
+pub(crate) fn config_show(paths: &Paths) -> Result<()> {
+    let path = &paths.config;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound) => {
+            return Err(no_config(path));
+        }
+        Err(error) => {
+            return Err(Error::new(format!("{}: {error}", path.display())));
+        }
+    };
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(text.as_bytes()).context("stdout")?;
+    if !text.ends_with('\n') {
+        writeln!(stdout).context("stdout")?;
+    }
+    Ok(())
+}
+
+/// Opens the config in `editor` (default `vi`), then checks what was saved.
+pub(crate) fn config_edit(paths: &Paths, editor: Option<&str>) -> Result<()> {
+    let path = writable_config(paths)?;
+    if !path.exists() {
+        return Err(no_config(path));
+    }
+    let editor = editor.unwrap_or("vi");
+    let mut words = editor.split_whitespace();
+    let program = words.next().context("the editor is empty")?;
+    let mut command = process::command(program);
+    command.args(words).arg(path);
+    let status = process::status(&mut command)?;
+    if !status.success() {
+        bail!("{editor} exited with {status}; the config wasn't checked");
+    }
+    match Hangar::load(paths) {
+        Ok(_) => {
+            info!("{} is valid: run 'hangar up' to apply it", path.display());
+            Ok(())
+        }
+        Err(error) => Err(Error::with_hint(
+            format!("{}: {}", path.display(), error.message()),
+            error.hint().unwrap_or("run 'hangar config edit' to fix it"),
+        )),
+    }
+}
+
+pub(crate) fn init(paths: &Paths, force: bool) -> Result<()> {
+    let path = writable_config(paths)?;
     if path.exists() && !force {
         return Err(Error::with_hint(
             format!("{} exists", path.display()),
@@ -137,63 +203,317 @@ fn change(name: &str, resource: Resource, outcome: Outcome) -> Change {
     }
 }
 
-/// Proxies first, each once, then the bays; a bay whose proxy failed is
-/// left alone. Tokens missing from the keychain are asked for first.
+/// Names for a heading, `nothing` when there are none.
+fn listed_names(names: &[&str]) -> String {
+    if names.is_empty() {
+        "nothing".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// One thing `up` brings up.
+pub(crate) enum Step<'a> {
+    Proxy(&'a str, &'a dyn Proxy),
+    Bay(Bay<'a>),
+}
+
+/// The bays a proxy needs up first: a managed proxy reaching a port on
+/// this machine needs the bay that publishes it.
+fn upstream<'a>(hangar: &'a Hangar, proxy: &dyn Proxy) -> Vec<&'a str> {
+    let egress = proxy.managed().map(|managed| managed.vm().egress());
+    let Some(Egress::OpenAndHostPort(port)) = egress else {
+        return Vec::new();
+    };
+    hangar
+        .settings
+        .bays
+        .iter()
+        .filter(|bay| bay.ports.iter().any(|published| published.host == port))
+        .map(|bay| bay.name.as_str())
+        .collect()
+}
+
+/// The named bays and proxies plus everything they need, each after what
+/// it needs: a bay after its proxy, a proxy after its upstream bays.
+pub(crate) fn plan_up<'a>(
+    hangar: &'a Hangar,
+    names: &[String],
+) -> Result<Vec<Step<'a>>> {
+    let mut selection = select(hangar, names)?;
+    loop {
+        let mut grew = false;
+        let needed: Vec<&str> = selection
+            .proxies
+            .iter()
+            .flat_map(|(_, proxy)| upstream(hangar, *proxy))
+            .collect();
+        for name in needed {
+            let known = selection.bays.iter().any(|bay| bay.name == name);
+            if let (false, Some(bay)) = (known, hangar.bay(name)) {
+                selection.bays.push(bay);
+                grew = true;
+            }
+        }
+        let used: Vec<_> = selection
+            .bays
+            .iter()
+            .filter_map(|bay| hangar.proxy_of(bay.settings))
+            .collect();
+        for (name, proxy) in used {
+            if !selection.proxies.iter().any(|(known, _)| *known == name) {
+                selection.add_proxy(name, proxy);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let (mut proxies, mut bays) = (selection.proxies, selection.bays);
+    let mut done: Vec<&str> = Vec::new();
+    let mut steps = Vec::new();
+    while !proxies.is_empty() || !bays.is_empty() {
+        let before = proxies.len() + bays.len();
+        let (ready, waiting): (Vec<_>, Vec<_>) =
+            proxies.into_iter().partition(|(_, proxy)| {
+                upstream(hangar, *proxy)
+                    .iter()
+                    .all(|bay| done.contains(bay))
+            });
+        proxies = waiting;
+        for (name, proxy) in ready {
+            done.push(name);
+            steps.push(Step::Proxy(name, proxy));
+        }
+        let (ready, waiting): (Vec<_>, Vec<_>) =
+            bays.into_iter().partition(|bay| {
+                hangar
+                    .proxy_of(bay.settings)
+                    .is_none_or(|(proxy, _)| done.contains(&proxy))
+            });
+        bays = waiting;
+        for bay in ready {
+            done.push(bay.name);
+            steps.push(Step::Bay(bay));
+        }
+        if proxies.len() + bays.len() == before {
+            let stuck: Vec<&str> = proxies
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(bays.iter().map(|bay| bay.name))
+                .collect();
+            bail!(
+                "{} need each other, so none can come up first",
+                stuck.join(", ")
+            );
+        }
+    }
+    Ok(steps)
+}
+
+/// Everything named and what it needs, in order; whatever a failed one
+/// was needed by is left alone. A proxy's own tokens are asked for just
+/// before it starts, its bays' tokens just before a bay of it does.
 pub(crate) fn up(
     hangar: &Hangar,
     names: &[String],
     prompt: &dyn Prompt,
 ) -> Result<UpReport> {
-    let mut selection = select(hangar, names)?;
-    let used: Vec<_> = selection
-        .bays
+    let mut changes: Vec<Change> = Vec::new();
+    let mut asked: Vec<&str> = Vec::new();
+    let steps = plan_up(hangar, names)?;
+    let touching: Vec<&str> = steps
         .iter()
-        .filter_map(|bay| hangar.proxy_of(bay.settings))
-        .collect();
-    for (name, proxy) in used {
-        selection.add_proxy(name, proxy);
-    }
-    if prompt.terminal() {
-        for (name, proxy) in &selection.proxies {
-            let secrets = hangar.secrets(name)?;
-            let missing = secrets.missing(proxy.secrets())?;
-            ask_for(name, &secrets, &missing, prompt)?;
-        }
-    }
-    let mut changes: Vec<Change> = selection
-        .proxies
-        .iter()
-        .map(|(name, proxy)| {
-            change(name, Resource::Proxy, managed::up(hangar, name, *proxy))
+        .map(|step| match step {
+            Step::Proxy(name, _) => *name,
+            Step::Bay(bay) => bay.name,
         })
         .collect();
-    for bay in &selection.bays {
-        let proxy = hangar.proxy_of(bay.settings).map(|(name, _)| name);
-        let outcome = match proxy {
-            Some(proxy) if proxy_failed(&changes, proxy) => {
-                Outcome::Failed(Error::new(format!("proxy {proxy} failed")))
+    crate::logger::heading(&format!("Starting {}", listed_names(&touching)));
+    for step in steps {
+        match step {
+            Step::Proxy(name, proxy) => {
+                let down = upstream(hangar, proxy)
+                    .into_iter()
+                    .find(|bay| failed(&changes, Resource::Bay, bay));
+                let outcome = if let Some(bay) = down {
+                    Outcome::Failed(Error::new(format!("bay {bay} failed")))
+                } else {
+                    let wanted = slot_tokens(proxy, false);
+                    ask_missing(hangar, name, &wanted, false, prompt)?;
+                    managed::up(hangar, name, proxy)
+                };
+                changes.push(change(name, Resource::Proxy, outcome));
             }
-            _ => bay::up(hangar, bay),
-        };
-        changes.push(change(bay.name, Resource::Bay, outcome));
+            Step::Bay(bay) => {
+                let outcome = match hangar.proxy_of(bay.settings) {
+                    Some((proxy, _))
+                        if failed(&changes, Resource::Proxy, proxy) =>
+                    {
+                        Outcome::Failed(Error::new(format!(
+                            "proxy {proxy} failed"
+                        )))
+                    }
+                    Some((name, proxy)) => {
+                        let wanted = match own_token(proxy, bay.name) {
+                            Some(token) => vec![token],
+                            None if asked.contains(&name) => Vec::new(),
+                            None => {
+                                asked.push(name);
+                                slot_tokens(proxy, true)
+                            }
+                        };
+                        ask_missing(hangar, name, &wanted, true, prompt)?;
+                        bay::up(hangar, &bay)
+                    }
+                    None => bay::up(hangar, &bay),
+                };
+                changes.push(change(bay.name, Resource::Bay, outcome));
+            }
+        }
     }
-    Ok(UpReport { changes })
+    let addresses = changes
+        .iter()
+        .filter(|change| !matches!(change.outcome, Outcome::Failed(_)))
+        .map(|change| (change.name.clone(), addresses(hangar, change)))
+        .filter(|(_, list)| !list.is_empty())
+        .collect();
+    let overview = touched(hangar, &changes);
+    Ok(UpReport {
+        changes,
+        addresses,
+        overview: Some(overview),
+    })
 }
 
-/// Stores each of `slots`, asked for one by one; what was saved.
+/// `ps` narrowed to the bays and proxies in `changes`.
+fn touched(hangar: &Hangar, changes: &[Change]) -> Overview {
+    let names: Vec<&str> =
+        changes.iter().map(|change| change.name.as_str()).collect();
+    status::of(hangar, &names)
+}
+
+/// Where to reach a bay's apps or a proxy, on the host's 127.0.0.1.
+fn addresses(hangar: &Hangar, change: &Change) -> Vec<String> {
+    match change.resource {
+        Resource::Bay => {
+            hangar.bay(&change.name).map_or_else(Vec::new, |bay| {
+                bay.settings
+                    .ports
+                    .iter()
+                    .map(output::port_address)
+                    .collect()
+            })
+        }
+        Resource::Proxy => {
+            let Some(proxy) = hangar.proxies.get(&change.name) else {
+                return Vec::new();
+            };
+            match proxy.managed() {
+                Some(managed) => managed
+                    .vm()
+                    .publish
+                    .iter()
+                    .map(output::proxy_address)
+                    .collect(),
+                None => match proxy.egress() {
+                    Egress::HostPort(port) => vec![format!("127.0.0.1:{port}")],
+                    Egress::Open | Egress::OpenAndHostPort(_) => Vec::new(),
+                },
+            }
+        }
+    }
+}
+
+/// A token to ask for: its keychain key and what it is.
+struct Token {
+    key: String,
+    about: String,
+}
+
+/// The proxy's own tokens, or with `for_bays` the ones its bays share.
+fn slot_tokens(proxy: &dyn Proxy, for_bays: bool) -> Vec<Token> {
+    proxy
+        .secrets()
+        .iter()
+        .filter(|slot| slot.for_bays == for_bays)
+        .map(|slot| Token {
+            key: slot.key.into(),
+            about: slot.about.into(),
+        })
+        .collect()
+}
+
+/// `bay`'s own token, when the proxy gives it one.
+fn own_token(proxy: &dyn Proxy, bay: &str) -> Option<Token> {
+    proxy
+        .bay_tokens()
+        .into_iter()
+        .find(|(owner, _)| owner == bay)
+        .map(|(_, key)| Token {
+            key,
+            about: format!("the token bay {bay} logs in with"),
+        })
+}
+
+/// Every token of `proxy`: its slots and its bays' own.
+fn all_tokens(proxy: &dyn Proxy) -> Vec<Token> {
+    let mut tokens = slot_tokens(proxy, false);
+    tokens.extend(slot_tokens(proxy, true));
+    for (bay, _) in proxy.bay_tokens() {
+        tokens.extend(own_token(proxy, &bay));
+    }
+    tokens
+}
+
+/// Asks for those of `wanted` missing from the keychain. A bay's token
+/// (`for_bays`) may be skipped with an empty answer, since it can need a
+/// server that is only now up.
+fn ask_missing(
+    hangar: &Hangar,
+    name: &str,
+    wanted: &[Token],
+    for_bays: bool,
+    prompt: &dyn Prompt,
+) -> Result<()> {
+    if !prompt.terminal() {
+        return Ok(());
+    }
+    let secrets = hangar.secrets(name)?;
+    for token in wanted {
+        if secrets.has(&token.key)? {
+            continue;
+        }
+        let mut question = format!("{name} {} ({})", token.key, token.about);
+        if for_bays {
+            question.push_str("; Enter skips it");
+        }
+        let answer = prompt.ask(&question)?;
+        if for_bays && answer.expose().is_empty() {
+            info!("proxy {name}: {} skipped", token.key);
+            continue;
+        }
+        secrets.store(&token.key, &answer)?;
+        info!("proxy {name}: {} saved", token.key);
+    }
+    Ok(())
+}
+
+/// Stores each of `tokens`, asked for one by one; what was saved.
 fn ask_for(
     proxy: &str,
     secrets: &Secrets,
-    slots: &[Slot],
+    tokens: &[Token],
     prompt: &dyn Prompt,
 ) -> Result<Vec<String>> {
-    slots
+    tokens
         .iter()
-        .map(|slot| {
-            let question = format!("{proxy} {} ({})", slot.key, slot.about);
-            secrets.store(slot.key, &prompt.ask(&question)?)?;
-            info!("proxy {proxy}: {} saved", slot.key);
-            Ok(format!("{} saved", slot.key))
+        .map(|token| {
+            let question = format!("{proxy} {} ({})", token.key, token.about);
+            secrets.store(&token.key, &prompt.ask(&question)?)?;
+            info!("proxy {proxy}: {} saved", token.key);
+            Ok(format!("{} saved", token.key))
         })
         .collect()
 }
@@ -210,30 +530,35 @@ pub(crate) fn secret_set(
         bail!("{name} is a bay; only proxies have tokens");
     };
     let secrets = hangar.secrets(name)?;
-    let mut slots = secrets.settable(proxy.secrets());
-    if slots.is_empty() {
+    let mut tokens: Vec<Token> = all_tokens(proxy)
+        .into_iter()
+        .filter(|token| !secrets.is_command(&token.key))
+        .collect();
+    if tokens.is_empty() {
         bail!("proxy {name} keeps no tokens in the keychain");
     }
-    if let Some(token) = token {
-        let keys: Vec<&str> = slots.iter().map(|slot| slot.key).collect();
-        slots.retain(|slot| slot.key == token);
-        if slots.is_empty() {
+    if let Some(wanted) = token {
+        let keys: Vec<String> =
+            tokens.iter().map(|token| token.key.clone()).collect();
+        tokens.retain(|token| token.key == wanted);
+        if tokens.is_empty() {
             return Err(Error::with_hint(
-                format!("proxy {name} keeps no {token} in the keychain"),
+                format!("proxy {name} keeps no {wanted} in the keychain"),
                 format!("it keeps: {}", keys.join(", ")),
             ));
         }
     }
-    let saved = ask_for(name, &secrets, &slots, prompt)?;
+    let saved = ask_for(name, &secrets, &tokens, prompt)?;
     Ok(UpReport {
         changes: vec![change(name, Resource::Proxy, Outcome::Updated(saved))],
+        ..UpReport::default()
     })
 }
 
-fn proxy_failed(changes: &[Change], proxy: &str) -> bool {
+fn failed(changes: &[Change], resource: Resource, name: &str) -> bool {
     changes.iter().any(|change| {
-        change.resource == Resource::Proxy
-            && change.name == proxy
+        change.resource == resource
+            && change.name == name
             && matches!(change.outcome, Outcome::Failed(_))
     })
 }
@@ -241,6 +566,13 @@ fn proxy_failed(changes: &[Change], proxy: &str) -> bool {
 /// The bays first, then the proxies.
 pub(crate) fn down(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
     let selection = select(hangar, names)?;
+    let touching: Vec<&str> = selection
+        .bays
+        .iter()
+        .map(|bay| bay.name)
+        .chain(selection.proxies.iter().map(|(name, _)| *name))
+        .collect();
+    crate::logger::heading(&format!("Stopping {}", listed_names(&touching)));
     let bays = selection.bays.iter().map(|bay| {
         let outcome = bay::down(hangar, bay).unwrap_or_else(Outcome::Failed);
         change(bay.name, Resource::Bay, outcome)
@@ -250,8 +582,12 @@ pub(crate) fn down(hangar: &Hangar, names: &[String]) -> Result<UpReport> {
             managed::down(hangar, name, *proxy).unwrap_or_else(Outcome::Failed);
         change(name, Resource::Proxy, outcome)
     });
+    let changes: Vec<Change> = bays.chain(proxies).collect();
+    let overview = Some(touched(hangar, &changes));
     Ok(UpReport {
-        changes: bays.chain(proxies).collect(),
+        changes,
+        overview,
+        ..UpReport::default()
     })
 }
 
@@ -261,7 +597,10 @@ pub(crate) fn restart(
     prompt: &dyn Prompt,
 ) -> Result<UpReport> {
     let mut report = down(hangar, names)?;
-    report.changes.extend(up(hangar, names, prompt)?.changes);
+    let up = up(hangar, names, prompt)?;
+    report.changes.extend(up.changes);
+    report.addresses = up.addresses;
+    report.overview = up.overview;
     Ok(report)
 }
 
@@ -272,7 +611,7 @@ struct Doomed {
     vm: String,
     folder: PathBuf,
     volume: Option<String>,
-    tokens: Option<(Secrets, Vec<Slot>)>,
+    tokens: Option<(Secrets, Vec<String>)>,
 }
 
 /// Configured or left over: a leftover is only known by its folder.
@@ -282,8 +621,12 @@ fn doomed(hangar: &Hangar, name: &str) -> Result<Doomed> {
         Ok(Target::Bay(_)) => Resource::Bay,
         Ok(Target::Proxy(name, proxy)) => {
             let secrets = hangar.secrets(name)?;
-            let slots = secrets.settable(proxy.secrets());
-            tokens = (!slots.is_empty()).then_some((secrets, slots));
+            let keys: Vec<String> = all_tokens(proxy)
+                .into_iter()
+                .map(|token| token.key)
+                .filter(|key| !secrets.is_command(key))
+                .collect();
+            tokens = (!keys.is_empty()).then_some((secrets, keys));
             Resource::Proxy
         }
         Err(error) => hangar
@@ -326,6 +669,7 @@ pub(crate) fn rm(
         .map_or_else(Outcome::Failed, |()| Outcome::Removed);
     Ok(UpReport {
         changes: vec![change(name, doomed.resource, outcome)],
+        ..UpReport::default()
     })
 }
 
@@ -348,8 +692,8 @@ fn remove(hangar: &Hangar, doomed: &Doomed, data: bool) -> Result<()> {
     if doomed.folder.exists() {
         fs::remove_dir_all(&doomed.folder).context(doomed.folder.display())?;
     }
-    if let Some((secrets, slots)) = &doomed.tokens {
-        secrets.delete(slots)?;
+    if let Some((secrets, keys)) = &doomed.tokens {
+        secrets.delete(keys)?;
     }
     Ok(())
 }
@@ -707,6 +1051,169 @@ mod tests {
     }
 
     #[test]
+    fn a_token_only_bays_need_is_asked_when_one_of_its_bays_comes_up() {
+        let keychain = Rc::new(FakeKeychain::default());
+        let config = r#"{"proxies": {"v": {"kind": "fake", "run": "managed",
+            "managed": true, "token": true, "bayToken": true, "port": 3100}},
+            "bays": [{"name": "w", "proxy": "v"}]}"#;
+        let state = scratch_dir("cmd-up-bay-token");
+        let hangar =
+            hangar_holding(config, &state, settled(), keychain.clone());
+        let start = FakePrompt::answering(&["start-1"]);
+        super::up(&hangar, &names(&["v"]), &start).unwrap();
+        assert_eq!(*start.questions.borrow(), ["v token (the fake token)"]);
+        let bay = FakePrompt::answering(&["bay-1"]);
+        super::up(&hangar, &names(&["w"]), &bay).unwrap();
+        assert_eq!(
+            *bay.questions.borrow(),
+            ["v bay-token (the fake bay token); Enter skips it"]
+        );
+        assert_eq!(keychain.items.borrow()["v/bay-token"], "bay-1");
+    }
+
+    #[test]
+    fn a_skipped_bay_token_is_asked_once_and_never_stored() {
+        let keychain =
+            Rc::new(FakeKeychain::holding(&[("v/token", "start-1")]));
+        let config = r#"{"proxies": {"v": {"kind": "fake", "run": "managed",
+            "managed": true, "token": true, "bayToken": true, "port": 3100}},
+            "bays": [{"name": "w", "proxy": "v"}, {"name": "x", "proxy": "v"},
+                     {"name": "d", "proxy": null}]}"#;
+        let state = scratch_dir("cmd-up-skip");
+        let hangar =
+            hangar_holding(config, &state, settled(), keychain.clone());
+        let prompt = FakePrompt::answering(&[""]);
+        let report = super::up(&hangar, &[], &prompt).unwrap();
+        assert_eq!(
+            *prompt.questions.borrow(),
+            ["v bay-token (the fake bay token); Enter skips it"]
+        );
+        assert!(!keychain.items.borrow().contains_key("v/bay-token"));
+        assert_eq!(summary(&report).len(), 4);
+    }
+
+    /// `p`'s upstream is port 9000, which bay `srv` publishes.
+    const UPSTREAM: &str = r#"{"proxies": {"p": {"kind": "fake",
+        "run": "managed", "managed": true, "port": 3100, "upstream": 9000}},
+        "apps": {"api": {"run": "serve",
+            "ports": [{"name": "api", "vm": 9000, "purpose": "API"}]}},
+        "bays": [{"name": "w", "proxy": "p"},
+                 {"name": "srv", "proxy": null, "apps": ["api"]}]}"#;
+
+    #[test]
+    fn up_brings_a_proxys_upstream_bay_up_before_it() {
+        let sandbox = settled();
+        let hangar = hangar_with(UPSTREAM, &scratch_dir("cmd-up-dep"), sandbox);
+        let report = up(&hangar, &names(&["w"])).unwrap();
+        let order: Vec<_> = report
+            .changes
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect();
+        assert_eq!(order, ["srv", "p", "w"]);
+        let all = up(&hangar, &[]).unwrap();
+        let order: Vec<_> = all
+            .changes
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect();
+        assert_eq!(order, ["srv", "p", "w"]);
+    }
+
+    #[test]
+    fn a_failed_upstream_bay_fails_its_proxy_and_that_proxys_bays() {
+        let sandbox = settled();
+        sandbox.fail_create.set(true);
+        let hangar =
+            hangar_with(UPSTREAM, &scratch_dir("cmd-up-dep-fail"), sandbox);
+        let summary = summary(&up(&hangar, &[]).unwrap());
+        assert!(summary[0].starts_with("srv bay Failed"), "{summary:?}");
+        assert_eq!(
+            summary[1],
+            r#"p proxy Failed(Error { message: "bay srv failed", hint: None })"#
+        );
+        assert_eq!(
+            summary[2],
+            r#"w bay Failed(Error { message: "proxy p failed", hint: None })"#
+        );
+    }
+
+    #[test]
+    fn a_bay_and_proxy_that_need_each_other_are_refused() {
+        let config = UPSTREAM.replace(
+            r#"{"name": "srv", "proxy": null"#,
+            r#"{"name": "srv", "proxy": "p""#,
+        );
+        let hangar =
+            hangar_with(&config, &scratch_dir("cmd-up-cycle"), settled());
+        let error = up(&hangar, &[]).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "p, w, srv need each other, so none can come up first"
+        );
+    }
+
+    /// `w` shares `v`'s bay token, `x` has its own.
+    const OWN: &str = r#"{"proxies": {"v": {"kind": "fake", "run": "managed",
+        "managed": true, "bayToken": true, "ownTokens": ["x"],
+        "port": 3100}},
+        "bays": [{"name": "w", "proxy": "v"}, {"name": "x", "proxy": "v"},
+                 {"name": "y", "proxy": "v"}]}"#;
+
+    fn owning(
+        name: &str,
+        items: &[(&str, &str)],
+    ) -> (Hangar, Rc<FakeKeychain>) {
+        let keychain = Rc::new(FakeKeychain::holding(items));
+        let state = scratch_dir(name);
+        let hangar = hangar_holding(OWN, &state, settled(), keychain.clone());
+        (hangar, keychain)
+    }
+
+    #[test]
+    fn a_bay_with_its_own_token_is_asked_for_it_and_never_shares() {
+        let (hangar, keychain) = owning("cmd-own-up", &[("v/token", "t")]);
+        let prompt = FakePrompt::answering(&["shared-1", "own-x"]);
+        super::up(&hangar, &[], &prompt).unwrap();
+        assert_eq!(
+            *prompt.questions.borrow(),
+            [
+                "v bay-token (the fake bay token); Enter skips it",
+                "v token@x (the token bay x logs in with); Enter skips it",
+            ]
+        );
+        let items = keychain.items.borrow();
+        assert_eq!(items["v/bay-token"], "shared-1");
+        assert_eq!(items["v/token@x"], "own-x");
+    }
+
+    #[test]
+    fn secret_set_rm_and_inspect_know_a_bays_own_token() {
+        let (hangar, keychain) = owning("cmd-own-set", &[]);
+        let one = FakePrompt::answering(&["own-x"]);
+        secret_set(&hangar, "v", Some("token@x"), &one).unwrap();
+        assert_eq!(keychain.items.borrow()["v/token@x"], "own-x");
+        let Detail::Proxy(detail) = inspect(&hangar, "v").unwrap() else {
+            panic!("not a proxy");
+        };
+        assert_eq!(
+            detail.tokens,
+            [
+                ("token".into(), TokenSource::Missing),
+                ("bay-token".into(), TokenSource::Missing),
+                ("token@x".into(), TokenSource::Keychain),
+            ]
+        );
+        let unknown = FakePrompt::answering(&[]);
+        let error = secret_set(&hangar, "v", Some("token@w"), &unknown)
+            .err()
+            .unwrap();
+        assert_eq!(error.hint(), Some("it keeps: token, bay-token, token@x"));
+        rm(&hangar, "v", true, true, &no_prompt()).unwrap();
+        assert!(keychain.items.borrow().is_empty());
+    }
+
+    #[test]
     fn up_without_a_terminal_never_asks() {
         let (hangar, keychain) = tokened("cmd-up-no-ask", &[]);
         let prompt = FakePrompt::default();
@@ -757,16 +1264,19 @@ mod tests {
         };
         assert_eq!(
             sources("t"),
-            (vec!["a".to_string()], vec![("token", TokenSource::Missing)])
+            (
+                vec!["a".to_string()],
+                vec![("token".into(), TokenSource::Missing)]
+            )
         );
         keychain
             .items
             .borrow_mut()
             .insert("t/token".into(), "x".into());
-        assert_eq!(sources("t").1, [("token", TokenSource::Keychain)]);
+        assert_eq!(sources("t").1, [("token".into(), TokenSource::Keychain)]);
         assert_eq!(
             sources("c"),
-            (vec![], vec![("token", TokenSource::Command)])
+            (vec![], vec![("token".into(), TokenSource::Command)])
         );
         let Detail::Bay(bay) = inspect(&hangar, "a").unwrap() else {
             panic!("not a bay");
@@ -818,10 +1328,6 @@ mod tests {
             .collect()
     }
 
-    fn touched(sandbox: &FakeSandbox, vm: &str) -> bool {
-        sandbox.calls.borrow().iter().any(|call| call.contains(vm))
-    }
-
     #[test]
     fn up_brings_each_proxy_up_once_before_its_bays() {
         let sandbox = settled();
@@ -869,7 +1375,8 @@ mod tests {
             summary[1],
             r#"a bay Failed(Error { message: "proxy p failed", hint: None })"#
         );
-        assert!(!touched(&sandbox, "hangar-bay-a"));
+        // Read for the summary, never changed.
+        assert!(!sandbox.changes().iter().any(|c| c.contains("hangar-bay-a")));
     }
 
     #[test]

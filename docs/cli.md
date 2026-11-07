@@ -7,11 +7,13 @@ Everything here works without a terminal. Add `--json` to any command
 
 - **stdout**: the command's result, nothing else. With `--json`, at most
   one JSON document per command.
-- **stderr**: progress and warnings (`==> …`, `warning: …`; more with
-  `-v`/`-vv` or `HANGAR_LOG=debug`). With `--json`, an error is the last
-  stderr line, as JSON.
+- **stderr**: a line saying what the command does, then progress and
+  warnings indented under it, one line each with the local time and the
+  level (`  21:09:38  info   proxy av: vm`); more with `-v`/`-vv` or
+  `HANGAR_LOG=debug`. With `--json` there's no heading, and an error is
+  the last stderr line, as JSON.
 - **`$XDG_STATE_HOME/hangar/hangar.log`** (0600): every info line and every
-  change, timestamped, whatever the flags.
+  change, with the date, local time and UTC offset, whatever the flags.
 
 | Code | Meaning |
 | --- | --- |
@@ -24,7 +26,7 @@ Everything here works without a terminal. Add `--json` to any command
 
 `up`, `down`, `restart`, `rm`, `cp`, `secret` and `setup` hold a lock
 (`$XDG_STATE_HOME/hangar/lock`); a second one waits until the first is
-done. `ps`, `inspect`, `logs`, `exec` and `init` never wait.
+done. `ps`, `inspect`, `logs`, `exec`, `config` and `init` never wait.
 
 ## Documents
 
@@ -46,12 +48,17 @@ order isn't significant.
 ```json
 { "version": 1, "changes": [
   { "name": "vault", "type": "proxy", "outcome": "created",
-    "reasons": [], "error": null },
+    "reasons": [], "error": null, "addresses": ["127.0.0.1:17323"] },
   { "name": "work", "type": "bay", "outcome": "recreated",
-    "reasons": ["image", "mounts"], "error": null },
+    "reasons": ["image", "mounts"], "error": null,
+    "addresses": ["http://127.0.0.1:3100"] },
   { "name": "docs", "type": "bay", "outcome": "failed", "reasons": [],
-    "error": { "error": "proxy corp failed", "hint": null } } ] }
+    "error": { "error": "proxy corp failed", "hint": null },
+    "addresses": [] } ] }
 ```
+
+`addresses` says where to reach what `up` brought up, on `127.0.0.1`: a
+URL for an HTTP port.
 
 `outcome` is `created`, `recreated`, `updated`, `unchanged`, `stopped`,
 `removed` or `failed`. `reasons` says why a VM was recreated (`image`,
