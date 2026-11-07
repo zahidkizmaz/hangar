@@ -67,12 +67,16 @@ order isn't significant.
   "bays": [
     { "name": "work", "state": "running", "proxy": "vault",
       "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
-      "apps": [ { "name": "paperclip", "state": "running" } ] } ],
+      "apps": [ { "name": "paperclip", "state": "running" } ],
+      "ports": [ { "name": "paperclip", "app": "paperclip", "host": 3100,
+        "vm": 3100, "address": "http://127.0.0.1:3100",
+        "purpose": "Paperclip web UI" } ] } ],
   "proxies": [
     { "name": "vault", "kind": "infisical", "state": "running",
-      "image": "infisical/cli:0.45.3@sha256:…", "health": "up" },
+      "image": "infisical/cli:0.45.3@sha256:…", "health": "up",
+      "port": 17323 },
     { "name": "corp", "kind": "http", "state": null, "image": null,
-      "health": "unreachable" } ],
+      "health": "unreachable", "port": 3128 } ],
   "leftovers": [ { "name": "old", "type": "bay" } ] }
 ```
 
@@ -82,7 +86,9 @@ order isn't significant.
   apps with a run entry while it runs: `running`, `exited` or
   `needs-setup`.
 - `health` is `up`, `unreachable`, or `null` when a managed proxy's VM
-  isn't running.
+  isn't running. `port` is the host port its bays reach it on.
+- A bay's `ports` are published on `127.0.0.1`; `address` is a URL for an
+  HTTP port, else `127.0.0.1:<port>`.
 - `leftovers`: bays and proxies with a folder in the data dir but no config
   entry; `hangar rm NAME --data` removes one.
 
@@ -92,32 +98,44 @@ A bay:
 
 ```json
 { "version": 1, "name": "work", "type": "bay", "state": "running",
-  "proxy": "vault", "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
-  "vm": "hangar-bay-work",
+  "proxy": "vault", "proxy_port": 17323,
+  "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
+  "vm": "hangar-bay-work", "cpus": 4, "memory": "6G", "disk": "40G",
   "home": "/home/you/.local/share/hangar/bays/work/home",
   "cache": "/home/you/.cache/hangar/bays/work",
   "volume": "hangar-bay-work-data",
-  "apps": ["claude-code"], "packages": ["github:numtide/llm-agents.nix#claude-code"],
+  "apps": ["claude-code"], "app_states": [], "ports": [],
+  "packages": ["github:numtide/llm-agents.nix#claude-code"],
+  "env": ["CLAUDE_CODE_OAUTH_TOKEN"],
   "mounts": [
     { "vm": "/home/pilot", "host": "/home/you/.local/share/hangar/bays/work/home",
       "mode": "rw", "kind": "home", "applied": true } ] }
 ```
 
-`mounts` lists the `ro` and `rw` mounts with hangar's own (`kind`:
-`user`, `home` or `cache`). `applied` says whether the VM was created
-with it; `null` when there's no record.
+`proxy_port` is the bay's only way out, `null` for the open internet.
+`env` holds names only. `mounts` lists every mount, hangar's own
+(`kind`: `user`, `home` or `cache`) and the `copy` ones (`mode`: `ro`,
+`rw` or `copy`). `applied` says whether the VM was created with it;
+`null` when there's no record, and always for a `copy`.
 
 A proxy:
 
 ```json
 { "version": 1, "name": "vault", "type": "proxy", "kind": "infisical",
-  "state": "running", "image": "infisical/cli:0.45.3@sha256:…",
+  "state": "running", "health": "up", "health_error": null, "port": 17323,
+  "url": null, "image": "infisical/cli:0.45.3@sha256:…",
   "vm": "hangar-proxy-vault",
   "data": "/home/you/.local/share/hangar/proxies/vault/data",
-  "log": "/home/you/.local/share/hangar/proxies/vault/data/data/proxy.log" }
+  "log": "/home/you/.local/share/hangar/proxies/vault/data/data/proxy.log",
+  "bays": ["work"],
+  "tokens": [ { "name": "proxy-token", "source": "keychain" },
+              { "name": "session-token", "source": "keychain" } ] }
 ```
 
-An external proxy has `state`, `image`, `vm` and `log` `null`.
+An external proxy has `url` set and `state`, `image`, `vm` and `log`
+`null`. A token's `source` is `keychain`, `command`, `missing`, or
+`unknown` when the keychain couldn't be asked; the token itself is
+never shown.
 
 ### Errors
 

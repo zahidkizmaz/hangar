@@ -270,10 +270,10 @@ fn rm_unknown_name_lists_bays_and_proxies() {
 }
 
 #[test]
-fn ps_lists_bays_with_state_proxy_image() {
+fn ps_wide_lists_bays_with_state_proxy_ports_and_image() {
     let machine = with_bay("ps", "", "");
     let rows = |machine: &Machine| -> Vec<Vec<String>> {
-        stdout(&machine.hangar(&["ps"], &[]))
+        stdout(&machine.hangar(&["ps", "--wide"], &[]))
             .lines()
             .map(|line| line.split_whitespace().map(String::from).collect())
             .collect()
@@ -281,8 +281,20 @@ fn ps_lists_bays_with_state_proxy_image() {
     assert_eq!(
         rows(&machine),
         [
-            ["NAME", "TYPE", "STATE", "PROXY", "IMAGE"],
-            ["default", "bay", "missing", "direct", "example/bay:1"]
+            [
+                "NAME", "TYPE", "STATE", "PROXY", "PORTS", "IMAGE", "APPS",
+                "MOUNTS"
+            ],
+            [
+                "default",
+                "bay",
+                "missing",
+                "direct",
+                "-",
+                "example/bay:1",
+                "-",
+                "-"
+            ]
         ]
     );
     run(&machine, &["up"]);
@@ -290,8 +302,17 @@ fn ps_lists_bays_with_state_proxy_image() {
     assert_eq!(
         rows(&machine)[1..],
         [
-            ["default", "bay", "running", "direct", "example/bay:1"],
-            ["old", "bay", "leftover", "-", "-"]
+            [
+                "default",
+                "bay",
+                "running",
+                "direct",
+                "-",
+                "example/bay:1",
+                "-",
+                "-"
+            ],
+            ["old", "bay", "leftover", "-", "-", "-", "-", "-"]
         ]
     );
 }
@@ -331,8 +352,22 @@ fn inspect_json_has_version_1_and_mounts() {
         "{json}"
     );
     let text = run(&machine, &["inspect", "default"]);
-    assert!(text.contains("state: missing"), "{text}");
+    assert!(text.contains("state:    missing"), "{text}");
     assert!(text.contains("/home/pilot"), "{text}");
+}
+
+#[test]
+fn ps_lists_ports_and_wide_adds_mounts() {
+    let machine = with_bay(
+        "ps-wide",
+        r#", "mounts": {"~/src": {"host": "~/src", "mode": "ro"}}"#,
+        "",
+    );
+    let text = run(&machine, &["ps"]);
+    assert!(text.starts_with("NAME"), "{text}");
+    assert!(text.lines().next().unwrap().ends_with("PORTS"), "{text}");
+    let wide = run(&machine, &["ps", "--wide"]);
+    assert!(wide.contains("~/src:~/src:ro"), "{wide}");
 }
 
 #[test]

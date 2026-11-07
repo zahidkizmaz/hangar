@@ -71,7 +71,7 @@ and [proxy-kinds.md](proxy-kinds.md) has every kind. Then:
 
 ```sh
 hangar up    # proxies first, then the bays
-hangar ps    # state, proxy and image of each bay and proxy
+hangar ps    # state, proxy and ports of each bay and proxy
 ```
 
 `up` prints one line per bay and proxy:
@@ -96,8 +96,8 @@ namespace.
 | `down [NAME…]` | stops them (bays first) |
 | `restart [NAME…]` | `down`, then `up` |
 | `rm NAME [--data] [-y]` | removes a VM; `--data` also deletes its data |
-| `ps` | lists bays, proxies and leftovers, and warns about anything wrong |
-| `inspect NAME` | everything about one bay or proxy |
+| `ps [-w]` | lists bays, proxies and leftovers with their ports, and warns about anything wrong; `-w` adds images, apps and mounts |
+| `inspect NAME` | everything about one bay or proxy: network, ports, apps, mounts, tokens |
 | `exec BAY [CMD…]` | a login shell in the bay, or `CMD` |
 | `logs [NAME [APP]] [-f]` | hangar's log, a bay's app journal, or a managed proxy's log |
 | `cp SRC DEST` | copies into or out of a running bay (`BAY:PATH` on one side) |

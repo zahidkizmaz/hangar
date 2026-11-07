@@ -348,9 +348,12 @@ pub(crate) enum MountKind {
 pub(crate) struct MountStatus {
     pub(crate) vm: String,
     pub(crate) host: String,
-    pub(crate) writable: bool,
+    /// The host path as the config has it, `~` included.
+    pub(crate) written: String,
+    pub(crate) mode: Mode,
     pub(crate) kind: MountKind,
-    /// The bay was created with it; `None` when that's unknown.
+    /// The bay was created with it; `None` when that's unknown, and for a
+    /// `copy`, which `up` applies to the running VM.
     pub(crate) applied: Option<bool>,
 }
 
@@ -401,22 +404,27 @@ pub(crate) fn status(
     home: &Path,
     recorded: Option<&[String]>,
 ) -> Vec<MountStatus> {
-    live(&with_hangar(mounts, bay_home, bay_cache))
+    with_hangar(mounts, bay_home, bay_cache)
         .iter()
         .map(|(vm, spec)| {
             let host = expanded(spec, home);
-            let host_now = resolved_host(&host);
-            let wanted = record_line(
-                vm,
-                &host_now,
-                spec.mode == Mode::Rw,
-                Path::new(&host_now).is_file(),
-            );
-            let applied = recorded.map(|lines| lines.contains(&wanted));
+            let applied = (spec.mode != Mode::Copy)
+                .then(|| {
+                    let host_now = resolved_host(&host);
+                    let wanted = record_line(
+                        vm,
+                        &host_now,
+                        spec.mode == Mode::Rw,
+                        Path::new(&host_now).is_file(),
+                    );
+                    recorded.map(|lines| lines.contains(&wanted))
+                })
+                .flatten();
             MountStatus {
                 vm: vm.clone(),
                 host,
-                writable: spec.mode == Mode::Rw,
+                written: spec.host.clone(),
+                mode: spec.mode,
                 kind: if bay_home.is_some() && vm == VM_HOME {
                     MountKind::Home
                 } else if bay_cache.is_some() && vm == VM_CACHE {
@@ -879,7 +887,8 @@ mod tests {
                 MountStatus {
                     vm: "/home/pilot/a".into(),
                     host: home.join("a").display().to_string(),
-                    writable: true,
+                    written: "~/a".into(),
+                    mode: Mode::Rw,
                     kind: MountKind::User,
                     applied: Some(true),
                 },
@@ -887,13 +896,35 @@ mod tests {
                 MountStatus {
                     vm: "/home/pilot/b".into(),
                     host: home.join("b").display().to_string(),
-                    writable: false,
+                    written: "~/b".into(),
+                    mode: Mode::Ro,
                     kind: MountKind::User,
                     applied: Some(false),
                 },
             ]
         );
         assert!(shown(None).iter().all(|m| m.applied.is_none()));
+    }
+
+    #[test]
+    fn copies_are_listed_with_their_mode_and_never_as_applied() {
+        let home = std::path::PathBuf::from("/h");
+        let set = BTreeMap::from([(
+            "/home/pilot/.gitconfig".to_string(),
+            spec("~/.gitconfig", Mode::Copy),
+        )]);
+        let shown = status(&set, None, None, &home, Some(&[]));
+        assert_eq!(
+            shown,
+            [MountStatus {
+                vm: "/home/pilot/.gitconfig".into(),
+                host: "/h/.gitconfig".into(),
+                written: "~/.gitconfig".into(),
+                mode: Mode::Copy,
+                kind: MountKind::User,
+                applied: None,
+            }]
+        );
     }
 
     #[test]

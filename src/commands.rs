@@ -662,7 +662,7 @@ mod tests {
     use crate::prompt::fake::FakePrompt;
     use crate::sandbox::fake::FakeSandbox;
     use crate::sandbox::{BoxState, data_volume};
-    use crate::status::Detail;
+    use crate::status::{Detail, TokenSource};
     use crate::testing::{hangar_holding, hangar_with, scratch_dir, settled};
     use std::fs;
     use std::rc::Rc;
@@ -744,6 +744,38 @@ mod tests {
             .to_string();
         assert!(error.starts_with("proxy t: token: "), "{error}");
         assert_eq!(keychain.items.borrow()["t/token"], "newer");
+    }
+
+    #[test]
+    fn inspect_names_a_proxys_bays_token_sources_and_a_bays_way_out() {
+        let (hangar, keychain) = tokened("cmd-inspect-tokens", &[]);
+        let sources = |name: &str| {
+            let Detail::Proxy(detail) = inspect(&hangar, name).unwrap() else {
+                panic!("not a proxy");
+            };
+            (detail.bays, detail.tokens)
+        };
+        assert_eq!(
+            sources("t"),
+            (vec!["a".to_string()], vec![("token", TokenSource::Missing)])
+        );
+        keychain
+            .items
+            .borrow_mut()
+            .insert("t/token".into(), "x".into());
+        assert_eq!(sources("t").1, [("token", TokenSource::Keychain)]);
+        assert_eq!(
+            sources("c"),
+            (vec![], vec![("token", TokenSource::Command)])
+        );
+        let Detail::Bay(bay) = inspect(&hangar, "a").unwrap() else {
+            panic!("not a bay");
+        };
+        assert_eq!(bay.proxy_port, Some(3100));
+        let Detail::Bay(direct) = inspect(&hangar, "b").unwrap() else {
+            panic!("not a bay");
+        };
+        assert_eq!(direct.proxy_port, None);
     }
 
     #[test]

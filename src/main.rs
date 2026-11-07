@@ -111,8 +111,12 @@ enum OnHangar {
         #[arg(short, long)]
         yes: bool,
     },
-    /// List bays and proxies
-    Ps,
+    /// List bays and proxies with their ports
+    Ps {
+        /// Also show images, apps and mounts
+        #[arg(short, long)]
+        wide: bool,
+    },
     /// Show everything about a bay or proxy
     Inspect {
         /// A bay or proxy
@@ -269,9 +273,12 @@ fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
         OnHangar::Rm { name, data, yes } => {
             Outcome::Changes(commands::rm(hangar, &name, data, yes, &Terminal)?)
         }
-        OnHangar::Ps => Outcome::Overview(commands::ps(hangar)),
+        OnHangar::Ps { wide } => Outcome::Overview {
+            overview: commands::ps(hangar),
+            wide,
+        },
         OnHangar::Inspect { name } => {
-            Outcome::Detail(commands::inspect(hangar, &name)?)
+            Outcome::Detail(Box::new(commands::inspect(hangar, &name)?))
         }
         OnHangar::Exec { bay, args } => {
             commands::exec(hangar, &bay, &args)?;
