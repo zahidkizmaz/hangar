@@ -12,19 +12,49 @@ use crate::files::{host_path, is_credentials_file};
 
 const HINT: &str = "see docs/configuration.md, \"Mounting folders\"";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Ro,
+    Rw,
+    Copy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountSpec {
     pub(crate) host: String,
-    pub(crate) writable: bool,
+    pub(crate) mode: Mode,
 }
 
 /// A checked mount: its source resolved, so symlinks can't hide where it
-/// points.
+/// points; `file` for a single-file mount.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Resolved {
     pub(crate) vm: String,
     pub(crate) host: PathBuf,
     pub(crate) writable: bool,
+    pub(crate) file: bool,
+}
+
+/// The mounts the VM is created with: `ro` and `rw`.
+pub(crate) fn live(
+    mounts: &BTreeMap<String, MountSpec>,
+) -> BTreeMap<String, MountSpec> {
+    mounts
+        .iter()
+        .filter(|(_, spec)| spec.mode != Mode::Copy)
+        .map(|(vm, spec)| (vm.clone(), spec.clone()))
+        .collect()
+}
+
+/// The `copy` mounts: VM path -> host path as configured.
+pub(crate) fn copies(
+    mounts: &BTreeMap<String, MountSpec>,
+) -> BTreeMap<String, String> {
+    mounts
+        .iter()
+        .filter(|(_, spec)| spec.mode == Mode::Copy)
+        .map(|(vm, spec)| (vm.clone(), spec.host.clone()))
+        .collect()
 }
 
 fn overlaps(a: &str, b: &str) -> bool {
@@ -56,7 +86,7 @@ pub(crate) fn with_hangar(
         if let Some(host) = host {
             let spec = MountSpec {
                 host: host.clone(),
-                writable: true,
+                mode: Mode::Rw,
             };
             all.insert(vm.to_string(), spec);
         }
@@ -64,23 +94,18 @@ pub(crate) fn with_hangar(
     all
 }
 
-/// `mounts` targets don't nest or cover the home mount, and no `files`
-/// target is inside, above or at one. Files may land in the home mount: they're copied into its host
-/// folder.
-pub(crate) fn check_targets<'a>(
+/// `mounts` targets don't nest or cover the home mount.
+pub(crate) fn check_targets(
     mounts: &BTreeMap<String, MountSpec>,
-    home: bool,
-    files: impl IntoIterator<Item = &'a String>,
 ) -> Result<()> {
-    if let Some(vm) = mounts
-        .keys()
-        .find(|vm| home && Path::new(VM_HOME).starts_with(vm))
+    if let Some(vm) =
+        mounts.keys().find(|vm| Path::new(VM_HOME).starts_with(vm))
     {
         return Err(Error::with_hint(
             format!(
                 "mounts.{vm} covers {VM_HOME}, where the bay's home is mounted"
             ),
-            "set home = false to mount your own",
+            format!("mount it at a path below {VM_HOME}"),
         ));
     }
     let targets: Vec<&String> = mounts.keys().collect();
@@ -92,20 +117,11 @@ pub(crate) fn check_targets<'a>(
             ));
         }
     }
-    for file in files {
-        if let Some(mount) = mount_at(file, mounts) {
-            return Err(Error::with_hint(
-                format!("files.{file} overlaps the mount at {mount}"),
-                "a VM path is either copied or mounted, not both",
-            ));
-        }
-    }
     Ok(())
 }
 
 /// What the rules check a source against, all resolved: the user's home,
-/// the two roots (`stateDir`, the package cache root) and this bay's own
-/// home and cache.
+/// hangar's data and cache dirs, and this bay's own home and cache.
 #[derive(Debug)]
 pub(crate) struct Roots {
     pub(crate) home: PathBuf,
@@ -153,7 +169,7 @@ pub(crate) fn resolve(
     mounts: &BTreeMap<String, MountSpec>,
     roots: &Roots,
 ) -> Result<Vec<Resolved>> {
-    let checked = mounts
+    let checked = live(mounts)
         .iter()
         .map(|(vm, spec)| check(vm, spec, roots))
         .collect::<Result<Vec<_>>>()?;
@@ -182,26 +198,48 @@ fn check(
         would_be(&configured)
             .context(format!("{context}: {}", configured.display()))?
     } else {
-        let host = fs::canonicalize(&configured)
-            .context(format!("{context}: {}", configured.display()))?;
-        if !host.is_dir() {
-            return Err(refuse(&context, &host, "isn't a directory"));
-        }
-        host
+        fs::canonicalize(&configured)
+            .context(format!("{context}: {}", configured.display()))?
     };
-    check_source(&host, spec.writable, roots)
+    let file = host.is_file();
+    if !missing && !file && !host.is_dir() {
+        return Err(refuse(
+            &context,
+            &host,
+            "isn't a regular file or directory",
+        ));
+    }
+    let writable = spec.mode == Mode::Rw;
+    check_source(&host, writable, roots)
         .map_err(|why| refuse(&context, &host, why))?;
+    // A stow link's own name counts too: `~/.bashrc` is host config
+    // wherever it points. Hangar's own folders are exempt, as in
+    // `check_source`.
+    let own =
+        host.starts_with(&roots.bay_home) || host.starts_with(&roots.bay_cache);
+    if !own {
+        check_source(&configured, writable, roots)
+            .map_err(|why| refuse(&context, &configured, why))?;
+    }
+    if file && is_credentials_file(Path::new(vm)) {
+        return Err(refuse(
+            &context,
+            Path::new(vm),
+            "holds credentials or keys",
+        ));
+    }
     let resolved = Resolved {
         vm: vm.to_string(),
         host,
-        writable: spec.writable,
+        writable: spec.mode == Mode::Rw,
+        file,
     };
     Ok((resolved, missing))
 }
 
 /// Where a missing path would end up: its nearest existing ancestor with
 /// symlinks resolved, plus the missing components.
-fn would_be(path: &Path) -> Result<PathBuf> {
+pub(crate) fn would_be(path: &Path) -> Result<PathBuf> {
     use std::path::Component;
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(Error::new("can't contain .."));
@@ -227,7 +265,7 @@ fn would_be(path: &Path) -> Result<PathBuf> {
 
 /// Creates the missing components of a checked path, each 0700; existing
 /// ancestors are left as they are.
-fn create(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     fs::DirBuilder::new()
         .recursive(true)
@@ -295,24 +333,6 @@ fn check_source(
     Ok(())
 }
 
-/// An existing bay's recorded mounts, against today's rules: a root may
-/// have moved since the VM was created.
-pub(crate) fn recheck(lines: &[String], roots: &Roots) -> Result<()> {
-    for line in lines {
-        let mut fields = line.split('\t');
-        let (Some(vm), Some(host), Some(mode)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let host = Path::new(host);
-        check_source(host, mode == "rw", roots).map_err(|why| {
-            refuse(&format!("the bay's mount at {vm}"), host, why)
-        })?;
-    }
-    Ok(())
-}
-
 fn refuse(context: &str, host: &Path, why: &str) -> Error {
     Error::with_hint(format!("{context}: {} {why}", host.display()), HINT)
 }
@@ -328,9 +348,12 @@ pub(crate) enum MountKind {
 pub(crate) struct MountStatus {
     pub(crate) vm: String,
     pub(crate) host: String,
-    pub(crate) writable: bool,
+    /// The host path as the config has it, `~` included.
+    pub(crate) written: String,
+    pub(crate) mode: Mode,
     pub(crate) kind: MountKind,
-    /// The bay was created with it; `None` when that's unknown.
+    /// The bay was created with it; `None` when that's unknown, and for a
+    /// `copy`, which `up` applies to the running VM.
     pub(crate) applied: Option<bool>,
 }
 
@@ -349,9 +372,14 @@ fn resolved_host(host: &str) -> String {
         .map_or_else(|| host.to_string(), |p| p.display().to_string())
 }
 
-fn line(vm: &str, host: &str, writable: bool) -> String {
+pub(crate) fn line(vm: &str, host: &str, writable: bool) -> String {
+    record_line(vm, host, writable, false)
+}
+
+fn record_line(vm: &str, host: &str, writable: bool, file: bool) -> String {
     let mode = if writable { "rw" } else { "ro" };
-    format!("{vm}\t{host}\t{mode}")
+    let kind = if file { "file-" } else { "" };
+    format!("{vm}\t{host}\t{kind}{mode}")
 }
 
 /// What the bay is created with, one line per mount with its resolved
@@ -361,7 +389,8 @@ pub(crate) fn lines(resolved: &[Resolved]) -> Vec<String> {
     resolved
         .iter()
         .map(|mount| {
-            line(&mount.vm, &mount.host.display().to_string(), mount.writable)
+            let host = mount.host.display().to_string();
+            record_line(&mount.vm, &host, mount.writable, mount.file)
         })
         .collect()
 }
@@ -379,12 +408,23 @@ pub(crate) fn status(
         .iter()
         .map(|(vm, spec)| {
             let host = expanded(spec, home);
-            let wanted = line(vm, &resolved_host(&host), spec.writable);
-            let applied = recorded.map(|lines| lines.contains(&wanted));
+            let applied = (spec.mode != Mode::Copy)
+                .then(|| {
+                    let host_now = resolved_host(&host);
+                    let wanted = record_line(
+                        vm,
+                        &host_now,
+                        spec.mode == Mode::Rw,
+                        Path::new(&host_now).is_file(),
+                    );
+                    recorded.map(|lines| lines.contains(&wanted))
+                })
+                .flatten();
             MountStatus {
                 vm: vm.clone(),
                 host,
-                writable: spec.writable,
+                written: spec.host.clone(),
+                mode: spec.mode,
                 kind: if bay_home.is_some() && vm == VM_HOME {
                     MountKind::Home
                 } else if bay_cache.is_some() && vm == VM_CACHE {
@@ -401,8 +441,8 @@ pub(crate) fn status(
 #[cfg(test)]
 mod tests {
     use super::{
-        MountKind, MountSpec, MountStatus, check_source, check_targets, lines,
-        overlaps, recheck, status, with_hangar,
+        Mode, MountKind, MountSpec, MountStatus, check_source, check_targets,
+        lines, overlaps, status, with_hangar,
     };
     use super::{Resolved, Roots, resolve};
     use crate::testing::{roots, scratch_dir};
@@ -437,7 +477,7 @@ mod tests {
                     (*vm).to_string(),
                     MountSpec {
                         host: (*host).to_string(),
-                        writable: *writable,
+                        mode: if *writable { Mode::Rw } else { Mode::Ro },
                     },
                 )
             })
@@ -460,13 +500,14 @@ mod tests {
             ("/home/you", false, "your home or above"),
             ("/home/you/.local/share/hangar", false, "hangar's own state"),
             (
-                "/home/you/.local/share/hangar/vault",
+                "/home/you/.local/share/hangar/proxies/p",
                 true,
                 "hangar's own state",
             ),
             ("/home/you/.ssh", false, "credentials or keys"),
             ("/home/you/work/.aws", false, "credentials or keys"),
             ("/home/you/.config/gh", false, "credentials or keys"),
+            ("/home/you/.secrets", false, "credentials or keys"),
             ("/home/you/.claude", true, "keep config"),
             ("/home/you/.claude/agents", true, "keep config"),
             ("/home/you/.config", true, "keep config"),
@@ -490,25 +531,13 @@ mod tests {
             ("/home/pilot/a", "~/a", false),
             ("/home/pilot/b", "~/b", true),
         ]);
-        let none: [String; 0] = [];
-        assert!(check_targets(&two, false, &none).is_ok());
+        assert!(check_targets(&two).is_ok());
         let nested = mounts(&[
             ("/home/pilot/a", "~/a", false),
             ("/home/pilot/a/b", "~/b", false),
         ]);
-        let error = check_targets(&nested, false, &none)
-            .unwrap_err()
-            .to_string();
+        let error = check_targets(&nested).unwrap_err().to_string();
         assert!(error.contains("overlap"), "{error}");
-        for file in ["/home/pilot/a/x", "/home/pilot/a", "/home/pilot"] {
-            let error = check_targets(&two, false, &[file.to_string()])
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("either copied or mounted"), "{error}");
-        }
-        assert!(
-            check_targets(&two, false, &["/home/pilot/c".to_string()]).is_ok()
-        );
     }
 
     #[test]
@@ -531,10 +560,10 @@ mod tests {
                 vm: "/home/pilot/d".into(),
                 host: home.join("data"),
                 writable: true,
+                file: false,
             }]
         );
         for (host, why) in [
-            ("~/file", "isn't a directory"),
             ("~/file/below", "isn't a directory"),
             ("~/missing/../x", "can't contain .."),
             ("relative", "expected an absolute path"),
@@ -547,6 +576,200 @@ mod tests {
                     .to_string();
             assert!(error.contains(why), "{host}: {error}");
         }
+    }
+
+    fn spec(host: &str, mode: Mode) -> MountSpec {
+        MountSpec {
+            host: host.into(),
+            mode,
+        }
+    }
+
+    #[test]
+    fn stow_symlinked_dir_mounts_its_real_target() {
+        let home = fs::canonicalize(scratch_dir("mount-stow")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        fs::create_dir_all(home.join("dotfiles/code")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join("dotfiles/code"),
+            home.join("code"),
+        )
+        .unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/code".into(),
+            spec("~/code", Mode::Ro),
+        )]);
+        let resolved = resolve(&set, &roots).unwrap();
+        assert_eq!(resolved[0].host, home.join("dotfiles/code"));
+    }
+
+    #[test]
+    fn symlink_into_state_is_refused_after_resolving() {
+        let home = fs::canonicalize(scratch_dir("mount-link-state")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        std::os::unix::fs::symlink(home.join("state"), home.join("alias"))
+            .unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/a".into(),
+            spec("~/alias", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("hangar's own state"), "{error}");
+    }
+
+    #[test]
+    fn file_mount_ro_records_file_ro() {
+        let home = fs::canonicalize(scratch_dir("mount-file")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        fs::create_dir_all(home.join("dotfiles")).unwrap();
+        fs::write(home.join("dotfiles/gitconfig"), "[user]").unwrap();
+        std::os::unix::fs::symlink(
+            home.join("dotfiles/gitconfig"),
+            home.join(".gitconfig"),
+        )
+        .unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/.gitconfig".into(),
+            spec("~/.gitconfig", Mode::Ro),
+        )]);
+        let resolved = resolve(&set, &roots).unwrap();
+        assert!(resolved[0].file);
+        assert_eq!(resolved[0].host, home.join("dotfiles/gitconfig"));
+        assert_eq!(
+            lines(&resolved),
+            [format!(
+                "/home/pilot/.gitconfig\t{}\tfile-ro",
+                home.join("dotfiles/gitconfig").display()
+            )]
+        );
+        let recorded = lines(&resolved);
+        let shown = status(&set, None, None, &home, Some(&recorded));
+        assert_eq!(shown[0].applied, Some(true));
+    }
+
+    fn stowed(home: &Path, link_name: &str, target: &str, dir: bool) {
+        let target = home.join(target);
+        if dir {
+            fs::create_dir_all(&target).unwrap();
+        } else {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, "x").unwrap();
+        }
+        std::os::unix::fs::symlink(&target, home.join(link_name)).unwrap();
+    }
+
+    #[test]
+    fn stowed_dot_paths_are_judged_by_their_name_when_writable() {
+        let home = fs::canonicalize(scratch_dir("mount-stow-dot")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        stowed(&home, ".bashrc", "dotfiles/bash/.bashrc", false);
+        stowed(&home, ".config", "dotfiles/config", true);
+        for host in ["~/.bashrc", "~/.config"] {
+            let rw = BTreeMap::from([(
+                "/home/pilot/x".into(),
+                spec(host, Mode::Rw),
+            )]);
+            let error = resolve(&rw, &roots).unwrap_err().to_string();
+            assert!(error.contains("keep config"), "{host}: {error}");
+            let ro = BTreeMap::from([(
+                "/home/pilot/x".into(),
+                spec(host, Mode::Ro),
+            )]);
+            assert!(resolve(&ro, &roots).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn stowed_credentials_are_refused_by_their_link_name() {
+        let home = fs::canonicalize(scratch_dir("mount-stow-cred")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        stowed(&home, ".git-credentials", "dotfiles/git-creds", false);
+        let set = BTreeMap::from([(
+            "/home/pilot/x".into(),
+            spec("~/.git-credentials", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("credentials"), "{error}");
+        stowed(&home, "innocent", "dotfiles/plain", false);
+        let set = BTreeMap::from([(
+            "/home/pilot/.netrc".into(),
+            spec("~/innocent", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn sockets_are_neither_files_nor_directories() {
+        let home = fs::canonicalize(scratch_dir("mount-socket")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(home.join("sock")).unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/s".into(),
+            spec("~/sock", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(
+            error.contains("isn't a regular file or directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn credentials_file_mount_is_refused() {
+        let home = fs::canonicalize(scratch_dir("mount-file-key")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        fs::create_dir_all(home.join("keys")).unwrap();
+        fs::write(home.join("keys/id_ed25519"), "key").unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/k".into(),
+            spec("~/keys/id_ed25519", Mode::Ro),
+        )]);
+        let error = resolve(&set, &roots).unwrap_err().to_string();
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn writable_file_mount_records_file_rw() {
+        let home = fs::canonicalize(scratch_dir("mount-file-rw")).unwrap();
+        let roots = roots(&home, "state", ".cache/hangar");
+        fs::write(home.join("notes"), "x").unwrap();
+        let set = BTreeMap::from([(
+            "/home/pilot/n".into(),
+            spec("~/notes", Mode::Rw),
+        )]);
+        let resolved = resolve(&set, &roots).unwrap();
+        assert!(lines(&resolved)[0].ends_with("\tfile-rw"));
+    }
+
+    #[test]
+    fn live_and_copies_split_the_modes() {
+        let set = BTreeMap::from([
+            ("/home/pilot/a".to_string(), spec("~/a", Mode::Ro)),
+            ("/home/pilot/b".to_string(), spec("~/b", Mode::Rw)),
+            ("/home/pilot/c".to_string(), spec("~/c", Mode::Copy)),
+        ]);
+        let live: Vec<_> = super::live(&set).into_keys().collect();
+        assert_eq!(live, ["/home/pilot/a", "/home/pilot/b"]);
+        assert_eq!(
+            super::copies(&set),
+            BTreeMap::from([("/home/pilot/c".to_string(), "~/c".to_string())])
+        );
+    }
+
+    #[test]
+    fn copy_and_live_mount_cannot_overlap() {
+        let set = BTreeMap::from([
+            ("/home/pilot/a".to_string(), spec("~/a", Mode::Ro)),
+            ("/home/pilot/a/b".to_string(), spec("~/b", Mode::Copy)),
+        ]);
+        let error = check_targets(&set).unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert_eq!(
+            super::mount_at("/home/pilot/a/x", &super::live(&set)),
+            Some("/home/pilot/a")
+        );
     }
 
     #[test]
@@ -624,11 +847,13 @@ mod tests {
                 vm: "/home/pilot/.paperclip".into(),
                 host: "/home/you/work/paperclip".into(),
                 writable: true,
+                file: false,
             },
             Resolved {
                 vm: "/home/pilot/skills".into(),
                 host: "/srv/skills".into(),
                 writable: false,
+                file: false,
             },
         ];
         assert_eq!(
@@ -662,7 +887,8 @@ mod tests {
                 MountStatus {
                     vm: "/home/pilot/a".into(),
                     host: home.join("a").display().to_string(),
-                    writable: true,
+                    written: "~/a".into(),
+                    mode: Mode::Rw,
                     kind: MountKind::User,
                     applied: Some(true),
                 },
@@ -670,7 +896,8 @@ mod tests {
                 MountStatus {
                     vm: "/home/pilot/b".into(),
                     host: home.join("b").display().to_string(),
-                    writable: false,
+                    written: "~/b".into(),
+                    mode: Mode::Ro,
                     kind: MountKind::User,
                     applied: Some(false),
                 },
@@ -680,23 +907,23 @@ mod tests {
     }
 
     #[test]
-    fn recorded_mounts_are_checked_again_against_todays_roots() {
-        let roots = bay_roots(STATE, CACHE);
-        let fine = [
-            format!("/home/pilot\t{STATE}/bays/default/home\trw"),
-            "/srv\t/srv/skills\tro".to_string(),
-            "unreadable".to_string(),
-        ];
-        assert!(recheck(&fine, &roots).is_ok());
-        // Allowed when created, but the state root has moved onto it.
-        let moved = bay_roots("/home/you/work", CACHE);
-        let error = recheck(&["/w\t/home/you/work/x\trw".into()], &moved)
-            .unwrap_err()
-            .to_string();
+    fn copies_are_listed_with_their_mode_and_never_as_applied() {
+        let home = std::path::PathBuf::from("/h");
+        let set = BTreeMap::from([(
+            "/home/pilot/.gitconfig".to_string(),
+            spec("~/.gitconfig", Mode::Copy),
+        )]);
+        let shown = status(&set, None, None, &home, Some(&[]));
         assert_eq!(
-            error,
-            "the bay's mount at /w: /home/you/work/x holds hangar's own \
-             state: see docs/configuration.md, \"Mounting folders\""
+            shown,
+            [MountStatus {
+                vm: "/home/pilot/.gitconfig".into(),
+                host: "/h/.gitconfig".into(),
+                written: "~/.gitconfig".into(),
+                mode: Mode::Copy,
+                kind: MountKind::User,
+                applied: None,
+            }]
         );
     }
 
@@ -710,7 +937,7 @@ mod tests {
             all["/home/pilot"],
             MountSpec {
                 host: home.clone(),
-                writable: true,
+                mode: Mode::Rw,
             }
         );
         assert_eq!(all.len(), 2);
@@ -730,24 +957,21 @@ mod tests {
 
     #[test]
     fn mounts_may_sit_under_the_home_mount_but_not_cover_it() {
-        let none: [String; 0] = [];
         let below =
             mounts(&[("/home/pilot/.claude/skills", "~/skills", false)]);
-        assert!(check_targets(&below, true, &none).is_ok());
+        assert!(check_targets(&below).is_ok());
         for vm in ["/home/pilot", "/home", "/"] {
             let error =
-                check_targets(&mounts(&[(vm, "~/x", true)]), true, &none)
-                    .unwrap_err()
-                    .to_string();
-            assert!(error.contains("bay's home is mounted"), "{vm}: {error}");
+                check_targets(&mounts(&[(vm, "~/x", true)])).unwrap_err();
             assert!(
-                check_targets(&mounts(&[(vm, "~/x", true)]), false, &none)
-                    .is_ok()
+                error.to_string().contains("bay's home is mounted"),
+                "{vm}: {error}"
+            );
+            assert_eq!(
+                error.hint(),
+                Some("mount it at a path below /home/pilot")
             );
         }
-        // Copied files may land in the home mount: only mounts conflict.
-        let files = ["/home/pilot/.claude/CLAUDE.md".to_string()];
-        assert!(check_targets(&BTreeMap::new(), true, &files).is_ok());
     }
 
     #[test]
@@ -769,7 +993,10 @@ mod tests {
                 ("/home/you/.cache/hangar/bays/default-2", "package caches"),
                 ("/home/you/.local/share", "hangar's own state"),
                 ("/home/you/.local/share/hangar", "hangar's own state"),
-                ("/home/you/.local/share/hangar/vault", "hangar's own state"),
+                (
+                    "/home/you/.local/share/hangar/proxies/p",
+                    "hangar's own state",
+                ),
                 ("/home/you/.local/share/hangar/guest", "hangar's own state"),
                 ("/home/you/.local/share/hangar/bays", "hangar's own state"),
                 (
@@ -862,7 +1089,7 @@ mod tests {
             all["/var/cache/hangar"],
             MountSpec {
                 host: cache.clone(),
-                writable: true,
+                mode: Mode::Rw,
             }
         );
         let shown =

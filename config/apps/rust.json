@@ -1,7 +1,0 @@
-{
-  "routes": [
-    { "name": "crates-index", "host": "index.crates.io", "auth": { "type": "passthrough" } },
-    { "name": "crates-static", "host": "static.crates.io", "auth": { "type": "passthrough" } },
-    { "name": "rustup", "host": "static.rust-lang.org", "auth": { "type": "passthrough" } }
-  ]
-}

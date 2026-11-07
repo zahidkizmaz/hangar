@@ -11,250 +11,223 @@ let
   inherit (lib) mkOption types;
 
   msb = pkgs.callPackage ./microsandbox.nix { };
+  usesMsb = cfg.sandbox.backend == null || cfg.sandbox.backend == "msb";
+
+  nonEmpty = lib.filterAttrs (_: value: value != null && value != [ ] && value != { });
 
   # Only what's set here; the CLI fills in config/defaults.json for the rest.
-  settings = lib.recursiveUpdate cfg.settings (
-    {
-      tower = {
-        inherit (cfg.tower) credentialFiles;
-        routes = map (lib.filterAttrs (_: value: value != null)) cfg.tower.routes;
-      }
-      // lib.optionalAttrs (cfg.tower.masterPasswordFile != null) {
-        inherit (cfg.tower) masterPasswordFile;
-      };
-    }
-    // lib.optionalAttrs (cfg.bays != [ ]) { bays = map renderBay cfg.bays; }
-    // lib.optionalAttrs (cfg.appDefinitions != { }) { inherit (cfg) appDefinitions; }
-    // lib.optionalAttrs (cfg.stateDir != null) { inherit (cfg) stateDir; }
-  );
+  settings = nonEmpty {
+    inherit (cfg) proxies apps;
+    defaults = nonEmpty { inherit (cfg.defaults) proxy; };
+    sandbox = nonEmpty { inherit (cfg.sandbox) backend; };
+    bays = map (bay: bay.rendered) cfg.bays;
+  };
 
-  renderBay =
-    bay:
-    lib.filterAttrs (_: value: value != null && value != [ ] && value != { }) (
-      removeAttrs bay [
-        "imagePackage"
-        "home"
-        "cache"
-      ]
-      // lib.optionalAttrs (bay.imagePackage != null) {
-        image = "${bay.imagePackage.imageName}:${bay.imagePackage.imageTag}";
-        imageLoader = "${bay.imagePackage}";
-      }
-    )
-    # On is the CLI's default; only off is written, after the filter.
-    // lib.optionalAttrs (!bay.home) { home = false; }
-    // lib.optionalAttrs (!bay.cache) { cache = false; };
-
-  routeModule = types.submodule {
+  mountModule = types.submodule {
     options = {
-      name = mkOption {
-        type = types.str;
-        description = "Unique among routes; an app's route names are taken.";
-      };
       host = mkOption {
         type = types.str;
-        example = "api.example.com";
-        description = "The host the tower forwards to (`*.example.com` matches one label).";
+        description = "Host path (absolute or `~/…`); a missing directory is created (0700).";
       };
-      auth = mkOption {
-        type = types.attrs;
-        example = {
-          type = "bearer";
-          token = "EXAMPLE_TOKEN";
-        };
-        description = "What the tower injects: `{ type; … }` with credential names only.";
-      };
-      extra = mkOption {
-        type = types.nullOr types.attrs;
-        default = null;
-        description = "Broker backend fields, passed through unchecked.";
+      mode = mkOption {
+        type = types.enum [
+          "ro"
+          "rw"
+          "copy"
+        ];
+        default = "ro";
+        description = ''
+          `ro`: mounted read-only. `rw`: mounted writable, only for a
+          dedicated directory in your home. `copy`: copied in on every
+          `hangar up`, never secrets.
+        '';
       };
     };
   };
 
-  bayModule = types.submodule {
-    options = {
-      name = mkOption {
-        type = types.str;
-        example = "work";
-        description = ''
-          The bay's name: lowercase letters and digits, joined by single
-          `-`, at most 32 characters. Its VM is `hangar-bay-<name>`.
-        '';
-      };
-
-      apps = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        example = [
-          "nix"
-          "github"
-          "claude-code"
-          "paperclip"
-        ];
-        description = ''
-          Apps to set up in the bay: built-ins (see docs/configuration.md) or
-          `appDefinitions` names. Each brings its packages, routes, env,
-          run entry and ports.
-        '';
-      };
-
-      ports = mkOption {
-        type = types.attrsOf types.port;
-        default = { };
-        example = {
-          paperclip = 3200;
+  bayModule = types.submodule (
+    { config, options, ... }:
+    {
+      options = {
+        name = mkOption {
+          type = types.str;
+          example = "work";
+          description = ''
+            The bay's name: lowercase letters and digits, joined by single
+            `-`, at most 32 characters. Its VM is `hangar-bay-<name>`.
+          '';
         };
-        description = "App port name -> host port, for two bays running the same app.";
-      };
 
-      image = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "ghcr.io/zahidkizmaz/hangar-bay@sha256:...";
-        description = ''
-          Bay image ref. Null: the image released with this hangar,
-          `ghcr.io/zahidkizmaz/hangar-bay:v<version>`.
-        '';
-      };
-
-      imagePackage = mkOption {
-        type = types.nullOr types.package;
-        default = null;
-        description = ''
-          Build the bay image locally instead, e.g.
-          `inputs.hangar.packages.''${system}.bay-image`. It's Linux only:
-          on macOS use `inputs.hangar.packages.aarch64-linux.bay-image`,
-          which needs a Linux builder.
-        '';
-      };
-
-      cpus = mkOption {
-        type = types.nullOr types.ints.positive;
-        default = null;
-        description = "CPUs for the bay's VM. Null: the CLI's default (4).";
-      };
-
-      memory = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "8G";
-        description = "Memory for the bay's VM. Null: the CLI's default (`6G`).";
-      };
-
-      disk = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Root disk size of the bay's VM. Null: the CLI's default (`40G`).";
-      };
-
-      packages = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        example = [
-          "github:numtide/llm-agents.nix#codex"
-          "nixpkgs#rtk"
-        ];
-        description = ''
-          Flake installables `hangar up` keeps installed in the bay;
-          removing one uninstalls it. Listing an unfree package (e.g.
-          claude-code) means accepting its license.
-        '';
-      };
-
-      env = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
-        example = {
-          GIT_AUTHOR_NAME = "agent";
+        # No default: unset means `defaults.proxy`, null the open internet.
+        proxy = mkOption {
+          type = types.nullOr types.str;
+          example = "vault";
+          description = ''
+            The proxy (a name in `proxies`) that is the bay's only way out.
+            Unset: `defaults.proxy`. `null`: the open internet.
+          '';
         };
-        description = ''
-          Plain variables for the bay's login shells, never secrets. Every
-          injected credential already gets a placeholder variable.
-        '';
-      };
 
-      run = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
-        example = {
-          worker = "npm run worker";
+        apps = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [
+            "claude-code"
+            "paperclip"
+          ];
+          description = ''
+            Apps to set up in the bay: built-ins (see docs/configuration.md) or
+            names in `apps`. Each brings its packages, env, run entry and
+            ports.
+          '';
         };
-        description = ''
-          Long-running commands (name -> command) `hangar up` starts in the
-          bay; one named like an app replaces the app's.
-        '';
-      };
 
-      files = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
-        example = {
-          "~/.claude/CLAUDE.md" = "~/dotfiles/claude/CLAUDE.md";
-          "~/.claude/agents" = "~/dotfiles/claude/agents";
+        packages = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [
+            "github:numtide/llm-agents.nix#codex"
+            "nixpkgs#rtk"
+          ];
+          description = ''
+            Flake installables `hangar up` keeps installed in the bay;
+            removing one uninstalls it. Listing an unfree package (e.g.
+            claude-code) means accepting its license.
+          '';
         };
-        description = ''
-          Config files or directories copied into the bay on every
-          `hangar up` (VM path -> host path); secrets are refused.
-        '';
-      };
 
-      home = mkOption {
-        type = types.bool;
-        default = true;
-        description = ''
-          Keep the bay's home in `<stateDir>/bays/<name>/home`, so apps'
-          data survives a new VM; false keeps it on the VM's disk.
-        '';
-      };
-
-      cache = mkOption {
-        type = types.bool;
-        default = true;
-        description = ''
-          Keep a cache of the bay's packages in
-          `$XDG_CACHE_HOME/hangar/bays/<name>`, so a new VM doesn't download
-          them again; only correctly signed paths are used from it.
-        '';
-      };
-
-      mounts = mkOption {
-        type = types.attrsOf (
-          types.submodule {
-            options = {
-              host = mkOption {
-                type = types.str;
-                description = "Host directory (absolute or `~/…`); created (0700) if missing.";
-              };
-              writable = mkOption {
-                type = types.bool;
-                default = false;
-                description = ''
-                  Let the VM write to it. Only for a dedicated directory in
-                  your home, never one a host program reads its config from.
-                '';
-              };
-            };
-          }
-        );
-        default = { };
-        example = {
-          "~/projects" = {
-            host = "~/work/projects";
-            writable = true;
+        env = mkOption {
+          type = types.attrsOf types.str;
+          default = { };
+          example = {
+            GIT_AUTHOR_NAME = "agent";
           };
+          description = "Plain variables for the bay's login shells, never secrets.";
         };
-        description = ''
-          Host directories mounted into the bay when it's created (VM path
-          -> source), read-only unless `writable`.
-        '';
+
+        mounts = mkOption {
+          type = types.attrsOf mountModule;
+          default = { };
+          example = {
+            "~/projects" = {
+              host = "~/work/projects";
+              mode = "rw";
+            };
+            "~/.claude/CLAUDE.md" = {
+              host = "~/dotfiles/claude/CLAUDE.md";
+              mode = "copy";
+            };
+          };
+          description = "VM path (in `~`) -> host path and mode.";
+        };
+
+        ports = mkOption {
+          type = types.attrsOf types.port;
+          default = { };
+          example = {
+            paperclip = 3200;
+          };
+          description = "App port name -> host port, for two bays running the same app.";
+        };
+
+        image = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "ghcr.io/zahidkizmaz/hangar-bay@sha256:...";
+          description = ''
+            Bay image ref. Null: the image released with this hangar,
+            `ghcr.io/zahidkizmaz/hangar-bay:v<version>`.
+          '';
+        };
+
+        imageRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "ghcr.io/example/hangar-bay";
+          description = ''
+            Where the release image is, when `image` is null. Null: the
+            CLI's default (`ghcr.io/zahidkizmaz/hangar-bay`).
+          '';
+        };
+
+        imageLoader = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = ''
+            A program that streams an image archive, loaded before the VM
+            is created when `image` is missing. `imagePackage` sets it.
+          '';
+        };
+
+        imagePackage = mkOption {
+          type = types.nullOr types.package;
+          default = null;
+          description = ''
+            Build the bay image locally instead, e.g.
+            `inputs.hangar.packages.''${system}.bay-image`. It's Linux only:
+            on macOS use `inputs.hangar.packages.aarch64-linux.bay-image`,
+            which needs a Linux builder.
+          '';
+        };
+
+        cpus = mkOption {
+          type = types.nullOr types.ints.positive;
+          default = null;
+          description = "CPUs for the bay's VM. Null: the CLI's default (4).";
+        };
+
+        memory = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "8G";
+          description = "Memory for the bay's VM. Null: the CLI's default (`6G`).";
+        };
+
+        disk = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Disk size of the bay's VM and its data volume. Null: the CLI's default (`40G`).";
+        };
+
+        rendered = mkOption {
+          type = types.attrs;
+          internal = true;
+          readOnly = true;
+          description = "The bay as hangar.json has it.";
+        };
       };
-    };
-  };
+
+      config.rendered =
+        nonEmpty (
+          {
+            inherit (config)
+              name
+              apps
+              packages
+              env
+              ports
+              image
+              imageRepository
+              imageLoader
+              cpus
+              memory
+              disk
+              ;
+            mounts = lib.mapAttrs (_: mount: { inherit (mount) host mode; }) config.mounts;
+          }
+          // lib.optionalAttrs (config.imagePackage != null) {
+            image = "${config.imagePackage.imageName}:${config.imagePackage.imageTag}";
+            imageLoader = "${config.imagePackage}";
+          }
+        )
+        # After the filter: null is a choice here.
+        // lib.optionalAttrs options.proxy.isDefined { inherit (config) proxy; };
+    }
+  );
 in
 {
   options.services.hangar = {
-    enable = lib.mkEnableOption "sandboxed bays behind a credential tower";
+    enable = lib.mkEnableOption "sandboxed bays whose only way out is a proxy";
 
     autoStart = mkOption {
       type = types.bool;
@@ -262,21 +235,30 @@ in
       description = "Run `hangar up` at login (off by default: it boots VMs).";
     };
 
-    msbPackage = mkOption {
-      type = types.nullOr types.package;
-      default = if msb.meta.available then msb else null;
-      defaultText = lib.literalExpression "hangar's packaged microsandbox release";
-      description = "microsandbox package; null uses `msb` from PATH.";
+    # Free-form: each kind checks its own keys when hangar loads.
+    proxies = mkOption {
+      type = types.attrsOf (types.attrsOf types.anything);
+      default = { };
+      example = lib.literalExpression ''
+        {
+          vault = {
+            kind = "infisical";
+            run = "managed";
+          };
+        }
+      '';
+      description = ''
+        Proxies by name (see docs/proxy-kinds.md). Their tokens never go
+        here: hangar keeps them in the OS keychain, or runs the command a
+        proxy's `secrets` names.
+      '';
     };
 
-    stateDir = mkOption {
+    defaults.proxy = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = ''
-        Vault data, tokens, the bays' records and home folders. Null:
-        the CLI uses `$XDG_DATA_HOME/hangar` (`~/.local/share/hangar`) of
-        whoever runs it.
-      '';
+      example = "vault";
+      description = "The proxy of every bay that doesn't set `proxy`.";
     };
 
     bays = mkOption {
@@ -284,62 +266,18 @@ in
       default = [ ];
       example = lib.literalExpression ''
         [
-          { name = "work"; apps = [ "nix" "github" "claude-code" ]; }
-          { name = "oss"; apps = [ "nix" "github" "claude-code" ]; cpus = 2; }
+          { name = "work"; apps = [ "claude-code" ]; }
+          { name = "scratch"; proxy = null; cpus = 2; }
         ]
       '';
       description = ''
-        The bays, in the order `up` and `status` take them. Empty: one bay,
+        The bays, in the order `up` and `ps` take them. Empty: one bay,
         `default`. Two modules setting this concatenate their lists; a
         duplicate name fails when hangar loads the config.
       '';
     };
 
-    tower = {
-      routes = mkOption {
-        type = types.listOf routeModule;
-        default = [ ];
-        example = [
-          {
-            name = "jira";
-            host = "example.atlassian.net";
-            auth = {
-              type = "basic";
-              username = "JIRA_USER";
-              password = "JIRA_TOKEN";
-            };
-          }
-        ];
-        description = ''
-          Hosts the tower forwards to, next to the ones the bays' apps
-          bring; hangar ships no routes of its own. A name an app's route
-          has is an error, and so is a second route for a host.
-        '';
-      };
-
-      credentialFiles = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
-        example = {
-          GITHUB_TOKEN = "/run/agenix/github-token";
-        };
-        description = "Vault credential key -> file holding its value.";
-      };
-
-      # A string, not a path: a path literal would copy the secret into the store.
-      masterPasswordFile = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = lib.literalExpression "config.sops.secrets.hangar-master-password.path";
-        description = ''
-          Explicit opt-in: a file holding the vault's master password, e.g.
-          a sops-nix or agenix secret on Linux. By default the password
-          lives in the OS keychain, generated on the first `hangar up`.
-        '';
-      };
-    };
-
-    appDefinitions = mkOption {
+    apps = mkOption {
       type = types.attrsOf types.attrs;
       default = { };
       example = {
@@ -356,24 +294,23 @@ in
         };
       };
       description = ''
-        Your own apps (name -> { packages, routes, env, credentials, setup,
-        run, ports }), enabled by listing them in a bay's `apps`. One named
-        like a built-in replaces it whole.
+        Your own apps (name -> { packages, env, setup, run, ports }),
+        enabled by listing them in a bay's `apps`. One named like a
+        built-in replaces it whole.
       '';
     };
 
-    settings = mkOption {
-      type = types.attrs;
-      default = { };
-      example = {
-        tower.agentVault.adminPort = 14421;
-      };
-      description = ''
-        Any other hangar.json setting (see docs/configuration.md), such as the sandbox
-        and the tower's backend settings (`sandbox`, `tower.backend`,
-        `tower.agentVault`). Lists here replace the generated ones whole,
-        so set bays and routes with the typed options.
-      '';
+    sandbox.backend = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "The sandbox backend. Null: the CLI's default (`msb`).";
+    };
+
+    sandbox.package = mkOption {
+      type = types.nullOr types.package;
+      default = if usesMsb && msb.meta.available then msb else null;
+      defaultText = lib.literalExpression "hangar's packaged microsandbox release, for the msb backend";
+      description = "The backend's CLI, put on hangar's PATH; null uses the one on PATH.";
     };
 
     cli = mkOption {
@@ -401,7 +338,7 @@ in
           ''
             makeWrapper ${lib.getExe cfg.cli} $out/bin/hangar \
               --set HANGAR_NIX_CONFIG ${json} \
-              ${lib.optionalString (cfg.msbPackage != null) "--prefix PATH : ${cfg.msbPackage}/bin"}
+              ${lib.optionalString (cfg.sandbox.package != null) "--prefix PATH : ${cfg.sandbox.package}/bin"}
           '';
     };
   };

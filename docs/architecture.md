@@ -2,495 +2,259 @@
 
 ## VMs and request flow
 
-microsandbox VMs: one tower and any number of bays (`bays` in the config;
-none configured means one, `default`).
+Every VM runs on the sandbox backend, msb (microsandbox) by default:
 
-- `hangar-tower`, the tower, runs the credential broker (`tower.backend`,
-  today only `agent-vault`, digest-pinned image) with the real
-  credentials. It publishes its admin API (`tower.agentVault.adminPort`,
-  default 14321) and MITM proxy (`tower.agentVault.proxyPort`, 14322) on
-  the host's `127.0.0.1` only; its own egress is the public internet.
-- `hangar-bay-<name>` is a bay, where agents run. Its only outbound path
-  is the host's proxy port, so traffic flows bay → `host:proxyPort` →
-  agent-vault → upstream. The vault swaps placeholders for real
-  credentials and, in deny mode, answers `403` naming any host without a
-  route. Each bay has its own vault agent, `hangar-<name>`, and token, so
-  the vault's request log says which bay made a request.
+- `hangar-bay-<name>`, a bay, where agents run. With a proxy, its only
+  outbound path is that proxy's port on the host's loopback: bay →
+  `host:<port>` → proxy → upstream. With `"proxy": null` it has the open
+  internet.
+- `hangar-proxy-<name>`, a managed proxy (kinds with `"run": "managed"`).
+  Its own egress is the open internet; it publishes its port on the
+  host's `127.0.0.1` only.
 
-## Names
+External proxies (`"url"`) run outside hangar; hangar only checks that
+they answer.
 
-- **Bay**: a VM where AI coding agents run (`hangar-bay-<name>`).
-- **Tower**: the one VM that runs the credential broker (`hangar-tower`).
-- **Broker** is the tower's role. The `Broker` trait, `src/broker/` and
-  the agent-vault backend keep that name: the trait says what the tower
-  does, not where it runs, much as `Sandbox` isn't named after a VM.
-- **Agent** stays only as an upstream term: agent-vault's own agents
-  (`hangar-<bay>`, its token, `agent-tokens/`) and "AI coding agents" in
-  prose.
+## Proxies: the trait and the registry
 
-## What the core verifies
+`src/proxy/mod.rs` holds the `Proxy` and `Managed` traits and
+`proxy::kinds()`, the registry: one `(name, build)` line per kind. A kind
+is one file, `src/proxy/<kind>.rs`; nothing else in `src/` names one
+(`no_core_module_names_a_kind`). `config.rs` checks each entry's `kind`
+and location; `Hangar::load` calls the kind's `build` with a `Spec` (the
+entry's fields, its location, the user's home, the proxy's data folder
+and its `Secrets`), so a kind checks its own keys when the config loads.
 
-Backends aren't trusted with the security-critical parts; the core
-checks them through the traits:
+The core never trusts a kind with the security-critical parts:
 
 | Invariant | Enforcement |
-|---|---|
-| deny before routes and credentials | `Broker::deny_unlisted`, then `health().unlisted` must be `Deny`, else `up` refuses to apply routes |
-| step order | `TOWER_STEPS`: deny → routes → credentials → tokens; then each bay's `access()` |
-| only managed credentials deleted | `stale_keys` and `credential-keys`; the broker only gets explicit keys |
-| one egress port | bays are created with `Egress::OnlyHostPort(proxy)`, and `access()` must name the same port |
-| egress fixed at create | `bays/<name>/vm` and `tower-vm` record it; an existing VM without a matching record is refused with the recreate hint |
-| secrets never in argv, env or logs | `exec` stdin, `Access` and `UiLogin` hold `Secret`s, `VmSpec.env` is non-secret |
+| --- | --- |
+| one egress per bay | a bay with a proxy is created with `Egress::HostPort(proxy.egress())`; direct bays and managed proxies get `Egress::Open`, a managed proxy with an upstream on this machine `Egress::OpenAndHostPort(port)` |
+| egress fixed at create | the VM record holds the egress; a different one recreates the VM |
+| managed proxies in their own VM | `proxy::managed` creates `hangar-proxy-<name>` from `Managed::vm()`; its mounts must resolve under the proxy's data folder |
+| the CA a bay trusts | `proxy::access` checks it is exactly one PEM certificate (`ca::verify`), pinned when the kind sets `sha256` |
+| secrets off argv, env and logs | logins and URLs are `Secret`s; tokens go on `exec` stdin; `VmSpec.env` is non-secret |
+| proxy tokens off disk | `keychain` keeps them in the OS keychain (tool by absolute path, token on its stdin); `proxy::Secrets` reads them when needed |
+| remote proxies | `proxy::loopback_port` refuses a non-loopback `url` |
+
+Kinds and how to add one: [proxy-kinds.md](proxy-kinds.md).
+
+## The egress spec
+
+`VmSpec.egress` is backend-neutral: `Egress::Open`,
+`Egress::HostPort(port)`, one port on the host and nothing else, or
+`Egress::OpenAndHostPort(port)`, both. The msb backend turns `HostPort`
+into `--no-net --net-rule allow@host:tcp:<port>`, plus an ingress rule
+per published port, and `OpenAndHostPort` into `allow@public` and that
+host rule. The record stores it as `open`, `host:<port>` or
+`open+host:<port>`.
+
+## `hangar up`
+
+`commands::up` selects the named bays and proxies (none: all), adds each
+selected bay's proxy, and brings the proxies up first, each once. A bay
+whose proxy failed is left alone. Every resource ends in one `Change`:
+`created`, `recreated` (with reasons), `updated` (with what changed),
+`unchanged` or `failed`.
+
+### A VM's plan
+
+`lifecycle::plan` compares the VM's state and its record
+(`bays/<name>/vm`, `proxies/<name>/vm`) with the wanted record: image,
+egress, mounts, ports, resources and, for a managed proxy, a fingerprint.
+
+- missing → create;
+- exists without a record → recreate (`no record`);
+- any field differs → recreate, with the fields as reasons;
+- stopped → start; running → keep.
+
+A recreate stops the VM first (removing is a hard kill), removes it and
+creates it again. The home, the package cache and the bay's data volume
+outlive it; a changed `disk` also replaces the data volume. A VM whose
+create failed has no record, so the next `up` recreates it.
+
+### A managed proxy
+
+`proxy::managed::up`: plan and create the VM (`Managed::vm()`; the record
+holds `Managed::fingerprint()`, e.g. a hash of the proxy token, and a new
+one recreates the VM with empty mounts), and if the proxy doesn't answer
+yet (`health`), wait until exec works, run
+`Managed::start` and wait up to 60 seconds for it to come up. An external
+proxy is only health-checked.
+
+### A bay
+
+`bay::reconcile`, each step named in its errors (`bay work: packages: …`):
+
+1. **vm**: resolve and check the mounts (see [Mounts](#mounts)), then
+   plan. A new VM gets its image (loaded first through `imageLoader`
+   when set), the data volume `hangar-bay-<name>-data` at
+   `/var/lib/pilot`, `/sbin/init` as its init, the egress and the published
+   ports.
+2. **boot**: wait up to 2 minutes until systemd says `running` or
+   `degraded`.
+3. **proxy env**: `proxy::access` gets the CA, the egress and the login.
+   As root over stdin, `up` writes the CA bundle
+   (`/var/lib/hangar/ca-bundle.crt`: the image's CAs plus the proxy's),
+   then `/etc/hangar/proxy.env` (root:pilot 0640: the proxy URL with the
+   login, `NO_PROXY`, the CA variables, and the CA's SHA-256 in a header,
+   so a new CA alone changes it too). Each replaces the old file only
+   when it changed. Then it waits for Docker.
+4. **packages**: reconcile hangar's nix profile (below).
+5. **copies**: the `copy` mounts (`src/files.rs`).
+6. **env**: `/etc/hangar/bay.env`, the bay's `env`.
+7. **setup checks**: each app's setup `check`; an app that fails it is
+   skipped in the next step.
+8. **apps**: start each run entry as the transient user unit
+   `hangar-run-<name>.service` in pilot's user manager. Its description
+   holds a hash of the command, `bay.env`, the copies record, the proxy
+   env and the CA bundle, so an entry whose inputs changed restarts.
+   Units no app lists are stopped.
+
+`down` stops bays, then proxies. `restart` is `down`, then `up`. `rm`
+stops and removes the VM; with `--data` it also deletes the bay's folder
+and data volume, or the proxy's folder and its keychain tokens.
+
+### Package reconcile
+
+hangar records which element of its profile
+(`/nix/var/nix/profiles/hangar`) each installable became, in a record on
+the VM disk. Each `up` removes recorded elements no longer listed and
+installs missing ones (`nix profile add`, with `NIXPKGS_ALLOW_UNFREE=1`
+for that step only); elements it didn't install are never touched. The
+package cache at `/var/cache/hangar` is an extra substituter of lower
+priority; cached paths still need a trusted signature. After an install,
+the profile's closure is copied into the cache; a failed copy only warns.
+
+## Mounts
+
+`mounts::resolve` checks each `ro`/`rw` mount before anything is created:
+the source resolved (symlinks followed) and as written, against your
+home, the data and cache dirs (only the bay's own folders allowed), the
+credentials names, and for writable mounts your home's dot directories
+and `~/Library`. A missing source is created 0700 after its would-be path
+passes. hangar adds its own: the home at `/home/pilot` and the package
+cache at `/var/cache/hangar`, both writable. Pilot (uid 1000) owns every
+mount but the cache, which is root's.
+
+`copy` mounts go through `files::copy`: the whole set is planned first
+(every symlink followed and each resolved target checked, the secret scan,
+1 MiB per file, 10 MiB and 1000 entries in total), then files whose entry
+is gone are removed and changed ones written atomically, contents on
+stdin. `bays/<name>/copies` records a hash per file; a new VM clears it.
 
 ## State
 
-Every default path comes from `src/dirs.rs`, per the XDG Base Directory
-spec, at runtime: `hangar_dir` gives `$XDG_{CONFIG,DATA,CACHE}_HOME/hangar`,
-or the spec's fallback under `$HOME` (`~/.config`, `~/.local/share`,
-`~/.cache`) when a variable is unset or relative. No default is a fixed
-path in `config/defaults.json` or the Nix module; the macOS login agent
-logs to `${XDG_STATE_HOME:-~/.local/state}/hangar/hangar.log`, resolved by
-its shell wrapper.
+Every path comes from `src/dirs.rs`, per the XDG Base Directory spec.
 
-- `stateDir` (default `$XDG_DATA_HOME/hangar`, mode 0700):
-  - shared: the broker's own files (agent-vault: `vault/`, its data,
-    mounted at `/data`, and `owner-password`; they never move, so an
-    existing vault keeps unlocking), `credential-keys` (credentials hangar
-    set), `tower-vm` (the tower's published ports,
-    `port\t<name>\t<host>\t<vm>` lines, the proxy named `proxy`),
-    agent-vault's `agent-tokens/<bay>` (0600, one per bay; a bay gets only
-    its own, inside the proxy URL) and `guest/` (only `ca.pem`, mounted
-    read-only at `/run/hangar` in every bay);
-  - per bay, `bays/<name>/`: `vm` (what the bay's VM was created with,
-    `key\tvalue` lines: `image\t<ref>`, `egress\t<port>`,
-    `port\t<name>\t<host>\t<vm>`, and `mount\t<vm>\t<host>\t<ro|rw>` per
-    mount with its resolved host, the home mount included; no `mount`
-    lines means none), `files` (hash and VM path of each file
-    `files` copied) and `home/`.
-- `home` (`true`): the bay's `bays/<name>/home` (0700) is its home
-  (`/home/pilot`), mounted writable, so app data outlives the VM; `destroy`
-  keeps it, `destroy --state` deletes it with the rest of `stateDir`.
-- `cache` (`true`): `$XDG_CACHE_HOME/hangar/bays/<name>` (0700),
-  mounted writable at `/var/cache/hangar`; `nix/` inside is a `file://`
-  binary cache of the installed packages. Never shared between bays.
-- Neither takes a path, so every bay's folders sit in one of two roots,
-  `stateDir` and the cache root `$XDG_CACHE_HOME/hangar`; `Hangar::load`
-  refuses a `stateDir` that overlaps the cache root. A `Bay` (built by
-  `Hangar::bay`, no I/O) knows both folders even when off: the mount
-  rules need them.
-- `$XDG_STATE_HOME/hangar/lock`: held by every command that changes
-  state, first thing (before the master password is read or generated),
-  so two `up`s can't race. It lives outside `stateDir`, which
-  `destroy --state` deletes. `src/lock.rs`: one `try_lock`, then
-  "waiting for another hangar" and a blocking `lock()`.
-- OS keychain: service `hangar`, account `master-password`, through
-  `/usr/bin/security` or `secret-tool` by absolute path (`/usr/bin/`, or
-  libsecret's store path baked in by `nix/cli.nix` via
-  `HANGAR_SECRET_TOOL` at compile time), never found on `PATH`.
-- VM disks: a bay's root disk holds `/nix`, hangar's package profile
-  (`/nix/var/nix/profiles/hangar`, first on login shells' `PATH`), the
-  package record (`/var/lib/hangar/packages.json`), docker data and repos.
-  Profile, record and store are lost together with the VM, so a new VM with
-  a kept home reinstalls cleanly. The root keeps the image's layers, so
-  `/var/lib/pilot`, Docker's storage, gets a disk of its own
-  (`VmSpec.native_fs`), since overlayfs can't stack on them; both are
-  `disk` in size.
+- `$XDG_DATA_HOME/hangar` (0700):
+  - `bays/<name>/`: `vm` (the VM record: `image`, `egress`, `resources`,
+    `port` and `mount` lines), `copies` and `home/`;
+  - `proxies/<name>/`: `vm` (with the `fingerprint`) and `data/`, the
+    kind's own files.
+- `$XDG_CACHE_HOME/hangar/bays/<name>`: the bay's package cache. The data
+  and cache dirs must not overlap: the mount rules exempt a bay's own
+  folder in one and refuse everything else in both.
+- `$XDG_STATE_HOME/hangar`: `hangar.log` (0600, opened without following
+  symlinks) and `lock`, held by every command that changes state.
+- `Hangar::leftovers`: folders in `bays/` or `proxies/` with no config
+  entry. The sandbox can't list VMs, so this is how they're found.
+- VM disks: a bay's root disk holds `/nix`, hangar's profile and its
+  record. They are lost with the VM, so a new VM reinstalls cleanly. The
+  data volume (`/var/lib/pilot`, Docker's storage) is ext4 of its own,
+  because overlayfs can't stack on the image's layers.
 
 ## Who runs what in a bay
 
-Apps never run as root. Every bay `exec` names its user (`bay::ROOT` or
-`bay::PILOT`); the tower keeps its image's default.
+Apps never run as root. Every bay `exec` names its user.
 
-- root: the CA bundle and proxy env, the package reconcile and cache
-  fill, the env file (`write_env`): hangar's own steps.
-- `pilot` (uid 1000, home `/home/pilot`, from the image): run entries
-  (units in its own user manager: start, stop, status, journal), setup and its check, `files` copies and
-  removals, and `shell`, `logs` and `setup` (which start in the home).
-  Docker is pilot's own rootless daemon; nix goes through `nix-daemon`,
-  which doesn't trust pilot. No sudo.
+- root: the CA bundle, the proxy env, the package reconcile and cache
+  fill, the env file.
+- `pilot` (uid 1000, home `/home/pilot`): run entries (units in its own
+  user manager), setup and its check, copies, `exec`, `logs` and `setup`.
+  Docker is pilot's rootless daemon; nix goes through `nix-daemon`, which
+  doesn't trust pilot. No sudo.
 
-Root never follows, sources or executes a path pilot can write:
-- `files` and `mounts` targets must be in `~` (`files::vm_path`), so
-  pilot only ever owns its own home;
-- root's execs name absolute programs (`/bin/sh`,
-  `/run/current-system/sw/bin/nix`) and never start a login shell; the
-  package step sources only the root-owned proxy env file;
-- pilot's folders are declared in the image (systemd-tmpfiles), under
-  root-owned parents, and dockerd makes its own data root;
-- `start` first waits until the VM's systemd has booted.
+Root never follows, sources or executes a path pilot can write: mount and
+copy targets are in `~`, root's execs name absolute programs and never
+start a login shell, and pilot's folders are declared in the image under
+root-owned parents.
 
 ## The bay image
 
 `nix/bay/configuration.nix` is the bay as a NixOS system, and
 `nix/image.nix` packs it (`dockerTools.streamLayeredImage`, with the Nix
-DB): a root of `/sbin/init` (the system's `init`), `/etc`, `/root` and
-`/home/pilot` (for `home = false`). Its `Env` is only
+DB) behind `/sbin/init`. Its `Env` is only
 `PATH=/run/wrappers/bin:/run/current-system/sw/bin`, the `PATH` of root's
-`sh -c` steps, so it never holds hangar's profile, where a bay package
-could ship its own `mv`. Pilot's login shell
-puts the profile first (`environment.profiles`).
+`sh -c` steps, so it never holds hangar's profile.
 
-- Boot: `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
+- Boot (msb): `msb create --init /sbin/init --tmpfs /run`. agentd sets up the
   VM (mounts, network, `/etc/hosts`, `resolv.conf`), appends to
-  `/etc/profile` and the CA bundle, then execs `/sbin/init`: NixOS
-  activation, then systemd as PID 1. Both appended files are copies
-  (`mode = "0644"`), so the append never writes into `/nix/store`.
-  Without `--tmpfs /run`, systemd's own `/run` hides the `/run/hangar`
-  mount.
-- Readiness: `msb create` and `start` return before systemd is up. Root's
-  exec fails ("failed to resolve guest uid 0") until activation writes
-  passwd, then `systemctl is-system-running --wait` says `offline`, then
-  `running` or `degraded`, both booted. `wait_booted` polls every 0.5 s
-  for up to 2 minutes; `maintenance` and `stopping` fail at once.
-- Snapshots: restoring an msb snapshot loses `--init` (msb #1676), so
-  hangar never restores one.
-- Disks: the root keeps the image's layers (msb can't flatten a loaded
-  image), and overlayfs can't stack on them, so `/var/lib/pilot`
-  (Docker's storage) gets a disk of its own (`VmSpec.native_fs`), removed
-  with the VM. Both are `disk` in size and sparse: at worst twice `disk`
-  on the host.
-- Daemons are systemd units: socket-activated `nix-daemon` and pilot's
-  rootless `docker` user unit (`linger`, so it starts without a login;
-  `TimeoutStartSec = 60s` and `TimeoutStopSec = 30s` over the module's
-  `TimeoutSec = 0`, so a hanging start or stop can't hang `up`). Both read
-  `EnvironmentFile=-/etc/hangar/proxy.env`, plain `KEY='value'` lines
-  (systemd rejects `export`); the `-` lets them start on the first boot,
-  before the file exists.
-- `up` writes what is unknown until then, as root over stdin (`bay.rs`,
-  `replace`): the CA bundle (`/var/lib/hangar/ca-bundle.crt`, 0644, the
-  image's `/etc/hangar/system-ca.crt` plus `/run/hangar/ca.pem`), then
-  `proxy.env` (root:pilot 0640). Each goes to a `.tmp` file first and
-  replaces the old one with `mv` only when `cmp` finds it changed.
-  `proxy.env` starts with a `# tower CA <hash>` line, so a new CA changes
-  it too.
-- Restarts are declared: the `hangar-proxy-env.path` unit
-  (`PathChanged=/etc/hangar/proxy.env`) starts the oneshot
-  `hangar-proxy-env.service`, which runs `systemctl try-restart
-  nix-daemon`, then `systemctl --user -M pilot@.host reset-failed docker`
-  and `restart docker`. The reset is there because the upstream unit
-  allows 3 starts per 60 s (`StartLimitBurst`): a new bay uses two (boot,
-  the first `proxy.env`), so one crash or a renewed token in that minute
-  would hit `start-limit-hit`, and with nothing changed no later `up`
-  would restart it. The limit itself stays, so a broken dockerd doesn't
-  restart forever on its own (`Restart=always`). The
-  path unit fires when the file is created or replaced (inotify on the
-  file's inode, and on its folder until it exists), never on its own
-  start (systemd.path(5)). It watches only `proxy.env`, written last:
-  while the oneshot runs, the path unit doesn't watch, so a second
-  watched file could change unseen. A renewed token or a new tower CA
-  therefore stops pilot's containers; an unchanged `up` restarts
-  nothing.
-- Readiness: `up` then polls as pilot (`wait_for_docker`, every 0.5 s for
-  up to 2 minutes) until `systemctl list-jobs hangar-proxy-env.service`
-  is empty (a restart was queued or is still running) and `docker info`
-  answers; the unit is active before its socket is.
-- Shells: `msb exec` is no PAM login, so `environment.extraInit` sets
-  `USER`, `LOGNAME` and `XDG_RUNTIME_DIR`, then sources `proxy.env` and
-  `bay.env` with `set -a`. Root's package step sources only `proxy.env`.
-- pilot: uid and gid 1000, `createHome = false` (the home is usually a
-  host mount), subuid and subgid 100000:65536 (NixOS's automatic range
-  for the only normal user). msb doesn't map uids by
-  identity: a mounted file shows the mount's `uid=,gid=` (`Mount.owner`),
-  so the host uid doesn't matter.
-- Privileges left: `newuidmap`/`newgidmap` (capabilities, for rootless
-  Docker) and setuid `unix_chkpwd` (PAM needs it for `user@1000`); `su`,
-  `sg`, `newgrp`, `mount`, `umount` and sudo are off. `/dev/net/tun` is
-  0666, which rootlesskit needs (root:pilot 0660 is unverified).
-  nix-daemon trusts only root, and builds run as nixbld.
-- Known gap: with `sandbox = false`, pilot's builds run unsandboxed as
-  nixbld and write to the store root installs packages from. Turn the
-  sandbox on once the bay kernel is shown to support it.
-- A custom `bays[].image` must be built from this module: hangar needs
-  systemd at `/sbin/init`, pilot, `nix`, `systemctl` and `docker` in the
-  system's `sw/bin`, `/etc/hangar/system-ca.crt` and the
-  `hangar-proxy-env` units.
-
-## `hangar up`
-
-Every step is idempotent, and `up` never restarts the VMs or run
-entries (the bay restarts its daemons only when their proxy env or CA
-changed):
-
-1. Resolve the master password: `HANGAR_MASTER_PASSWORD`,
-   `HANGAR_MASTER_PASSWORD_FILE`, `tower.masterPasswordFile`, then the keychain.
-   Generate one only when the broker has no data (`Broker::has_data`).
-   Fails before anything is created; an empty password is refused.
-2. Tower pre-flight, before any VM is touched: an existing tower must have
-   a `tower-vm` record with today's proxy port. Without a record, or with
-   another port, `up` refuses with "run 'hangar destroy && hangar up'
-   (home is kept)": it's fixed when the VM is created. Other tower port
-   changes only warn.
-3. Tower (`Broker::ensure_running`): create or start, then unlock it
-   with the password on stdin and log in as admin (agent-vault: start the
-   server, since starting a sandbox doesn't rerun the image's entrypoint,
-   then the owner login). A new VM gets its `tower-vm` record, even when
-   a later part of the start fails, so the next `up` can finish it.
-4. Deny mode; the core then reads the policy back (`Broker::health`) and
-   refuses to go on unless unlisted hosts are denied.
-5. Routes (the whole set; agent-vault: one `PUT` of its services).
-6. Credentials from `tower.credentialFiles` (values on stdin or in a request
-   body); delete those in `credential-keys` that left the config. The
-   broker only ever gets explicit keys.
-7. Bays' tokens (`Broker::retain_bays`): the vault agent and token file
-   of every bay that has a token but isn't configured are deleted (a 404
-   counts as gone); vault agents without a token file aren't hangar's.
-8. Each bay, in order. Its first step is its own pre-flight: an existing
-   VM needs a `bays/<name>/vm` record whose egress is the proxy port, and
-   its recorded mounts must pass today's mount rules (a root may have
-   moved), or the bay is refused with the same recreate hint. Then:
-   create or start, wait until its systemd has booted (see "The bay
-   image"), then `Broker::access(bay)` (agent-vault keeps the bay's token
-   in `agent-tokens/<bay>`; without the file it deletes any vault agent
-   `hangar-<bay>` and creates it again, never adopting one, and warns to
-   restart the bay's run entries) with the CA written to `guest/ca.pem`,
-   checked to name the proxy port, then the CA bundle and the proxy env
-   (the proxy URL on stdin) and the wait for docker. The image is
-   `bays[].image`, else `<imageRepository>:v<hangar version>`;
-   `imageLoader` (from `imagePackage`) loads it first if missing. The
-   VM's only egress is the tower's proxy port (`Egress::OnlyHostPort`); it
-   publishes the enabled apps' ports. Its image, egress, published ports
-   and mounts are recorded in `bays/<name>/vm`, also when a failing create
-   left the VM behind; a later `up` with a different image, ports or
-   mounts warns instead of recreating the VM (`drift_warnings`).
-   `mounts` plus hangar's own mounts (`mounts::with_hangar`:
-   `home` at `/home/pilot` and `cache` at `/var/cache/hangar`,
-   writable, same rules; pilot (uid 1000) owns every mount but the
-   cache and `/run/hangar`, which stay root's) are checked on their resolved sources
-   (`mounts::Roots`; a missing one on the path it would have, then created
-   0700) before the VM is created, passed in order (read-only unless
-   writable; the sandbox applies enclosing mounts before nested ones) and
-   recorded. A source may contain neither root, and inside them only the
-   bay's own home and cache are allowed (`mounts::check_hangar_dirs`, also
-   used for `files` sources); those are the only folders in a dot
-   directory a writable mount may use.
-9. Reconcile `packages` (below) in hangar's profile
-   (`--profile /nix/var/nix/profiles/hangar`).
-10. Copy `files` (`src/files.rs`). The whole set is planned first:
-    every file is read and checked (credentials deny-list by name and place,
-    the shared secret scan, no symlinks or special files, 1 MiB per file,
-    10 MiB and 1000 files in total, VM paths inside pilot's home,
-    without `..`). Any refusal stops the step before anything is copied. Then
-    files hangar copied whose entry is gone are removed (`rm -f`), and each
-    changed file is written atomically with its contents on stdin; the
-    `bays/<name>/files` record (FNV-1a of mode plus contents) is saved after
-    each file. Creating a new bay VM clears the record, so every file is copied
-    again. One core serves every copy: the checks in `files::plan`, the pure
-    `plan_copy` (declared: write changed, delete gone; ad hoc: write all,
-    delete nothing, forget the hashes it shadows) and `apply_copy`.
-11. Write `/etc/hangar/bay.env` (via `bay.env.tmp` and `mv`, so a login
-    never sources half a file; login shells source it with `set -a`):
-    `NAME='hangar-placeholder'` for
-    every credential name a route's auth references (`token`,
-    `username`, `password`, `key`, `{{ NAME }}` in custom headers) plus
-    `credentialFiles`, then `env` on top. Values are single-quoted;
-    `env` refuses real-looking secrets. Rewritten every `up`.
-12. Run each enabled app's setup `check` in a login shell (`sh -lc`, so
-    `PATH` and the app env apply); only its exit status counts. An app
-    whose check fails gets the warning "NAME needs setup: run 'hangar
-    setup NAME'", and step 13 skips the run entry of that name, even when
-    `run.NAME` overrides the command. There's no record: the check
-    is the truth, so a wiped home asks for setup again.
-13. Start each `run` entry not already running as the transient unit
-    `hangar-run-<name>.service` in pilot's user manager (`systemd-run
-    --user --collect`, run by pilot, with `XDG_RUNTIME_DIR` set since
-    `msb exec` is no login): `/bin/sh -lc` inside it, so the proxy env,
-    placeholders and profile apply, in pilot's home. Its cgroup holds
-    every process it starts, its output goes to the journal, and
-    `--collect` unloads it once it exits, failed or not, so the name is
-    free for the next start; there's no restart on failure. It counts as
-    running while `systemctl --user is-active` says `active` or
-    `activating`. The unit's description holds a fingerprint (FNV-1a of
-    the command, the env file and the `files` record): a running entry
-    whose description differs only gets a warning. Units are per boot,
-    so a restarted VM starts them again.
-14. Print `status`'s short view: health, each bay's run entries and
-    ports, the tower and its ports. Every published port is probed the same
-    way: an HTTP GET for HTTP ports, a TCP connect otherwise; the proxy,
-    which only the bays use, isn't probed.
-
-`hangar copy` runs step 10 alone (or one ad-hoc source through the same
-core). `hangar restart [NAME…]` runs step 10 (unless `--no-copy`) and step
-11, then stops each entry's unit (`systemctl --user stop`: TERM to its
-whole cgroup, KILL after 10 seconds) and starts it again through the same
-`launch` as step 13, with the new fingerprint. It doesn't run setup checks: a restart is an explicit action.
-
-`hangar setup NAME [--force]` needs the bay running and `NAME` an
-enabled app with a `setup`. Unless `--force`, an app whose check passes is
-left alone; otherwise it runs `sh -lc COMMAND` through `Sandbox::shell`
-with a terminal, then the check again, and a failing command or check is
-an error. `status` shows a stopped entry of an app with a setup as
-`stopped (needs setup? hangar setup NAME)`.
-
-## Credentials
-
-- `tower.credentialFiles`: hangar-managed, recorded in `credential-keys`,
-  reconciled on every `up`. So is an app's fixed, non-secret
-  `credentials` value (e.g. `github-token`'s `GITHUB_GIT_USER`) whenever
-  a route references it; two apps may share one only with the same value,
-  and `credentialFiles` can't name it.
-- `hangar credential set/list/rm`: the user's own. `list` reads each
-  one's kind and state from the broker (`Broker::credentials`: static, or
-  OAuth with whether it's connected), and `set` refuses an OAuth one: the
-  vault would store the value as its access token (`SetCredential`
-  keeps the row's type). Values come from a
-  hidden prompt (`stty -echo` in a trapped `sh`, value back over a pipe) or
-  stdin and go to the admin API in-process. Never recorded, so `up` never
-  deletes them; names managed by the config are refused.
-- `hangar credential login`: an OAuth credential the vault keeps and
-  refreshes. With a URL, `src/oauth.rs` finds the provider (RFC 9728
-  resource metadata, else RFC 8414 or OpenID metadata at the issuer,
-  checking issuer and resource) and registers hangar as a public client
-  (RFC 7591, `none` only) with `Broker::oauth_redirect_uri`; it fetches
-  only `https` URLs with public host names. `Broker::oauth_begin` saves
-  the client (none: a re-login with the one the broker holds, secret
-  included) and returns a `PendingLogin`: the consent URL and a marker
-  only the backend reads. hangar opens the URL only when it's https and
-  its `redirect_uri` is `Broker::oauth_redirect_uri` (a tower from before
-  `AGENT_VAULT_ADDR` would send the browser to `0.0.0.0`), then blocks in
-  `Broker::oauth_wait` (agent-vault: until `last_refreshed_at` moves off
-  the marker, no clock involved). The lock covers only the begin.
-  Brokers without OAuth keep the trait's refusing defaults.
-- `hangar vault-ui`: pipes `owner-password` into `pbcopy`, `wl-copy` or
-  `xclip` and opens the UI; it never prints the password.
-
-## Package reconcile
-
-hangar records which element of its profile (`/nix/var/nix/profiles/hangar`)
-each installable became, in the package record on the VM disk. Each `up`
-reads the record (none yet: empty) and the profile (missing on a new VM:
-empty), removes recorded elements no longer listed, installs missing ones
-(`nix profile add --profile … --impure` in a login shell, with
-`NIXPKGS_ALLOW_UNFREE=1` for that step only) and saves the record after
-every step. Recorded elements missing from the profile are reinstalled;
-elements not in the record were installed by hand and are never touched.
-
-With `cache`, installs add `--extra-substituters
-file:///var/cache/hangar/nix?priority=10` (lower priority wins over
-cache.nixos.org's 40; `trusted` stays off, so cached paths still need a
-signature from a trusted key). After an `up` that installed something, `nix
-copy --to file:///var/cache/hangar/nix?compression=zstd <profile>` copies
-the profile's closure into the cache, keeping each path's upstream
-signature; a failed copy only warns. hangar never creates a signing key, so
-locally built (unsigned) paths are copied but never used from the cache.
+  `/etc/profile` and the CA bundle, then execs `/sbin/init`. Both
+  appended files are copies, so the append never writes into the store.
+  hangar never restores snapshots: they lose `--init`.
+- Daemons: socket-activated `nix-daemon` and pilot's rootless `docker`
+  (lingering, so it starts without a login). Both read
+  `EnvironmentFile=-/etc/hangar/proxy.env`. The `hangar-proxy-env.path`
+  unit watches that file and restarts both when hangar replaces it; it
+  resets docker's start limit first, since boot and the first proxy env
+  already use two of its three starts a minute.
+- Shells: a sandbox exec is no PAM login, so `environment.extraInit` sets
+  `USER`, `LOGNAME` and `XDG_RUNTIME_DIR` and sources `proxy.env` and
+  `bay.env` with `set -a`.
+- Privileges left: `newuidmap`/`newgidmap` for rootless Docker and
+  setuid `unix_chkpwd`; `su`, `sg`, `newgrp`, `mount`, `umount` and sudo
+  are off.
+- Known gap: with `sandbox = false`, pilot's nix builds run unsandboxed
+  as nixbld.
 
 ## Config
 
-`hangar.json` is the only config. Lookup: `$HANGAR_CONFIG`, then the
-Nix-rendered file (`HANGAR_NIX_CONFIG`), then
-`$XDG_CONFIG_HOME/hangar/hangar.json`. Its top level is checked first
-(`bays`, `tower`, `appDefinitions`, `sandbox`, `stateDir`; anything else is
-an unknown setting), then it's merged over `config/defaults.json`, whose
-`bay` object is merged under each entry of `bays` (none: one bay,
-`default`). Bay names are `[a-z0-9]+(-[a-z0-9]+)*`, at most 32 characters,
-unique (agent-vault's own name rule then always holds for `hangar-<bay>`).
-`home` and `cache` are strict booleans. Unknown settings and unknown `auth`
-keys are errors.
-
-Routes are what the tower forwards: a list of `{name, host, auth, extra?}`;
-`extra` holds broker-specific fields, which agent-vault flattens into the
-service (keys clashing with `name`, `host` or `auth` are errors, checked
-by `Broker::validate` when the config loads). hangar ships none: they come
-from the bays' apps and `tower.routes`.
-
-Apps (`src/apps.rs`) are data: `config/apps/<name>.json` (built in via
-`include_str!`) or `appDefinitions.<name>` (replaces a built-in whole),
-enabled per bay by its `apps` (the built-ins are listed in
-[configuration.md](configuration.md#built-in-apps)).
-`config::resolve`:
-
-1. Per bay: its `apps` (`apps::Catalog::enabled`).
-2. Once, for the tower (`apps::merge_routes`): every bay's apps' routes,
-   each app once in bay order; two apps may share a route only when it's
-   identical ("enable only one of the two apps" otherwise), and a
-   `tower.routes` entry may not take an app route's name, so apps and the
-   user never shadow each other. Then `check_routes`: two sources can't
-   route one host (`apps::Origin`), and an app's route can't use a
-   credential another source uses. No app may set a credential's
-   placeholder variable (`check_placeholders`), over every bay.
-3. Per bay (`apps::apply`): `packages` are a union (order kept), `env` and
-   `run` per key with the bay winning (two of the bay's apps disagreeing on
-   a variable is an error), ports unique by name, with the bay's `ports`
-   moving one to another host port. Then `check_packages`: a bay with
-   packages needs a route whose host is exactly `cache.nixos.org`, and for
-   `github:` or registry refs (`nixpkgs#x`, `flake:nixpkgs#x`) exactly
-   `api.github.com`.
-
-An app's route can't set `extra`, which reaches the broker unchecked and
-so is trusted user config only. `Hangar::load` refuses two published
-ports (the tower's and every bay's) on one host port, naming both owners
-(`port 3100: work/paperclip and oss/paperclip: set ports.paperclip in bay
-oss`), and warns about a `credentialFiles` entry no route uses. No code
-outside `config/apps/` knows an app by name: checks key on hosts and
-credential names.
-
-`commands::pick` resolves `--bay` for the one-bay commands (the only bay,
-else an error listing them). `up` runs the tower steps once, then each
-selected bay's steps; a failing bay is logged, collected in
-`UpReport::failed` and makes `up` exit 1, and the others go on.
-`Hangar::leftovers` lists folders in `bays/` with no config entry (the
-sandbox can't list VMs): `status` shows them, `up` warns, `down`/`destroy`
-reach them by name.
+`hangar.json` is the only config (lookup in
+[configuration.md](configuration.md)). `config::resolve` checks the top
+level (`proxies`, `defaults`, `bays`, `apps`, `sandbox`), merges it over
+`config/defaults.json` (whose `bay` goes under each bay), checks each
+proxy's kind and location and each bay's keys, picks each bay's proxy
+(its own, `null`, or `defaults.proxy`; none is an error), and applies the
+bay's apps (`apps::apply`). `Hangar::load` then builds the proxies and
+refuses two things publishing one host port. No code outside
+`config/apps/` knows an app by name.
 
 ## Files
 
 - `src/main.rs`: argument parsing (clap) and dispatch.
-- `src/commands.rs`: what each command does, including the ordered
-  `TOWER_STEPS` and per-bay `BAY_STEPS` of `up`.
-- `src/hangar.rs`: `Hangar`, the shared context (settings, state dir, the
-  package cache root, sandbox and broker), which builds each `Bay`; the
-  only place that picks the backends (`sandbox.backend`,
-  `tower.backend`).
-- `src/credential.rs`: `hangar credential`, OAuth logins included.
-- `src/url.rs`: query parameters (the consent URL's, `resource=`).
-- `src/oauth.rs`: provider discovery and client registration.
-- `src/overview.rs`: what `status`, the port summary and `vault-ui`
-  report (data only).
-- `src/output.rs`: renders command results as text or `--json`, errors
-  included, and picks the exit code (docs/cli.md).
-- `src/config.rs`: lookup, merge, validation (routes into
-  `broker::Route`).
-- `src/apps.rs`: app definitions (built-in catalog, `appDefinitions`),
-  their merge into the settings and the cross-source checks.
-- `src/broker/mod.rs`: the `Broker` trait, `Route`/`Auth`, and the core
-  side: the pre-flight, `tower-vm`, the deny check, the credential
-  reconcile, the bays' tokens and the access check. `src/broker/agent_vault.rs` is the
-  agent-vault backend (its VM, admin API and state files) and
-  `src/broker/fake.rs` the in-process test double.
-- `src/bay.rs`: `Bay` and its steps (its pre-flight, create or start,
-  image loading, placeholders, `run`).
-- `src/packages.rs`: package reconcile.
-- `src/files.rs`: `files` (plan with the safety checks, reconcile,
-  copy).
-- `src/mounts.rs`: `mounts` (source and target rules, overlap with
-  `files`, the creation record and status). Reuses `files.rs`'s path
-  and credentials helpers.
-- `src/sandbox/mod.rs`: the `Sandbox` trait, `VmSpec`, `Mount`, `Egress`,
-  `BoxState` and the VM names; `src/sandbox/msb.rs` is the msb backend
-  and `src/sandbox/fake.rs` the in-process test double (see
-  `sandbox-backends.md`).
-- `src/vm_record.rs`: the `bays/<name>/vm` and `tower-vm` records
-  (`VmRecord`).
-- `src/password.rs`, `src/keychain.rs`: password resolution, keychain.
-- `src/lock.rs`: the lock that keeps a second hangar waiting.
-- `src/state.rs`: the `stateDir` layout (`StateDir`, one method per file)
-  and `write_private` for owner-only files.
-- `src/process.rs`: child processes (strips `HANGAR_MASTER_PASSWORD`).
-- `src/http.rs`: HTTP through ureq: the admin API and the providers.
-- `src/secret.rs`: `Secret` (redacting `Debug`, no `Display`),
-  `random_hex` and `find_secret`, the scan `env` and `files`
-  share.
-- `src/json.rs`, `src/error.rs`: helpers.
-- `nix/bay/configuration.nix`: the bay as a NixOS system (pilot, the
-  daemons, the tool set).
+- `src/commands.rs`: what each command does.
+- `src/hangar.rs`: `Hangar`, the shared context (settings, data dir,
+  cache root, sandbox, proxies); picks the sandbox backend.
+- `src/config.rs`: lookup, merge, validation.
+- `src/apps.rs`: app definitions and their merge into a bay.
+- `src/proxy/mod.rs`: the traits, the registry, `access`;
+  `src/proxy/managed.rs` runs a managed proxy's VM; `src/proxy/ca.rs`
+  loads and checks CAs; one file per kind; `src/proxy/fake.rs` for tests.
+- `src/bay.rs`: a bay's steps.
+- `src/lifecycle.rs`: plans, outcomes and changes.
+- `src/status.rs`: what `ps` and `inspect` report, and `ps`'s events.
+- `src/output.rs`: renders results as text or `--json` and picks the exit
+  code ([cli.md](cli.md)).
+- `src/packages.rs`, `src/files.rs`, `src/mounts.rs`: packages, copies
+  and mounts.
+- `src/sandbox/mod.rs`: the `Sandbox` trait and `VmSpec`;
+  `src/sandbox/msb.rs` the msb backend, `src/sandbox/fake.rs` the test
+  double ([sandbox-backends.md](sandbox-backends.md)).
+- `src/vm_record.rs`, `src/state.rs`, `src/dirs.rs`, `src/lock.rs`,
+  `src/logger.rs`: records, the data dir layout, XDG paths, the lock and
+  the log.
+- `src/secret.rs`: `Secret` (redacting `Debug`, no `Display`) and the
+  secret scan `env` and copies share.
+- `src/keychain.rs`: the OS keychain (`security`, `secret-tool`);
+  `src/proxy/secrets.rs`: a proxy's tokens, from it or a command;
+  `src/prompt.rs`: asking for a token or a confirmation.
+- `src/http.rs`, `src/process.rs`, `src/json.rs`, `src/error.rs`: helpers.
 - `config/defaults.json`, `config/apps/*.json`: the only copy of the
-  defaults and the built-in apps, built into the binary (the Nix module
-  only sets what you configure).
-- `nix/image.nix`: the bay image, that system behind `/sbin/init`
-  (generic tools only).
-- `nix/module.nix`, `nix/darwin.nix`, `nix/nixos.nix`: Nix modules
-  (render `hangar.json`, autostart).
-- `nix/cli.nix` builds the binary, which `nix/module.nix` wraps with the
-  rendered config; `nix/microsandbox.nix` packages msb.
-- `tests/cli.rs`: integration tests; `nix/tests/module.nix`: the module
-  check, which renders `hangar.json` and diffs it against
-  `tests/module.json`.
+  defaults and the built-in apps.
+- `nix/bay/configuration.nix`, `nix/image.nix`: the bay image.
+- `nix/module.nix`, `nix/nixos.nix`, `nix/darwin.nix`: the modules;
+  `nix/cli.nix` builds the binary, `nix/microsandbox.nix` packages msb.
+- `tests/cli.rs`: integration tests; `nix/tests/module.nix` renders the
+  module and diffs it against `tests/module.json`, which a unit test in
+  `src/config.rs` also loads.

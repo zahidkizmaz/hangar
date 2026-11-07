@@ -1,22 +1,23 @@
 //! The shared context of a command: the resolved settings, the state
-//! directory, the package cache root and the sandbox and broker backends.
+//! directory, the package cache root and the sandbox backend.
 //! Each bay is built from it on demand ([`Hangar::bay`]).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::bay::Bay;
-use crate::broker::{AgentVault, Broker};
-use crate::config::{
-    self, BaySettings, Paths, Settings, env_var, valid_bay_name,
-};
+use crate::config::{self, BaySettings, Paths, Settings, env_var, valid_name};
 use crate::dirs::{self, Base};
-use crate::error::{Context, Error, Result};
+use crate::error::{Context, Error, Result, bail};
 use crate::files;
 use crate::json;
-use crate::overview;
-use crate::sandbox::{Msb, Sandbox, bay_vm};
+use crate::keychain::{Keychain, OsKeychain};
+use crate::lifecycle::Resource;
+use crate::mounts;
+use crate::proxy::{self, Proxy, Secrets, Spec};
+use crate::sandbox::{Egress, Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
 
 pub(crate) struct Hangar {
@@ -24,10 +25,14 @@ pub(crate) struct Hangar {
     pub(crate) state: StateDir,
     /// `$XDG_CACHE_HOME/hangar`: every bay's package cache is under it.
     pub(crate) cache_root: PathBuf,
+    /// `$XDG_STATE_HOME/hangar`: the log and the lock.
+    pub(crate) state_root: PathBuf,
     /// The user's `$HOME`, which the mount rules protect.
     pub(crate) host_home: PathBuf,
     pub(crate) sandbox: Rc<dyn Sandbox>,
-    pub(crate) broker: Box<dyn Broker>,
+    /// Where the proxies' tokens live.
+    pub(crate) keychain: Rc<dyn Keychain>,
+    pub(crate) proxies: BTreeMap<String, Box<dyn Proxy>>,
 }
 
 impl Hangar {
@@ -44,34 +49,39 @@ impl Hangar {
         let settings =
             config::resolve(config::defaults()?, config).context(&invalid)?;
         let sandbox = sandbox(&settings.sandbox_backend).context(&invalid)?;
-        let state = StateDir::new(config::state_dir(&settings, &env_var)?);
+        let state = StateDir::new(dirs::hangar_dir(Base::Data, &env_var)?);
+        // The mount rules resolve it, so it must exist before any `up`.
+        mounts::create(state.root()).context(state.root().display())?;
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
         let host_home = files::host_home()?;
-        let broker = broker(&settings, sandbox.clone(), state.root())
+        let service = env_var("HANGAR_KEYCHAIN_SERVICE");
+        let keychain: Rc<dyn Keychain> = Rc::new(OsKeychain::new(service)?);
+        let proxies = build_proxies(&settings, &state, &host_home, &keychain)
             .context(&invalid)?;
-        for route in settings.routes.values() {
-            broker.validate(route).context(&invalid)?;
-        }
-        for (scoped, whole) in config::uncovered_path_scopes(&settings) {
-            log::warn!(
-                "route {scoped} is scoped to a path, but route {whole} lets \
-                 bays reach its whole host"
-            );
-        }
-        for key in config::unused_credential_files(&settings) {
-            log::warn!("credentialFiles {key} is used by no route");
-        }
-        overview::check_ports(&overview::published(broker.as_ref(), &settings))
-            .context(&invalid)?;
+        check_ports(&settings, &proxies).context(&invalid)?;
         Ok(Self {
             settings,
             state,
             cache_root,
+            state_root: dirs::hangar_dir(Base::State, &env_var)?,
             host_home,
             sandbox,
-            broker,
+            keychain,
+            proxies,
         })
+    }
+
+    /// The tokens of proxy `name`, as its config says to find them.
+    pub(crate) fn secrets(&self, name: &str) -> Result<Secrets> {
+        let entry = self
+            .settings
+            .proxies
+            .get(name)
+            .ok_or_else(|| Error::new(format!("no proxy {name}")))?;
+        let fields =
+            config::Fields::new(&entry.raw, &format!("proxies.{name}"))?;
+        Secrets::new(name, self.keychain.clone(), &fields)
     }
 
     pub(crate) fn bay(&self, name: &str) -> Option<Bay<'_>> {
@@ -90,6 +100,16 @@ impl Hangar {
             .collect()
     }
 
+    /// The bay's proxy and its config name; none for a direct bay.
+    pub(crate) fn proxy_of(
+        &self,
+        bay: &BaySettings,
+    ) -> Option<(&str, &dyn Proxy)> {
+        let (name, proxy) =
+            self.proxies.get_key_value(bay.proxy.as_deref()?)?;
+        Some((name.as_str(), proxy.as_ref()))
+    }
+
     fn build<'a>(&'a self, settings: &'a BaySettings) -> Bay<'a> {
         let name = settings.name.as_str();
         let dir = self.state.bay(name);
@@ -102,35 +122,109 @@ impl Hangar {
         }
     }
 
-    /// Bays with a folder in `stateDir` but no config entry, by name. The
-    /// sandbox can't list VMs, so this is the only way to find them;
-    /// folders whose names aren't bay names aren't hangar's.
-    pub(crate) fn leftovers(&self) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(self.state.bays()) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| valid_bay_name(name) && self.bay(name).is_none())
-            .collect();
-        names.sort();
-        names
+    /// Bays and proxies with a folder in the data dir but no config entry.
+    /// The sandbox can't list VMs, so this is the only way to find them;
+    /// folders whose names aren't valid names aren't hangar's.
+    pub(crate) fn leftovers(&self) -> Vec<(Resource, String)> {
+        let bays = folders(&self.state.bays())
+            .into_iter()
+            .filter(|name| self.bay(name).is_none())
+            .map(|name| (Resource::Bay, name));
+        let proxies = folders(&self.state.proxies())
+            .into_iter()
+            .filter(|name| !self.proxies.contains_key(name))
+            .map(|name| (Resource::Proxy, name));
+        bays.chain(proxies).collect()
     }
 }
 
-/// Each bay's home is only safe to mount because `stateDir` and the cache
-/// root never overlap: the mount rules exempt a bay's own folder in one
-/// root and refuse everything else in both.
-fn check_disjoint(state: &Path, cache_root: &Path) -> Result<()> {
-    if state.starts_with(cache_root) || cache_root.starts_with(state) {
+/// The sorted names of the valid-named folders in `dir`.
+fn folders(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| valid_name(name))
+        .collect();
+    names.sort();
+    names
+}
+
+pub(crate) fn build_proxies(
+    settings: &Settings,
+    state: &StateDir,
+    home: &Path,
+    keychain: &Rc<dyn Keychain>,
+) -> Result<BTreeMap<String, Box<dyn Proxy>>> {
+    settings
+        .proxies
+        .values()
+        .map(|entry| {
+            let path = format!("proxies.{}", entry.name);
+            let fields = config::Fields::new(&entry.raw, &path)?;
+            let spec = Spec {
+                secrets: Secrets::new(&entry.name, keychain.clone(), &fields)?,
+                fields,
+                location: entry.location.clone(),
+                home,
+                data: state.proxy(&entry.name).data(),
+            };
+            Ok((entry.name.clone(), proxy::build(&spec)?))
+        })
+        .collect()
+}
+
+/// No two things take the same host port: proxies (where they listen or
+/// publish) and bays. Only external proxies may share one, e.g. two
+/// vaults on one Agent Vault server.
+pub(crate) fn check_ports(
+    settings: &Settings,
+    proxies: &BTreeMap<String, Box<dyn Proxy>>,
+) -> Result<()> {
+    let proxies = proxies.iter().flat_map(|(name, proxy)| {
+        let egress = match proxy.egress() {
+            Egress::HostPort(port) => Some(port),
+            Egress::Open | Egress::OpenAndHostPort(_) => None,
+        };
+        let published = proxy.managed().map(|managed| managed.vm().publish.0);
+        let shareable = published.is_none();
+        let mut ports: Vec<u16> = egress.into_iter().chain(published).collect();
+        ports.dedup();
+        ports
+            .into_iter()
+            .map(move |port| (port, format!("proxy {name}"), shareable))
+    });
+    let bays = settings.bays.iter().flat_map(|bay| {
+        bay.ports.iter().map(|port| {
+            (port.host, format!("{}/{}", bay.name, port.name), false)
+        })
+    });
+    let mut owners: BTreeMap<u16, (String, bool)> = BTreeMap::new();
+    for (port, owner, shareable) in proxies.chain(bays) {
+        match owners.get(&port) {
+            Some((_, true)) if shareable => {}
+            Some((first, _)) => bail!("port {port}: {first} and {owner}"),
+            None => {
+                owners.insert(port, (owner, shareable));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Each bay's home is only safe to mount because the data dir and the
+/// cache root never overlap: the mount rules exempt a bay's own folder in
+/// one root and refuse everything else in both.
+fn check_disjoint(data: &Path, cache_root: &Path) -> Result<()> {
+    if data.starts_with(cache_root) || cache_root.starts_with(data) {
         return Err(Error::with_hint(
             format!(
-                "stateDir {} overlaps the package cache {}",
-                state.display(),
+                "the data dir {} overlaps the package cache {}",
+                data.display(),
                 cache_root.display()
             ),
-            "set stateDir (or XDG_DATA_HOME / XDG_CACHE_HOME) apart",
+            "set XDG_DATA_HOME and XDG_CACHE_HOME apart",
         ));
     }
     Ok(())
@@ -140,32 +234,20 @@ fn sandbox(backend: &str) -> Result<Rc<dyn Sandbox>> {
     match backend {
         "msb" => Ok(Rc::new(Msb)),
         other => Err(Error::new(format!(
-            "config.sandbox.backend: unknown backend {other:?}; known: msb"
-        ))),
-    }
-}
-
-pub(crate) fn broker(
-    settings: &Settings,
-    sandbox: Rc<dyn Sandbox>,
-    state: &Path,
-) -> Result<Box<dyn Broker>> {
-    match settings.broker_backend.as_str() {
-        "agent-vault" => {
-            Ok(Box::new(AgentVault::new(&settings.tower, sandbox, state)?))
-        }
-        other => Err(Error::new(format!(
-            "config.tower.backend: unknown backend {other:?}; known: \
-             agent-vault"
+            "sandbox.backend: unknown backend {other:?}; known: msb"
         ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{broker, check_disjoint, sandbox};
+    use super::{build_proxies, check_disjoint, check_ports, sandbox};
+    use crate::lifecycle::Resource;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::settings;
+    use crate::state::StateDir;
+    use crate::testing::{hangar_with, no_keychain, scratch_dir, settings};
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
     use std::rc::Rc;
 
@@ -184,9 +266,8 @@ mod tests {
             check("/h/.cache/hangar/state", "/h/.cache/hangar").unwrap_err();
         assert_eq!(
             error,
-            "stateDir /h/.cache/hangar/state overlaps the package cache \
-             /h/.cache/hangar: set stateDir (or XDG_DATA_HOME / XDG_CACHE_HOME) \
-             apart"
+            "the data dir /h/.cache/hangar/state overlaps the package cache \
+             /h/.cache/hangar: set XDG_DATA_HOME and XDG_CACHE_HOME apart"
         );
         assert!(check("/h/data", "/h/data/cache").is_err());
         assert!(check("/h/same", "/h/same").is_err());
@@ -198,20 +279,147 @@ mod tests {
         let error = sandbox("docker").err().unwrap().to_string();
         assert_eq!(
             error,
-            r#"config.sandbox.backend: unknown backend "docker"; known: msb"#
+            r#"sandbox.backend: unknown backend "docker"; known: msb"#
         );
-        let state = Path::new("/nonexistent");
-        let load = |config: &str| {
-            broker(&settings(config), Rc::new(FakeSandbox::default()), state)
+    }
+
+    const MANAGED_AT_3100: &str = r#"{"proxies": {"p":
+        {"kind": "fake", "run": "managed", "managed": true, "port": 3100}},
+        "bays": [{"name": "work", "proxy": "p", "apps": ["paperclip"]}]}"#;
+
+    #[test]
+    fn published_ports_never_collide() {
+        let settings = settings(MANAGED_AT_3100);
+        let state = scratch_dir("hangar-ports");
+        let proxies = build_proxies(
+            &settings,
+            &crate::state::StateDir::new(state),
+            Path::new("/home/u"),
+            &no_keychain(),
+        )
+        .unwrap();
+        let error = check_ports(&settings, &proxies).unwrap_err();
+        assert_eq!(error.to_string(), "port 3100: proxy p and work/paperclip");
+
+        let moved =
+            MANAGED_AT_3100.replace(r#""port": 3100"#, r#""port": 3101"#);
+        let settings = crate::testing::settings(&moved);
+        let proxies = build_proxies(
+            &settings,
+            &crate::state::StateDir::new(scratch_dir("hangar-ports-ok")),
+            Path::new("/home/u"),
+            &no_keychain(),
+        )
+        .unwrap();
+        assert!(check_ports(&settings, &proxies).is_ok());
+    }
+
+    #[test]
+    fn an_external_proxys_port_is_taken_too() {
+        let config = |port: u16| {
+            format!(
+                r#"{{"proxies": {{"p": {{"kind": "fake", "url": "x",
+                "port": {port}}}, "q": {{"kind": "fake", "url": "y",
+                "port": 3200}}}}, "bays": [{{"name": "work", "proxy": "p",
+                "apps": ["paperclip"]}}]}}"#
+            )
         };
-        assert!(load("{}").is_ok());
-        let error = load(r#"{"tower": {"backend": "vault"}}"#)
-            .err()
-            .unwrap()
-            .to_string();
+        let error_at = |port: u16| {
+            let settings = settings(&config(port));
+            let state = StateDir::new(scratch_dir("hangar-external-port"));
+            let proxies = build_proxies(
+                &settings,
+                &state,
+                Path::new("/home/u"),
+                &no_keychain(),
+            )
+            .unwrap();
+            check_ports(&settings, &proxies)
+                .err()
+                .map(|e| e.to_string())
+        };
         assert_eq!(
-            error,
-            r#"config.tower.backend: unknown backend "vault"; known: agent-vault"#
+            error_at(3100).as_deref(),
+            Some("port 3100: proxy p and work/paperclip")
         );
+        assert_eq!(error_at(3200), None);
+        assert_eq!(error_at(3300), None);
+        let shared = settings(
+            r#"{"proxies": {"e": {"kind": "fake", "url": "x", "port": 3400},
+            "m": {"kind": "fake", "run": "managed", "managed": true,
+            "port": 3400}}, "bays": [{"name": "work", "proxy": "e"}]}"#,
+        );
+        let state = StateDir::new(scratch_dir("hangar-managed-port"));
+        let proxies = build_proxies(
+            &shared,
+            &state,
+            Path::new("/home/u"),
+            &no_keychain(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_ports(&shared, &proxies).unwrap_err().to_string(),
+            "port 3400: proxy e and proxy m"
+        );
+        let open = crate::proxy::fake::FakeProxy {
+            egress: crate::sandbox::Egress::Open,
+            ..crate::proxy::fake::FakeProxy::at(1)
+        };
+        let proxies = BTreeMap::from([("o".to_string(), Box::new(open) as _)]);
+        assert!(check_ports(&settings(MANAGED_AT_3100), &proxies).is_ok());
+    }
+
+    #[test]
+    fn leftovers_cover_bays_and_proxies() {
+        let state = scratch_dir("hangar-leftovers");
+        let hangar = hangar_with(
+            MANAGED_AT_3100,
+            &state,
+            Rc::new(FakeSandbox::default()),
+        );
+        for folder in ["bays/old", "bays/work", "proxies/gone", "proxies/p"] {
+            fs::create_dir_all(state.join(folder)).unwrap();
+        }
+        fs::create_dir_all(state.join("bays/Not_A_Name")).unwrap();
+        assert_eq!(
+            hangar.leftovers(),
+            [
+                (Resource::Bay, "old".to_string()),
+                (Resource::Proxy, "gone".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bay_finds_its_proxy_by_config_name() {
+        let state = scratch_dir("hangar-proxy-of");
+        let hangar = hangar_with(
+            MANAGED_AT_3100,
+            &state,
+            Rc::new(FakeSandbox::default()),
+        );
+        let (name, proxy) = hangar.proxy_of(&hangar.settings.bays[0]).unwrap();
+        assert_eq!((name, proxy.kind()), ("p", "fake"));
+        let direct = hangar_with(
+            crate::testing::DIRECT,
+            &state,
+            Rc::new(FakeSandbox::default()),
+        );
+        assert!(direct.proxy_of(&direct.settings.bays[0]).is_none());
+    }
+
+    #[test]
+    fn proxy_kind_options_are_checked_by_the_kind() {
+        let settings = settings(
+            r#"{"proxies": {"p":
+                {"kind": "fake", "run": "managed", "zzz": 1}},
+                "bays": [{"name": "work", "proxy": null}]}"#,
+        );
+        let state = StateDir::new(scratch_dir("hangar-kind-options"));
+        let home = Path::new("/home/u");
+        let error = build_proxies(&settings, &state, home, &no_keychain())
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "proxies.p.zzz: unknown setting");
     }
 }

@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::apps::{self, App};
-use crate::broker::{Auth, Route};
 use crate::dirs::{self, Base};
-use crate::error::{Context, Error, Result, bail};
+use crate::error::{Context, Result, bail};
 use crate::files;
-use crate::mounts::{self, MountSpec};
+use crate::mounts::{self, Mode, MountSpec};
+use crate::proxy::{self, Location};
 use crate::sandbox::PublishedPort;
 use crate::secret::{SECRET_PREFIXES, find_secret};
 use miniserde::json::Object;
@@ -18,15 +18,16 @@ use crate::json::{self, Json};
 const DEFAULTS: &str = include_str!("../config/defaults.json");
 
 pub(crate) const INITIAL_CONFIG: &str = r#"{
-  "bays": [{ "name": "default", "apps": [], "packages": [] }],
-  "tower": { "credentialFiles": {} }
+  "proxies": {},
+  "bays": [{ "name": "default", "proxy": null, "apps": [] }]
 }
 "#;
 
-const TOP_LEVEL: [&str; 5] =
-    ["bays", "tower", "appDefinitions", "sandbox", "stateDir"];
-const BAY_KEYS: [&str; 16] = [
+const TOP_LEVEL: [&str; 5] = ["proxies", "defaults", "bays", "apps", "sandbox"];
+const DEFAULTS_KEYS: [&str; 1] = ["proxy"];
+const BAY_KEYS: [&str; 13] = [
     "name",
+    "proxy",
     "apps",
     "ports",
     "image",
@@ -37,52 +38,8 @@ const BAY_KEYS: [&str; 16] = [
     "disk",
     "packages",
     "env",
-    "run",
-    "files",
     "mounts",
-    "home",
-    "cache",
 ];
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Source {
-    File(String),
-    App { app: String, value: String },
-}
-
-/// The credentials hangar owns: `credentialFiles`, plus the apps' fixed
-/// values that a route references. Everything else in the vault belongs
-/// to the user.
-pub(crate) fn managed_credentials(
-    settings: &Settings,
-) -> BTreeMap<String, Source> {
-    let used = route_credentials(settings);
-    let fixed = settings
-        .app_credentials
-        .iter()
-        .filter(|(key, _)| used.contains(*key))
-        .map(|(key, (app, value))| {
-            let source = Source::App {
-                app: app.clone(),
-                value: value.clone(),
-            };
-            (key.clone(), source)
-        });
-    settings
-        .credential_files
-        .iter()
-        .map(|(key, file)| (key.clone(), Source::File(file.clone())))
-        .chain(fixed)
-        .collect()
-}
-
-fn route_credentials(settings: &Settings) -> BTreeSet<String> {
-    settings
-        .routes
-        .values()
-        .flat_map(|route| route.auth.credentials())
-        .collect()
-}
 
 /// Reads a non-empty environment variable; tests pass their own lookup.
 pub(crate) type Var<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -94,21 +51,23 @@ pub(crate) fn env_var(name: &str) -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct Settings {
     pub(crate) sandbox_backend: String,
-    pub(crate) broker_backend: String,
-    /// The `tower` object; each backend reads its own key.
-    pub(crate) tower: Json,
+    pub(crate) proxies: BTreeMap<String, ProxySettings>,
     pub(crate) bays: Vec<BaySettings>,
-    pub(crate) credential_files: BTreeMap<String, String>,
-    /// The enabled apps' fixed credentials: key -> (app, value).
-    pub(crate) app_credentials: BTreeMap<String, (String, String)>,
-    pub(crate) routes: BTreeMap<String, Route>,
-    pub(crate) state_dir: Option<String>,
-    pub(crate) master_password_file: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProxySettings {
+    pub(crate) name: String,
+    pub(crate) location: Location,
+    /// The entry as written; the kind reads its own options from it.
+    pub(crate) raw: Json,
 }
 
 #[derive(Debug)]
 pub(crate) struct BaySettings {
     pub(crate) name: String,
+    /// `None`: the open internet.
+    pub(crate) proxy: Option<String>,
     pub(crate) apps: Vec<App>,
     pub(crate) ports: Vec<PublishedPort>,
     /// The config's `ports`: app port name -> host port.
@@ -121,13 +80,9 @@ pub(crate) struct BaySettings {
     pub(crate) disk: String,
     pub(crate) packages: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
+    /// The apps' run entries: app name -> command.
     pub(crate) run: BTreeMap<String, String>,
-    /// Config files copied into the VM on every `up`: VM path (`~`
-    /// expanded) -> host path.
-    pub(crate) files: BTreeMap<String, String>,
     pub(crate) mounts: BTreeMap<String, MountSpec>,
-    pub(crate) home: bool,
-    pub(crate) cache: bool,
 }
 
 impl BaySettings {
@@ -166,33 +121,23 @@ pub(crate) fn defaults() -> Result<Json> {
     json::parse(DEFAULTS).context("built-in defaults")
 }
 
-/// The config over the defaults: each bay over the defaults' `bay`, the
-/// tower's routes from every bay's apps plus the config's own.
+/// The config over the defaults: each bay over the defaults' `bay`.
 pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     let Json::Object(mut config) = config else {
         bail!("config must be a JSON object");
     };
-    Fields::new(&Json::Object(config.clone()), "config")?.only(&TOP_LEVEL)?;
+    Fields::new(&Json::Object(config.clone()), "")?.only(&TOP_LEVEL)?;
     let Json::Object(mut merged) = defaults else {
         bail!("built-in defaults must be a JSON object");
     };
     let bay_defaults = merged.remove("bay").context("defaults: no bay")?;
-    let catalog = apps::Catalog::new(config.remove("appDefinitions"))?;
+    let catalog = apps::Catalog::new(config.remove("apps"))?;
+    let proxies = proxy_settings(config.remove("proxies"))?;
+    let default_proxy = default_proxy(config.remove("defaults"), &proxies)?;
     let bays = config.remove("bays");
-    let user_routes = match config.get_mut("tower") {
-        Some(Json::Object(tower)) => tower.remove("routes"),
-        _ => None,
-    };
     let mut merged = Json::Object(merged);
     merge(&mut merged, Json::Object(config));
-    let top = Fields::new(&merged, "config")?;
-    let tower = top.object("tower")?;
-    tower.only(&[
-        "backend",
-        "agentVault",
-        "credentialFiles",
-        "masterPasswordFile",
-    ])?;
+    let top = Fields::new(&merged, "")?;
 
     let bays = bay_entries(bays)?
         .into_iter()
@@ -209,37 +154,116 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
             catalog.enabled(fields.map.get("apps"), &fields.at("apps"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let user_routes = routes(user_routes.as_ref(), "config.tower.routes")?;
-    let (routes, origins) = apps::merge_routes(&enabled, user_routes)?;
-    apps::check_routes(&routes, &origins)?;
 
+    top.object("sandbox")?.only(&["backend"])?;
     let mut settings = Settings {
         sandbox_backend: top.object("sandbox")?.string("backend")?,
-        broker_backend: tower.string("backend")?,
-        tower: Json::Object(tower.map.clone()),
+        proxies,
         bays: Vec::new(),
-        credential_files: tower.string_map("credentialFiles")?,
-        app_credentials: apps::fixed_credentials(&enabled)?,
-        routes,
-        state_dir: top.optional_string("stateDir")?,
-        master_password_file: tower.optional_string("masterPasswordFile")?,
     };
-    top.object("sandbox")?.only(&["backend"])?;
-    apps::check_placeholders(&enabled, &referenced_credentials(&settings))?;
-    if let Some((key, (app, _))) = settings
-        .app_credentials
-        .iter()
-        .find(|(key, _)| settings.credential_files.contains_key(*key))
-    {
-        bail!("config.tower.credentialFiles.{key}: app {app} sets it");
-    }
     for (bay, apps) in bays.iter().zip(&enabled) {
-        let mut bay = BaySettings::from_json(bay)?;
+        Fields::new(bay, &bay_path(bay))?.only(&BAY_KEYS)?;
+        let proxy =
+            bay_proxy(bay, default_proxy.as_deref(), &settings.proxies)?;
+        let mut bay = BaySettings::from_json(bay, proxy)?;
         apps::apply(&mut bay, apps)?;
-        check_packages(&bay, &settings.routes)?;
         settings.bays.push(bay);
     }
+    one_namespace(&settings)?;
     Ok(settings)
+}
+
+/// Each entry: its kind and location read, its options checked by the kind.
+fn proxy_settings(
+    proxies: Option<Json>,
+) -> Result<BTreeMap<String, ProxySettings>> {
+    let entries = match proxies {
+        None | Some(Json::Null) => Object::new(),
+        Some(Json::Object(entries)) => entries,
+        Some(_) => bail!("proxies: expected an object"),
+    };
+    let mut settings = BTreeMap::new();
+    for (name, raw) in entries {
+        let path = format!("proxies.{name}");
+        if !valid_name(&name) {
+            bail!("{path}: {}", NAME_RULE);
+        }
+        let fields = Fields::new(&raw, &path)?;
+        proxy::check_kind(&fields)?;
+        let location = proxy::location(&fields)?;
+        let entry = ProxySettings {
+            name: name.clone(),
+            location,
+            raw,
+        };
+        settings.insert(name, entry);
+    }
+    Ok(settings)
+}
+
+fn default_proxy(
+    defaults: Option<Json>,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<Option<String>> {
+    let Some(defaults) = defaults else {
+        return Ok(None);
+    };
+    let fields = Fields::new(&defaults, "defaults")?;
+    fields.only(&DEFAULTS_KEYS)?;
+    let name = fields.optional_string("proxy")?;
+    if let Some(name) = &name {
+        known_proxy(&fields.at("proxy"), name, proxies)?;
+    }
+    Ok(name)
+}
+
+fn known_proxy(
+    path: &str,
+    name: &str,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<()> {
+    if proxies.contains_key(name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = proxies.keys().map(String::as_str).collect();
+    let known = if known.is_empty() {
+        "none".to_string()
+    } else {
+        known.join(", ")
+    };
+    bail!("{path}: no proxy \"{name}\"; known: {known}")
+}
+
+/// The bay's `proxy`: a name, `null` for direct, or the default's.
+fn bay_proxy(
+    bay: &Json,
+    default: Option<&str>,
+    proxies: &BTreeMap<String, ProxySettings>,
+) -> Result<Option<String>> {
+    let bay = Fields::new(bay, &bay_path(bay))?;
+    let name = match bay.map.get("proxy") {
+        Some(Json::Null) => return Ok(None),
+        Some(Json::String(name)) => name.as_str(),
+        Some(_) => bail!("{}: expected a proxy name or null", bay.at("proxy")),
+        None => default.context(format!(
+            "{}: no proxy; set \"proxy\", defaults.proxy, or \
+             \"proxy\": null for direct internet",
+            bay.path()
+        ))?,
+    };
+    known_proxy(&bay.at("proxy"), name, proxies)?;
+    Ok(Some(name.to_string()))
+}
+
+fn one_namespace(settings: &Settings) -> Result<()> {
+    let shared = settings
+        .bays
+        .iter()
+        .find(|bay| settings.proxies.contains_key(&bay.name));
+    if let Some(bay) = shared {
+        bail!("name \"{}\" is used by a bay and a proxy", bay.name);
+    }
+    Ok(())
 }
 
 /// `bays` as given; none (absent, `null` or `[]`) is one bay, `default`.
@@ -247,23 +271,20 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
     let items = match bays {
         None | Some(Json::Null) => Vec::new(),
         Some(Json::Array(items)) => items.into_iter().collect(),
-        Some(_) => bail!("config.bays: expected a list"),
+        Some(_) => bail!("bays: expected a list"),
     };
     if items.is_empty() {
         return Ok(vec![json::object([("name", json::string("default"))])]);
     }
     let mut names = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
-        let entry = Fields::new(item, &format!("config.bays.{index}"))?;
+        let entry = Fields::new(item, &format!("bays.{index}"))?;
         let name = entry.string("name")?;
-        if !valid_bay_name(&name) {
-            bail!(
-                "config.bays.{index}.name: {name:?}: lowercase letters and \
-                 digits, joined by single -, at most 32 characters"
-            );
+        if !valid_name(&name) {
+            bail!("bays.{index}.name: {name:?}: {NAME_RULE}");
         }
         if !names.insert(name.clone()) {
-            bail!("config.bays: two bays named {name}");
+            bail!("bays: two bays named {name}");
         }
     }
     Ok(items)
@@ -272,139 +293,18 @@ fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
 fn bay_path(bay: &Json) -> String {
     match bay {
         Json::Object(bay) if let Some(Json::String(name)) = bay.get("name") => {
-            format!("config.bays.{name}")
+            format!("bays.{name}")
         }
-        _ => "config.bays".to_string(),
+        _ => "bays".to_string(),
     }
-}
-
-pub(crate) fn routes(
-    value: Option<&Json>,
-    path: &str,
-) -> Result<BTreeMap<String, Route>> {
-    let items = match value {
-        None | Some(Json::Null) => return Ok(BTreeMap::new()),
-        Some(Json::Array(items)) => items,
-        Some(_) => bail!("{path}: expected a list"),
-    };
-    let mut routes = BTreeMap::new();
-    for (index, item) in items.iter().enumerate() {
-        let entry = format!("{path}.{index}");
-        let name = Fields::new(item, &entry)?.string("name")?;
-        if !valid_name(&name) {
-            bail!("{entry}.name: names are lowercase, digits and -");
-        }
-        let route = parse_route(&format!("{path}.{name}"), &name, item)?;
-        if routes.insert(name.clone(), route).is_some() {
-            bail!("{path}: two routes named {name}");
-        }
-    }
-    Ok(routes)
-}
-
-/// Packages come from the nix caches, and flakes on GitHub (and registry
-/// names like `nixpkgs#…` or `flake:nixpkgs#…`, which resolve there)
-/// through GitHub's API.
-/// Without routes to those hosts, every install would fail halfway.
-fn check_packages(
-    bay: &BaySettings,
-    routes: &BTreeMap<String, Route>,
-) -> Result<()> {
-    let has_route =
-        |host: &str| routes.values().any(|route| route.host == host);
-    let via_github = |package: &String| {
-        let package = package.strip_prefix("flake:").unwrap_or(package);
-        package.starts_with("github:") || !package.contains(':')
-    };
-    let needed = [
-        (!bay.packages.is_empty(), "cache.nixos.org"),
-        (bay.packages.iter().any(via_github), "api.github.com"),
-    ];
-    if let Some((_, host)) =
-        needed.iter().find(|(need, host)| *need && !has_route(host))
-    {
-        return Err(Error::with_hint(
-            format!(
-                "bay {} has packages, but no route allows {host}",
-                bay.name
-            ),
-            "add \"nix\" and \"github\" (or \"github-token\") to its apps",
-        ));
-    }
-    Ok(())
-}
-
-/// `credentialFiles` entries no route uses: stored in the vault, never
-/// injected anywhere.
-pub(crate) fn unused_credential_files(settings: &Settings) -> Vec<String> {
-    let used = route_credentials(settings);
-    settings
-        .credential_files
-        .keys()
-        .filter(|key| !used.contains(*key))
-        .cloned()
-        .collect()
-}
-
-/// Path-scoped routes (`host/path`) that another route covers whole: the
-/// scope then keeps nothing out. Pairs of (scoped, covering) names.
-pub(crate) fn uncovered_path_scopes(
-    settings: &Settings,
-) -> Vec<(String, String)> {
-    let routes = settings.routes.values();
-    let scoped = routes.clone().filter_map(|route| {
-        let (host, _) = route.host.split_once('/')?;
-        Some((route, host))
-    });
-    scoped
-        .flat_map(|(route, host)| {
-            routes
-                .clone()
-                .filter(move |whole| covers(&whole.host, host))
-                .map(|whole| (route.name.clone(), whole.name.clone()))
-        })
-        .collect()
-}
-
-/// Whether route host `whole` (no path) matches every request to `host`:
-/// the same name, or a `*.` wildcard one label up, on any port unless it
-/// names one.
-fn covers(whole: &str, host: &str) -> bool {
-    if whole.contains('/') {
-        return false;
-    }
-    let split = |host: &str| {
-        let (name, port) = host.split_once(':').unwrap_or((host, ""));
-        (name.to_ascii_lowercase(), port.to_string())
-    };
-    let ((whole_name, whole_port), (name, port)) = (split(whole), split(host));
-    if !whole_port.is_empty() && whole_port != port {
-        return false;
-    }
-    let one_label_below = |suffix: &str| {
-        name.strip_suffix(suffix)
-            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
-    };
-    whole_name == name
-        || whole_name.strip_prefix('*').is_some_and(one_label_below)
-}
-
-pub(crate) fn state_dir(settings: &Settings, var: Var) -> Result<PathBuf> {
-    if let Some(dir) = var("HANGAR_STATE_DIR") {
-        return Ok(dir.into());
-    }
-    if let Some(dir) = settings.state_dir.as_ref().filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    dirs::hangar_dir(Base::Data, var)
 }
 
 impl BaySettings {
-    fn from_json(value: &Json) -> Result<Self> {
+    fn from_json(value: &Json, proxy: Option<String>) -> Result<Self> {
         let bay = Fields::new(value, &bay_path(value))?;
-        bay.only(&BAY_KEYS)?;
         let settings = Self {
             name: bay.string("name")?,
+            proxy,
             apps: Vec::new(),
             ports: Vec::new(),
             host_ports: host_ports(&bay)?,
@@ -416,42 +316,15 @@ impl BaySettings {
             disk: bay.string("disk")?,
             packages: bay.strings("packages")?,
             env: checked_vars(&bay, "env")?,
-            run: bay_run(&bay)?,
-            files: bay_files(&bay)?,
+            run: BTreeMap::new(),
             mounts: bay_mounts(&bay)?,
-            home: bay.boolean("home")?,
-            cache: bay.boolean("cache")?,
         };
-        mounts::check_targets(
-            &settings.mounts,
-            settings.home,
-            settings.files.keys(),
-        )?;
+        mounts::check_targets(&settings.mounts)?;
         Ok(settings)
     }
 }
 
-/// Every credential name the broker injects: what the routes' auth
-/// references, plus `credentialFiles`. Every bay gets a placeholder for
-/// each, so tools that read the variable find something to send.
-pub(crate) fn referenced_credentials(settings: &Settings) -> BTreeSet<String> {
-    let mut names = route_credentials(settings);
-    names.extend(settings.credential_files.keys().cloned());
-    names
-}
-
-pub(crate) fn route_json(route: &Route) -> Json {
-    let mut object = Object::new();
-    object.insert("name".into(), json::string(&route.name));
-    object.insert("host".into(), json::string(&route.host));
-    object.insert("auth".into(), route.auth.to_json());
-    if !route.extra.is_empty() {
-        object.insert("extra".into(), Json::Object(route.extra.clone()));
-    }
-    Json::Object(object)
-}
-
-/// agent-vault's credential key rule, `^[A-Z][A-Z0-9_]*$`.
+/// `^[A-Z][A-Z0-9_]*$`.
 pub(crate) fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
     chars.next().is_some_and(|first| first.is_ascii_uppercase())
@@ -461,7 +334,7 @@ pub(crate) fn valid_key(key: &str) -> bool {
 
 /// Real-looking secrets don't belong in `env`: the VM sees them. A
 /// placeholder is one short value, so this is stricter than the scan of
-/// `files`: any credential prefix counts, and so does a long token.
+/// copied files: any secret prefix counts, and so does a long token.
 fn looks_like_a_secret(value: &str) -> bool {
     SECRET_PREFIXES
         .iter()
@@ -512,19 +385,26 @@ pub(crate) fn checked_vars(
             bail!("{path}.{key}: expected UPPER_SNAKE_CASE");
         }
         if looks_like_a_secret(value) {
-            bail!(
-                "{path}.{key}: looks like a real secret; store it with \
-                 'hangar credential set {key}' instead"
-            );
+            bail!("{path}.{key}: looks like a real secret");
         }
     }
     Ok(vars)
 }
 
-/// A bay name: `[a-z0-9]+(-[a-z0-9]+)*`, at most 32 characters. It ends up
-/// in VM and file names and the vault agent `hangar-<name>`, whose rule
-/// (3–64 characters, no leading, trailing or doubled `-`) it always meets.
-pub(crate) fn valid_bay_name(name: &str) -> bool {
+/// `[a-z0-9-]+`: app names.
+pub(crate) fn valid_app_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+const NAME_RULE: &str = "lowercase letters and digits, joined by single -, \
+                         at most 32 characters";
+
+/// A bay or proxy name, one namespace: `[a-z0-9]+(-[a-z0-9]+)*`, at most
+/// 32 characters. It ends up in VM and file names.
+pub(crate) fn valid_name(name: &str) -> bool {
     name.len() <= 32
         && name.split('-').all(|part| {
             !part.is_empty()
@@ -532,13 +412,6 @@ pub(crate) fn valid_bay_name(name: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         })
-}
-
-pub(crate) fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn host_ports(bay: &Fields) -> Result<BTreeMap<String, u16>> {
@@ -553,26 +426,13 @@ fn host_ports(bay: &Fields) -> Result<BTreeMap<String, u16>> {
         .collect()
 }
 
-fn bay_run(bay: &Fields) -> Result<BTreeMap<String, String>> {
-    let run = bay.string_map("run")?;
-    if let Some(name) = run.keys().find(|name| !valid_name(name)) {
-        bail!(
-            "{}.{name}: names are lowercase, digits and -",
-            bay.at("run")
-        );
+fn mount_mode(entry: &Fields) -> Result<Mode> {
+    match entry.map.get("mode") {
+        Some(Json::String(mode)) if mode == "ro" => Ok(Mode::Ro),
+        Some(Json::String(mode)) if mode == "rw" => Ok(Mode::Rw),
+        Some(Json::String(mode)) if mode == "copy" => Ok(Mode::Copy),
+        _ => bail!("{}: expected ro, rw or copy", entry.at("mode")),
     }
-    Ok(run)
-}
-
-fn bay_files(bay: &Fields) -> Result<BTreeMap<String, String>> {
-    bay.string_map("files")?
-        .into_iter()
-        .map(|(vm, host)| {
-            let expanded = files::vm_path(&vm)
-                .context(format!("{}.{vm}", bay.at("files")))?;
-            Ok((expanded, host))
-        })
-        .collect()
 }
 
 fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
@@ -585,71 +445,15 @@ fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
         .keys()
         .map(|vm| {
             let entry = entries.object(vm)?;
-            entry.only(&["host", "writable"])?;
+            entry.only(&["host", "mode"])?;
             let expanded = files::vm_path(vm).context(entries.at(vm))?;
             let spec = MountSpec {
                 host: entry.string("host")?,
-                writable: entry.flag_or("writable", false)?,
+                mode: mount_mode(&entry)?,
             };
             Ok((expanded, spec))
         })
         .collect()
-}
-
-/// `auth` keys are checked: a typo there would silently change what
-/// gets injected.
-fn parse_route(path: &str, name: &str, value: &Json) -> Result<Route> {
-    let fields = Fields::new(value, path)?;
-    fields.only(&["name", "host", "auth", "extra"])?;
-    let extra = match fields.map.get("extra") {
-        None | Some(Json::Null) => Object::new(),
-        Some(_) => fields.object("extra")?.map.clone(),
-    };
-    Ok(Route {
-        name: name.to_string(),
-        host: fields.string("host")?,
-        auth: parse_auth(&fields.object("auth")?)?,
-        extra,
-    })
-}
-
-fn parse_auth(auth: &Fields) -> Result<Auth> {
-    let kind = auth.string("type")?;
-    let only = |keys: &[&str]| auth.only(&[&["type"], keys].concat());
-    Ok(match kind.as_str() {
-        "bearer" => {
-            only(&["token"])?;
-            Auth::Bearer {
-                token: auth.string("token")?,
-            }
-        }
-        "basic" => {
-            only(&["username", "password"])?;
-            Auth::Basic {
-                username: auth.string("username")?,
-                password: auth.optional_string("password")?,
-            }
-        }
-        "api-key" => {
-            only(&["key", "header", "prefix"])?;
-            Auth::ApiKey {
-                key: auth.string("key")?,
-                header: auth.optional_string("header")?,
-                prefix: auth.optional_string("prefix")?,
-            }
-        }
-        "custom" => {
-            only(&["headers"])?;
-            Auth::Custom {
-                headers: auth.string_map("headers")?,
-            }
-        }
-        "passthrough" => {
-            only(&[])?;
-            Auth::Passthrough
-        }
-        _ => bail!("{}: unknown auth type {kind:?}", auth.at("type")),
-    })
 }
 
 /// One JSON object being read into a struct; errors name the key's path
@@ -673,6 +477,10 @@ impl<'a> Fields<'a> {
         })
     }
 
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
     pub(crate) fn at(&self, key: &str) -> String {
         if self.path.is_empty() {
             key.to_string()
@@ -690,14 +498,6 @@ impl<'a> Fields<'a> {
     pub(crate) fn string(&self, key: &str) -> Result<String> {
         self.optional_string(key)?
             .context(format!("{}: expected a string", self.at(key)))
-    }
-
-    /// Strict: `null` is refused, never read as absent.
-    fn boolean(&self, key: &str) -> Result<bool> {
-        match self.map.get(key) {
-            Some(Json::Bool(value)) => Ok(*value),
-            _ => bail!("{}: expected true or false", self.at(key)),
-        }
     }
 
     pub(crate) fn optional_string(&self, key: &str) -> Result<Option<String>> {
@@ -777,16 +577,25 @@ mod tests {
     use super::*;
 
     use crate::testing::{
-        config_error as error, one_bay, resolved as resolve_text,
-        settings as resolve_with, vars,
+        DIRECT, config_error as error, one_bay, settings as resolve_with, vars,
     };
+
+    const FAKE: &str = r#"{"kind": "fake", "run": "managed"}"#;
+
+    /// `bays` (a JSON fragment) with a proxy `p` and `defaults.proxy`.
+    fn with_default_proxy(bays: &str) -> String {
+        format!(
+            r#"{{"proxies": {{"p": {FAKE}}}, "defaults": {{"proxy": "p"}},
+                 {bays}}}"#
+        )
+    }
 
     fn names(settings: &Settings) -> Vec<&str> {
         settings.bays.iter().map(|bay| bay.name.as_str()).collect()
     }
 
     #[test]
-    fn keys_follow_agent_vaults_rule() {
+    fn keys_follow_the_env_key_rule() {
         for key in ["A", "GITHUB_TOKEN", "K8S_", "X_1"] {
             assert!(valid_key(key), "{key}");
         }
@@ -796,23 +605,42 @@ mod tests {
     }
 
     #[test]
-    fn no_bays_is_one_bay_named_default_and_no_routes() {
-        for config in ["{}", r#"{"bays": null}"#, r#"{"bays": []}"#] {
-            let settings = resolve_with(config);
+    fn module_fixture_is_a_valid_config() {
+        let settings = resolve_with(include_str!("../tests/module.json"));
+        let proxies: Vec<&str> =
+            settings.proxies.keys().map(String::as_str).collect();
+        assert_eq!(proxies, ["vault"]);
+        assert!(matches!(
+            settings.proxies["vault"].location,
+            Location::Managed
+        ));
+        let [default, oss] = &settings.bays[..] else {
+            panic!("two bays expected");
+        };
+        assert_eq!(default.proxy.as_deref(), Some("vault"));
+        assert_eq!(oss.proxy, None);
+        assert_eq!(oss.image_repository, "ghcr.io/example/hangar-bay");
+        let modes: Vec<Mode> =
+            default.mounts.values().map(|mount| mount.mode).collect();
+        assert_eq!(modes, [Mode::Copy, Mode::Ro, Mode::Rw]);
+        assert_eq!(default.ports[0].host, 3200);
+    }
+
+    #[test]
+    fn no_bays_is_one_bay_named_default() {
+        for bays in [r#""apps": {}"#, r#""bays": null"#, r#""bays": []"#] {
+            let settings = resolve_with(&with_default_proxy(bays));
             assert_eq!(names(&settings), ["default"]);
             assert_eq!(settings.bays[0].cpus, 4);
-            assert!(settings.routes.is_empty(), "hangar ships no routes");
         }
-        let settings = resolve_with("{}");
-        assert_eq!(settings.broker_backend, "agent-vault");
     }
 
     #[test]
     fn bays_keep_their_order_and_each_gets_the_defaults() {
-        let settings = resolve_with(
-            r#"{"bays": [{"name": "work", "cpus": 8}, {"name": "oss"},
-                         {"name": "a-1"}]}"#,
-        );
+        let settings = resolve_with(&with_default_proxy(
+            r#""bays": [{"name": "work", "cpus": 8}, {"name": "oss"},
+                        {"name": "a-1"}]"#,
+        ));
         assert_eq!(names(&settings), ["work", "oss", "a-1"]);
         assert_eq!(settings.bays[0].cpus, 8);
         assert_eq!(settings.bays[0].memory, "6G");
@@ -823,18 +651,18 @@ mod tests {
     fn bay_names_are_required_unique_and_well_formed() {
         assert_eq!(
             error(r#"{"bays": [{"cpus": 2}]}"#),
-            "config.bays.0.name: expected a string"
+            "bays.0.name: expected a string"
         );
         assert_eq!(
             error(r#"{"bays": [{"name": "a"}, {"name": "a"}]}"#),
-            "config.bays: two bays named a"
+            "bays: two bays named a"
         );
-        assert_eq!(error(r#"{"bays": {}}"#), "config.bays: expected a list");
+        assert_eq!(error(r#"{"bays": {}}"#), "bays: expected a list");
         for good in ["a", "a-b-1", &"a".repeat(32)] {
-            assert!(valid_bay_name(good), "{good}");
+            assert!(valid_name(good), "{good}");
         }
         for bad in ["", "A", "x-", "-x", "a--b", "a_b", &"a".repeat(33)] {
-            assert!(!valid_bay_name(bad), "{bad}");
+            assert!(!valid_name(bad), "{bad}");
             let config = format!(r#"{{"bays": [{{"name": "{bad}"}}]}}"#);
             assert!(error(&config).contains("lowercase letters and digits"));
         }
@@ -842,100 +670,25 @@ mod tests {
 
     #[test]
     fn misplaced_keys_are_refused() {
-        for key in ["bay", "credentialFiles"] {
+        for key in ["bay", "credentialFiles", "tower"] {
             let config = format!(r#"{{"{key}": {{}}}}"#);
-            assert_eq!(
-                error(&config),
-                format!("config.{key}: unknown setting")
-            );
+            assert_eq!(error(&config), format!("{key}: unknown setting"));
         }
-        assert_eq!(
-            error(r#"{"tower": {"apps": []}}"#),
-            "config.tower.apps: unknown setting"
-        );
-    }
-
-    #[test]
-    fn the_tower_holds_routes_backend_and_credentials() {
-        let settings = resolve_with(
-            r#"{"tower": {
-              "agentVault": {"adminPort": 15000},
-              "credentialFiles": {"JIRA": "/run/j"},
-              "masterPasswordFile": "/run/pw",
-              "routes": [{"name": "twilio", "host": "api.twilio.com",
-                          "auth": {"type": "basic", "username": "SID"},
-                          "extra": {"substitutions": []}}]}}"#,
-        );
-        let twilio = &settings.routes["twilio"];
-        assert_eq!(twilio.name, "twilio");
-        assert_eq!(
-            json::stringify(&route_json(twilio)),
-            r#"{"auth":{"type":"basic","username":"SID"},"extra":{"substitutions":[]},"host":"api.twilio.com","name":"twilio"}"#
-        );
-        assert_eq!(settings.credential_files["JIRA"], "/run/j");
-        assert_eq!(settings.master_password_file.as_deref(), Some("/run/pw"));
-        let route = |route: &str| {
-            error(&format!(r#"{{"tower": {{"routes": [{route}]}}}}"#))
-        };
-        assert_eq!(
-            route(r#"{"host": "h", "auth": {"type": "passthrough"}}"#),
-            "config.tower.routes.0.name: expected a string"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h", "auth": {"type": "passthrough"}},
-                   {"name": "x", "host": "i", "auth": {"type": "passthrough"}}"#
-            ),
-            "config.tower.routes: two routes named x"
-        );
-        assert!(
-            route(r#"{"name": "x", "host": "h", "auth": {"type": "oops"}}"#)
-                .contains("unknown auth")
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "api-key", "key": "K", "prefx": "T"}}"#
-            ),
-            "config.tower.routes.x.auth.prefx: unknown setting"
-        );
-        assert_eq!(
-            route(r#"{"name": "x", "host": "h", "auth": {"type": "bearer"}}"#),
-            "config.tower.routes.x.auth.token: expected a string"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "passthrough"}, "substitutions": []}"#
-            ),
-            "config.tower.routes.x.substitutions: unknown setting"
-        );
-        assert_eq!(
-            route(
-                r#"{"name": "x", "host": "h",
-                      "auth": {"type": "passthrough"}, "extra": []}"#
-            ),
-            "config.tower.routes.x.extra: expected an object"
-        );
-        assert_eq!(
-            error(r#"{"tower": {"routes": {}}}"#),
-            "config.tower.routes: expected a list"
-        );
     }
 
     #[test]
     fn bad_bay_values_name_the_bay() {
         assert_eq!(
             error(&one_bay(r#""packages": ["a", 1]"#, "")),
-            "config.bays.default.packages: expected strings"
+            "bays.default.packages: expected strings"
         );
         assert_eq!(
             error(&one_bay(r#""cpus": 8.5"#, "")),
-            "config.bays.default.cpus: expected a whole number"
+            "bays.default.cpus: expected a whole number"
         );
         assert_eq!(
             error(&one_bay(r#""cpu": 8"#, "")),
-            "config.bays.default.cpu: unknown setting"
+            "bays.default.cpu: unknown setting"
         );
     }
 
@@ -967,82 +720,28 @@ mod tests {
     }
 
     #[test]
-    fn home_and_cache_are_on_or_off_never_a_path() {
-        let bay = |config: &str| resolve_with(config).bays.remove(0);
-        let unset = bay("{}");
-        assert_eq!((unset.home, unset.cache), (true, true));
-        let off = bay(&one_bay(r#""home": false, "cache": false"#, ""));
-        assert_eq!((off.home, off.cache), (false, false));
-        for value in ["null", r#""~/h""#, "1"] {
-            let message = error(&one_bay(&format!(r#""cache": {value}"#), ""));
-            assert_eq!(
-                message,
-                "config.bays.default.cache: expected true or false"
-            );
-        }
-        let mount = one_bay(
-            r#""mounts": {"~/data": {"host": "~/d", "writable": null}}"#,
-            "",
-        );
-        assert!(!bay(&mount).mounts["/home/pilot/data"].writable);
-    }
-
-    #[test]
-    fn state_dir_order() {
-        let settings = resolve_with(r#"{"stateDir": "/from/config"}"#);
-        let env = vars(&[("HOME", "/h"), ("HANGAR_STATE_DIR", "/from/env")]);
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/from/env")
-        );
-        let env = vars(&[("HOME", "/h")]);
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/from/config")
-        );
-        let settings = resolve_with("{}");
-        assert_eq!(
-            state_dir(&settings, &env).unwrap(),
-            PathBuf::from("/h/.local/share/hangar")
-        );
-    }
-
-    #[test]
-    fn module_fixture_is_a_valid_config() {
-        let settings = resolve_with(include_str!("../tests/module.json"));
-        let bay = &settings.bays[0];
-        assert_eq!(
-            bay.packages,
-            [
-                "github:numtide/llm-agents.nix#claude-code",
-                "github:numtide/llm-agents.nix#codex"
-            ]
-        );
-        assert_eq!(bay.ports[0].name, "web");
-        let mount = &bay.mounts["/home/pilot/.app-data"];
-        assert_eq!(
-            (mount.host.as_str(), mount.writable),
-            ("~/work/app-data", true)
-        );
-    }
-
-    #[test]
     fn mounts_are_validated_when_the_config_loads() {
         for (mounts, why) in [
             (
-                r#"{"~/a": {"host": "~/a", "rw": true}}"#,
+                r#"{"~/a": {"host": "~/a", "mode": "ro", "rw": true}}"#,
                 "rw: unknown setting",
             ),
-            (r#"{"~/a": {"writable": true}}"#, "host: expected a string"),
+            (r#"{"~/a": {"mode": "rw"}}"#, "host: expected a string"),
             (
-                r#"{"~/a": {"host": "~/a", "writable": "yes"}}"#,
-                "expected true or false",
+                r#"{"/run/hangar/x": {"host": "~/a", "mode": "ro"}}"#,
+                "must be in ~",
             ),
-            (r#"{"/run/hangar/x": {"host": "~/a"}}"#, "must be in ~"),
-            (r#"{"/etc/profile.d": {"host": "~/a"}}"#, "must be in ~"),
-            (r#"{"~/../etc": {"host": "~/a"}}"#, "'..' isn't allowed"),
             (
-                r#"{"~/a": {"host": "~/a"}, "~/a/b": {"host": "~/b"}}"#,
+                r#"{"/etc/profile.d": {"host": "~/a", "mode": "ro"}}"#,
+                "must be in ~",
+            ),
+            (
+                r#"{"~/../etc": {"host": "~/a", "mode": "ro"}}"#,
+                "'..' isn't allowed",
+            ),
+            (
+                r#"{"~/a": {"host": "~/a", "mode": "ro"},
+                    "~/a/b": {"host": "~/b", "mode": "ro"}}"#,
                 "overlap",
             ),
         ] {
@@ -1057,7 +756,7 @@ mod tests {
         let image = |config: &str| resolve_with(config).bays[0].image_ref();
         let version = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            image("{}"),
+            image(DIRECT),
             format!("ghcr.io/zahidkizmaz/hangar-bay:v{version}")
         );
         assert_eq!(
@@ -1077,174 +776,11 @@ mod tests {
             panic!("not an object")
         };
         let keys: Vec<&String> = top.keys().collect();
-        assert_eq!(keys, ["bays", "tower"]);
+        assert_eq!(keys, ["bays", "proxies"]);
         let settings = resolve_with(INITIAL_CONFIG);
-        assert!(settings.routes.is_empty());
         assert_eq!(names(&settings), ["default"]);
+        assert_eq!(settings.bays[0].proxy, None);
         assert_eq!(settings.bays[0].packages, Vec::<String>::new());
-        assert!(settings.master_password_file.is_none());
-    }
-
-    #[test]
-    fn an_apps_fixed_credential_is_managed_while_a_route_sends_it() {
-        let app = |route_user: &str| {
-            format!(
-                r#"{{"bays": [{{"name": "default", "apps": ["git"]}}],
-                    "appDefinitions": {{"git": {{
-                      "credentials": {{"GIT_USER": "x-user"}},
-                      "routes": [{{"name": "git", "host": "git.example",
-                        "auth": {{"type": "basic", "username": "{route_user}",
-                                  "password": "GIT_TOKEN"}}}}]}}}},
-                    "tower": {{"credentialFiles": {{"GIT_TOKEN": "/run/t"}}}}}}"#
-            )
-        };
-        assert_eq!(
-            managed_credentials(&resolve_with(&app("GIT_USER"))),
-            BTreeMap::from([
-                (
-                    "GIT_USER".into(),
-                    Source::App {
-                        app: "git".into(),
-                        value: "x-user".into()
-                    }
-                ),
-                ("GIT_TOKEN".into(), Source::File("/run/t".into())),
-            ])
-        );
-        let unused = resolve_with(&app("OTHER_USER"));
-        assert_eq!(managed_credentials(&unused).len(), 1);
-        let clash = app("GIT_USER")
-            .replace(r#""GIT_TOKEN": "/run"#, r#""GIT_USER": "/run"#);
-        assert_eq!(
-            error(&clash),
-            "config.tower.credentialFiles.GIT_USER: app git sets it"
-        );
-        // A token file alone adds no routes.
-        let plain = resolve_with(
-            r#"{"tower": {"credentialFiles": {"GITHUB_TOKEN": "/run/gh"}}}"#,
-        );
-        assert!(plain.routes.is_empty());
-        assert_eq!(unused_credential_files(&plain), ["GITHUB_TOKEN"]);
-        assert_eq!(
-            unused_credential_files(&resolve_with(&app("GIT_USER"))),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn a_path_scope_another_route_covers_whole_is_found() {
-        let routes = |hosts: &[&str]| {
-            let routes: Vec<String> = hosts
-                .iter()
-                .enumerate()
-                .map(|(index, host)| {
-                    format!(
-                        r#"{{"name": "r{index}", "host": "{host}",
-                             "auth": {{"type": "passthrough"}}}}"#
-                    )
-                })
-                .collect();
-            let config =
-                format!(r#"{{"tower": {{"routes": [{}]}}}}"#, routes.join(","));
-            uncovered_path_scopes(&resolve_with(&config))
-        };
-        let pair = |scoped: &str, whole: &str| (scoped.into(), whole.into());
-        assert_eq!(
-            routes(&["mcp.example.com/v1/mcp", "mcp.example.com"]),
-            [pair("r0", "r1")]
-        );
-        assert_eq!(
-            routes(&[
-                "mcp.example.com/v1/*",
-                "*.example.com",
-                "x.mcp.example.com"
-            ]),
-            [pair("r0", "r1")]
-        );
-        assert_eq!(
-            routes(&["MCP.example.com:8443/v1", "mcp.example.com:8443"]),
-            [pair("r0", "r1")]
-        );
-        for alone in [
-            &["mcp.example.com/v1/mcp", "mcp.example.com/v2/*"][..],
-            &["mcp.example.com/v1", "mcp.example.com:8443"],
-            &["mcp.example.com/v1", "*.mcp.example.com"],
-            &["a.mcp.example.com/v1", "*.example.com"],
-            &["mcp.example.com/v1", "example.com"],
-        ] {
-            assert_eq!(routes(alone), Vec::new(), "{alone:?}");
-        }
-    }
-
-    #[test]
-    fn placeholders_cover_every_injected_credential() {
-        let settings = resolve_with(
-            r#"{"bays": [{"name": "default", "apps": ["github-token"]}],
-                "tower": {"credentialFiles": {"GITHUB_TOKEN": "/run/gh"},
-                "routes": [
-                  {"name": "jira", "host": "x.atlassian.net",
-                   "auth": {"type": "custom",
-                            "headers": {"Authorization": "Basic {{ JIRA }}"}}},
-                  {"name": "keyed", "host": "api.example.com",
-                   "auth": {"type": "api-key", "key": "X_KEY"}}]}}"#,
-        );
-        let names: Vec<String> =
-            referenced_credentials(&settings).into_iter().collect();
-        assert_eq!(names, ["GITHUB_GIT_USER", "GITHUB_TOKEN", "JIRA", "X_KEY"]);
-    }
-
-    #[test]
-    fn packages_need_routes_to_the_nix_and_github_hosts() {
-        let route = |name: &str, host: &str| {
-            format!(
-                r#"{{"name": "{name}", "host": "{host}",
-                     "auth": {{"type": "passthrough"}}}}"#
-            )
-        };
-        let with = |packages: &str, routes: &[String]| {
-            resolve_text(&format!(
-                r#"{{"bays": [{{"name": "work", "packages": [{packages}]}}],
-                    "tower": {{"routes": [{}]}}}}"#,
-                routes.join(", ")
-            ))
-        };
-        let nix = route("n", "cache.nixos.org");
-        let github = route("g", "api.github.com");
-        let error = with(r#""path:/p""#, &[]).unwrap_err();
-        assert_eq!(
-            error.message(),
-            "bay work has packages, but no route allows cache.nixos.org"
-        );
-        assert_eq!(
-            error.hint(),
-            Some(r#"add "nix" and "github" (or "github-token") to its apps"#)
-        );
-        assert!(
-            with(
-                r#""path:/p", "https://x/y.tar.gz""#,
-                std::slice::from_ref(&nix)
-            )
-            .is_ok()
-        );
-        for package in [
-            r#""github:o/r#x""#,
-            r#""nixpkgs#rtk""#,
-            r#""flake:nixpkgs#rtk""#,
-        ] {
-            let error = with(package, std::slice::from_ref(&nix)).unwrap_err();
-            assert_eq!(
-                error.message(),
-                "bay work has packages, but no route allows api.github.com"
-            );
-            assert!(with(package, &[nix.clone(), github.clone()]).is_ok());
-        }
-        // An exact host, not a wildcard that happens to cover it.
-        let wild = route("w", "*.nixos.org");
-        assert!(with(r#""path:/p""#, &[wild]).is_err());
-        // Routes are shared: one bay's apps serve another's packages.
-        let two = r#"{"bays": [{"name": "a", "apps": ["nix", "github"]},
-                               {"name": "b", "packages": ["nixpkgs#rtk"]}]}"#;
-        assert!(resolve_text(two).is_ok());
     }
 
     #[test]
@@ -1255,18 +791,139 @@ mod tests {
             let message =
                 error(&one_bay(&format!(r#""env": {{"T": "{secret}"}}"#), ""));
             assert!(message.contains("looks like a real secret"), "{message}");
-            assert!(message.contains("hangar credential set T"), "{message}");
         }
-        let ok = resolve_with(&one_bay(
-            r#""env": {"T": "placeholder value"}, "run": {"paper-clip2": "x"}"#,
-            "",
-        ));
+        let ok =
+            resolve_with(&one_bay(r#""env": {"T": "placeholder value"}"#, ""));
         assert_eq!(ok.bays[0].env["T"], "placeholder value");
-        assert_eq!(ok.bays[0].run["paper-clip2"], "x");
-        let name = error(&one_bay(r#""run": {"Bad Name": "x"}"#, ""));
+    }
+
+    #[test]
+    fn bay_proxy_absent_uses_the_default() {
+        let config = with_default_proxy(r#""bays": [{"name": "work"}]"#);
+        let settings = resolve_with(&config);
+        assert_eq!(settings.bays[0].proxy.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn bay_proxy_null_means_direct() {
+        let config =
+            with_default_proxy(r#""bays": [{"name": "work", "proxy": null}]"#);
+        assert_eq!(resolve_with(&config).bays[0].proxy, None);
+    }
+
+    #[test]
+    fn bay_without_any_proxy_choice_is_an_error() {
         assert_eq!(
-            name,
-            "config.bays.default.run.Bad Name: names are lowercase, digits and -"
+            error(r#"{"bays": [{"name": "work"}]}"#),
+            "bays.work: no proxy; set \"proxy\", defaults.proxy, or \
+             \"proxy\": null for direct internet"
         );
+    }
+
+    #[test]
+    fn unknown_proxy_name_is_an_error() {
+        let config = r#"{"proxies": {"infi": {"kind": "fake", "run": "managed"}},
+            "bays": [{"name": "work", "proxy": "nope"}]}"#;
+        assert_eq!(
+            error(config),
+            "bays.work.proxy: no proxy \"nope\"; known: infi"
+        );
+        let config = r#"{"defaults": {"proxy": "nope"}}"#;
+        assert_eq!(
+            error(config),
+            "defaults.proxy: no proxy \"nope\"; known: none"
+        );
+        assert_eq!(
+            error(&one_bay(r#""proxy": 3"#, "")),
+            "bays.default.proxy: expected a proxy name or null"
+        );
+    }
+
+    #[test]
+    fn names_are_one_namespace() {
+        let config = format!(
+            r#"{{"proxies": {{"work": {FAKE}}},
+                 "bays": [{{"name": "work", "proxy": null}}]}}"#
+        );
+        assert_eq!(
+            error(&config),
+            "name \"work\" is used by a bay and a proxy"
+        );
+    }
+
+    #[test]
+    fn proxy_names_follow_the_bay_name_rule() {
+        let config = format!(r#"{{"proxies": {{"Bad": {FAKE}}}}}"#);
+        assert!(error(&config).starts_with("proxies.Bad: lowercase"));
+        assert_eq!(error(r#"{"proxies": []}"#), "proxies: expected an object");
+    }
+
+    #[test]
+    fn mount_mode_must_be_ro_rw_or_copy() {
+        let mount = |entry: &str| {
+            one_bay(&format!(r#""mounts": {{"~/code": {entry}}}"#), "")
+        };
+        let expected =
+            "bays.default.mounts.~/code.mode: expected ro, rw or copy";
+        for entry in [
+            r#"{"host": "~/c", "mode": "writable"}"#,
+            r#"{"host": "~/c"}"#,
+            r#"{"host": "~/c", "mode": 1}"#,
+        ] {
+            assert_eq!(error(&mount(entry)), expected, "{entry}");
+        }
+        for (mode, want) in
+            [("ro", Mode::Ro), ("rw", Mode::Rw), ("copy", Mode::Copy)]
+        {
+            let entry = format!(r#"{{"host": "~/c", "mode": "{mode}"}}"#);
+            let bay = resolve_with(&mount(&entry)).bays.remove(0);
+            assert_eq!(bay.mounts["/home/pilot/code"].mode, want);
+        }
+    }
+
+    #[test]
+    fn old_keys_are_unknown() {
+        for (key, config) in [
+            ("files", one_bay(r#""files": {}"#, "")),
+            ("tower", r#"{"tower": {}}"#.to_string()),
+            ("appDefinitions", r#"{"appDefinitions": {}}"#.to_string()),
+            ("stateDir", r#"{"stateDir": "/x"}"#.to_string()),
+            ("home", one_bay(r#""home": false"#, "")),
+            ("cache", one_bay(r#""cache": false"#, "")),
+            ("run", one_bay(r#""run": {}"#, "")),
+        ] {
+            let path = if config.contains("bays") {
+                format!("bays.default.{key}")
+            } else {
+                key.to_string()
+            };
+            assert_eq!(
+                error(&config),
+                format!("{path}: unknown setting"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unregistered_kind_is_an_error() {
+        let config =
+            r#"{"proxies": {"p": {"kind": "nope", "run": "managed"}}}"#;
+        assert!(
+            error(config)
+                .starts_with("proxies.p.kind: unknown kind \"nope\"; known: "),
+            "{}",
+            error(config)
+        );
+    }
+
+    #[test]
+    fn apps_key_replaces_app_definitions() {
+        let config = one_bay(
+            r#""apps": ["paperclip"]"#,
+            r#""apps": {"paperclip": {"packages": ["x"]}}"#,
+        );
+        let bay = resolve_with(&config).bays.remove(0);
+        assert_eq!(bay.packages, ["x"]);
     }
 }

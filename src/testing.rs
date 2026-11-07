@@ -7,14 +7,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::{self, JoinHandle};
 
-use crate::broker::Broker;
-use crate::broker::fake::FakeBroker;
 use crate::config::{Settings, defaults, resolve};
 use crate::error::Result;
-use crate::hangar::Hangar;
+use crate::hangar::{Hangar, build_proxies};
 use crate::json;
 use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
+use crate::sandbox::fake::FakeSandbox;
 use crate::state::StateDir;
 
 /// An empty directory unique to this test process and `name`.
@@ -48,13 +47,23 @@ pub(crate) fn config_error(config: &str) -> String {
     resolved(config).unwrap_err().to_string()
 }
 
+/// One bay `default` on the open internet.
+pub(crate) const DIRECT: &str =
+    r#"{"bays": [{"name": "default", "proxy": null}]}"#;
+
 /// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
-/// `"apps": ["web"]`), plus top-level `rest`.
+/// `"apps": ["web"]`), plus top-level `rest`. The bay is direct unless
+/// `bay` sets its own `proxy`.
 pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
-    let bay = if bay.is_empty() {
-        String::new()
+    let proxy = if bay.contains(r#""proxy""#) {
+        ""
     } else {
-        format!(", {bay}")
+        r#", "proxy": null"#
+    };
+    let bay = if bay.is_empty() {
+        proxy.to_string()
+    } else {
+        format!("{proxy}, {bay}")
     };
     let rest = if rest.is_empty() {
         String::new()
@@ -98,21 +107,21 @@ pub(crate) fn vars(
 
 /// A `Hangar` on `config` (merged over the defaults), with its state in
 /// `state` (the package caches in `<state>-cache` and the user's home in
-/// `<state>-home`, next to it), `sandbox` in place of a real backend and a
-/// [`FakeBroker`].
+/// `<state>-home`, next to it) and `sandbox` in place of a real backend.
 pub(crate) fn hangar_with(
     config: &str,
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
 ) -> Hangar {
-    hangar_with_broker(config, state, sandbox, Box::new(FakeBroker::default()))
+    hangar_holding(config, state, sandbox, no_keychain())
 }
 
-pub(crate) fn hangar_with_broker(
+/// [`hangar_with`], its proxies' tokens in `keychain`.
+pub(crate) fn hangar_holding(
     config: &str,
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
-    broker: Box<dyn Broker>,
+    keychain: Rc<dyn crate::keychain::Keychain>,
 ) -> Hangar {
     let settings = settings(config);
     let sibling = |suffix: &str| {
@@ -122,14 +131,34 @@ pub(crate) fn hangar_with_broker(
     };
     let host_home = sibling("-home");
     fs::create_dir_all(&host_home).unwrap();
+    let state_dir = StateDir::new(state.to_path_buf());
+    let proxies =
+        build_proxies(&settings, &state_dir, &host_home, &keychain).unwrap();
     Hangar {
         settings,
-        state: StateDir::new(state.to_path_buf()),
+        state: state_dir,
         cache_root: sibling("-cache"),
+        state_root: sibling("-state"),
         host_home,
         sandbox,
-        broker,
+        keychain,
+        proxies,
     }
+}
+
+/// An empty fake keychain.
+pub(crate) fn no_keychain() -> Rc<dyn crate::keychain::Keychain> {
+    Rc::new(crate::keychain::fake::FakeKeychain::default())
+}
+
+/// A sandbox whose bays answer like ones that are already in line.
+pub(crate) fn settled() -> Rc<FakeSandbox> {
+    let sandbox = Rc::new(FakeSandbox::default());
+    sandbox.reply("umask 077", "same\n");
+    sandbox.reply("hangar-packages /", "{}");
+    sandbox.reply("hangar-profile", r#"{"elements":{}}"#);
+    sandbox.reply("hangar-setup-check", "done");
+    sandbox
 }
 
 /// Answers one request per `(status, body)`, in order, and returns
@@ -146,8 +175,7 @@ pub(crate) fn serve_each(
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 let mut buffer = [0; 4096];
-                // Head and body may arrive in separate writes.
-                while !complete(&request) {
+                while !request.contains("\r\n\r\n") {
                     let read = stream.read(&mut buffer).unwrap();
                     request.push_str(&String::from_utf8_lossy(&buffer[..read]));
                 }
@@ -164,15 +192,10 @@ pub(crate) fn serve_each(
     (port, server)
 }
 
-fn complete(request: &str) -> bool {
-    let Some((head, body)) = request.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let length = head
-        .to_ascii_lowercase()
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length: "))
-        .and_then(|length| length.parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= length
+/// A proxy's secrets, read from an empty fake keychain.
+pub(crate) fn no_secrets(
+    fields: &crate::config::Fields,
+) -> crate::proxy::Secrets {
+    let keychain = Rc::new(crate::keychain::fake::FakeKeychain::default());
+    crate::proxy::Secrets::new("p", keychain, fields).unwrap()
 }

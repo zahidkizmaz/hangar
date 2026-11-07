@@ -1,3 +1,0 @@
-{
-  "routes": [{ "name": "npm", "host": "registry.npmjs.org", "auth": { "type": "passthrough" } }]
-}

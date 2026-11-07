@@ -1,8 +1,4 @@
-use std::fmt::{self, Write as _};
-use std::fs::File;
-use std::io::Read;
-
-use crate::error::{Context, Result};
+use std::fmt;
 
 /// A credential that redacts itself in `Debug`. There is deliberately no
 /// `Display`: formatting a secret must go through `expose()`, so a mistake
@@ -52,6 +48,9 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         return Some("a private key");
     }
+    if has_jwt(text) {
+        return Some("a JWT");
+    }
     let token = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     text.split(|c: char| !token(c)).find_map(|word| {
         SECRET_PREFIXES.iter().find_map(|prefix| {
@@ -69,15 +68,14 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn random_hex(bytes: usize) -> Result<String> {
-    let mut buffer = vec![0; bytes];
-    File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut buffer))
-        .context("/dev/urandom")?;
-    Ok(buffer.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    }))
+/// `eyJ` (base64 of `{"`), 20 or more base64url characters, then a `.`.
+fn has_jwt(text: &str) -> bool {
+    let base64url = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices("eyJ").any(|(at, _)| {
+        let rest = &text[at + 3..];
+        let body = rest.find(|c| !base64url(c)).unwrap_or(rest.len());
+        body >= 20 && rest[body..].starts_with('.')
+    })
 }
 
 impl fmt::Debug for Secret {
@@ -88,7 +86,7 @@ impl fmt::Debug for Secret {
 
 #[cfg(test)]
 mod tests {
-    use super::{Secret, find_secret, random_hex, trim_line_end};
+    use super::{Secret, find_secret, trim_line_end};
 
     #[test]
     fn real_looking_credentials_are_found_but_prose_is_not() {
@@ -114,11 +112,19 @@ mod tests {
     }
 
     #[test]
-    fn random_hex_has_two_digits_per_byte() {
-        let hex = random_hex(16).unwrap();
-        assert_eq!(hex.len(), 32);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(hex, random_hex(16).unwrap());
+    fn a_jwt_is_found_but_prose_mentioning_ey_j_is_not() {
+        let body = "a".repeat(20);
+        let jwt = format!("eyJ{body}.eyJ{body}.sig");
+        assert_eq!(find_secret(&format!("token={jwt}")), Some("a JWT"));
+        assert_eq!(find_secret(&format!("\"{jwt}\"")), Some("a JWT"));
+        for prose in [
+            "JWTs start with eyJ, the base64 of {\"",
+            "eyJhbGciOiJIUzI1NiJ9.",
+            &format!("eyJ{body} and no dot"),
+            &format!("eyJ{body}"),
+        ] {
+            assert_eq!(find_secret(prose), None, "{prose}");
+        }
     }
 
     #[test]

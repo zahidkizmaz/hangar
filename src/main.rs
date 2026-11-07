@@ -1,12 +1,9 @@
-//! hangar: locked-down bays for AI coding agents, and a tower that holds
-//! their credentials, in a sandbox.
+//! hangar: locked-down bays for AI coding agents, in a sandbox.
 
 mod apps;
 mod bay;
-mod broker;
 mod commands;
 mod config;
-mod credential;
 mod dirs;
 mod error;
 mod files;
@@ -14,39 +11,42 @@ mod hangar;
 mod http;
 mod json;
 mod keychain;
+mod lifecycle;
 mod lock;
 mod logger;
 mod mounts;
-mod oauth;
 mod output;
-mod overview;
 mod packages;
-mod password;
 mod process;
+mod prompt;
+mod proxy;
 mod sandbox;
 mod secret;
 mod state;
+mod status;
 #[cfg(test)]
 mod testing;
-mod url;
 mod vm_record;
 
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{ArgAction, ArgGroup, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use config::{Paths, env_var};
+use dirs::Base;
 use error::Result;
 use hangar::Hangar;
 use output::{Format, Outcome};
-use overview::StatusReport;
+use prompt::Terminal;
 
 /// Sandboxed workspaces for AI agents.
 #[derive(Debug, Parser)]
 #[command(
     version,
     propagate_version = true,
-    after_help = "Exit codes: 0 ok, 1 error, 2 usage, 3 status: not healthy.\n\
+    after_help = "Exit codes: 0 ok, 1 error, 2 usage, 3 ps found something \
+                  wrong.\n\
                   Scripts and agents: add --json, see docs/cli.md."
 )]
 #[expect(clippy::doc_markdown, reason = "doc comments are the --help text")]
@@ -68,53 +68,65 @@ struct Cli {
 #[expect(clippy::doc_markdown, reason = "doc comments are the --help text")]
 enum Command {
     /// Write a starter $XDG_CONFIG_HOME/hangar/hangar.json
-    #[command(after_help = "init writes hangar's own config; 'hangar setup \
-                            NAME' configures an app inside a bay.")]
     Init {
         /// Overwrite an existing file
         #[arg(long)]
         force: bool,
     },
-    /// Start the tower and the bays and apply the config
-    #[command(after_help = "Without BAY: every configured bay. A failing \
-                            bay doesn't stop the others; up exits 1 and \
-                            --json lists it under failed.\n\n\
-                            Examples:\n  hangar up\n  hangar up work\n  \
-                            hangar up --json | jq .failed")]
+    #[command(flatten)]
+    OnHangar(OnHangar),
+}
+
+/// The commands that act on the configured hangar.
+#[derive(Debug, Subcommand)]
+enum OnHangar {
+    /// Create or start bays and proxies and apply the config
+    #[command(after_help = "Without NAME: every bay and proxy. A bay's \
+                            proxy comes up first; a bay whose proxy fails \
+                            is left alone. Exits 1 if anything failed.")]
     Up {
-        /// Bays to bring up (default: all)
-        bays: Vec<String>,
+        /// Bays or proxies (default: all)
+        names: Vec<String>,
     },
-    /// Stop bays, or every bay and the tower
-    #[command(after_help = "Without BAY: every bay, then the tower. With \
-                            BAY: only those bays; the tower keeps running.")]
+    /// Stop bays and proxies
     Down {
-        /// Bays to stop (default: all, and the tower)
-        bays: Vec<String>,
+        /// Bays or proxies (default: all)
+        names: Vec<String>,
     },
-    /// Show health, each bay (run entries, ports) and the tower
-    #[command(after_help = "Exits 3 when something isn't healthy. --all \
-                            adds each bay's apps (hosts and credential \
-                            names), mounts and package cache, and the \
-                            tower's routes; --json always has everything. \
-                            Stored credentials: 'hangar credential list'.\n\n\
-                            Examples:\n  hangar status\n  \
-                            hangar status --all\n  \
-                            hangar status --json | jq .tower\n  \
-                            hangar status --json || hangar up")]
-    Status {
-        /// Also show apps, mounts, the package cache and the routes
+    /// Stop, then start bays and proxies
+    Restart {
+        /// Bays or proxies (default: all)
+        names: Vec<String>,
+    },
+    /// Remove a bay's or proxy's VM; --data also deletes its data
+    #[command(after_help = "--data deletes a bay's home and data volume, \
+                            or a proxy's data dir. Package caches are kept.")]
+    Rm {
+        /// A bay or proxy, configured or left over
+        name: String,
+        /// Also delete its data
+        #[arg(long)]
+        data: bool,
+        /// Don't ask before deleting data
         #[arg(short, long)]
-        all: bool,
+        yes: bool,
     },
-    /// Open a login shell in the bay, or run CMD there
-    #[command(after_help = "Examples:\n  hangar shell\n  \
-                            hangar shell gh --help\n  \
-                            hangar shell git -C repo status")]
-    Shell {
-        #[command(flatten)]
-        bay: BayFlag,
-        /// Command and its arguments, passed as given (including --help)
+    /// List bays and proxies with their ports
+    Ps {
+        /// Also show images, apps and mounts
+        #[arg(short, long)]
+        wide: bool,
+    },
+    /// Show everything about a bay or proxy
+    Inspect {
+        /// A bay or proxy
+        name: String,
+    },
+    /// Open a login shell in a bay, or run CMD there
+    Exec {
+        /// The bay
+        bay: String,
+        /// Command and its arguments, passed as given
         #[arg(
             value_name = "CMD",
             trailing_var_arg = true,
@@ -122,167 +134,69 @@ enum Command {
         )]
         args: Vec<String>,
     },
-    /// Show the log of a run entry or app
-    #[command(after_help = "Examples:\n  hangar logs web\n  \
-                            hangar logs -f web")]
+    /// Show hangar's log, a bay's apps' journal or a proxy's log
     Logs {
-        #[command(flatten)]
-        bay: BayFlag,
-        /// Keep following the log
+        /// A bay or proxy (default: hangar's own log)
+        name: Option<String>,
+        /// One app of the bay
+        app: Option<String>,
+        /// Keep following
         #[arg(short, long)]
         follow: bool,
-        /// The run entry or app
-        name: String,
     },
-    /// Run an app's one-time interactive setup in the bay
-    #[command(after_help = "Runs the app's setup command with a terminal, \
-                            then its check; a failing check is an error. \
-                            hangar up skips an app's run entry while its \
-                            check fails. To write hangar's own config, use \
-                            'hangar init'.\n\n\
-                            Examples:\n  hangar setup web\n  \
-                            hangar setup --force web")]
+    /// Copy files into or out of a running bay
+    #[command(
+        after_help = "Examples:\n  hangar cp ~/notes.md work:~/notes.md\n  \
+                            hangar cp work:~/out.txt ~/out.txt"
+    )]
+    Cp {
+        /// Host path or BAY:PATH
+        src: String,
+        /// Host path or BAY:PATH
+        dest: String,
+    },
+    /// Manage a proxy's tokens in the OS keychain
+    #[command(subcommand)]
+    Secret(SecretCommand),
+    /// Run an app's one-time interactive setup in a bay
     Setup {
-        #[command(flatten)]
-        bay: BayFlag,
-        /// Run the setup command even if the check already passes
+        /// The bay
+        bay: String,
+        /// An enabled app with a setup
+        app: String,
+        /// Run it even if the check already passes
         #[arg(long)]
         force: bool,
-        /// An enabled app with a setup
-        name: String,
     },
-    /// Copy the declared files into the bay, or one SRC
-    #[command(after_help = "Without SRC: the declared files only (write \
-                            what changed, remove dropped ones).\n\
-                            With SRC: one host file or directory, same \
-                            checks, not managed; a declared entry for the \
-                            same path overwrites it on the next copy, up or \
-                            restart.\n\n\
-                            Examples:\n  hangar copy\n  \
-                            hangar copy ~/notes/todo.md\n  \
-                            hangar copy ./script.sh ~/bin/script.sh")]
-    Copy {
-        #[command(flatten)]
-        bay: BayFlag,
-        /// Host file or directory (default: the declared files)
-        src: Option<String>,
-        /// VM path (default: SRC's place under the VM user's home)
-        #[arg(requires = "src")]
-        dest: Option<String>,
-    },
-    /// Re-apply files and the env file, then restart run entries
-    #[command(after_help = "Without NAME: every run entry. hangar up \
-                            never restarts anything; it warns when a running \
-                            entry's inputs changed.\n\n\
-                            Examples:\n  hangar restart\n  \
-                            hangar restart web\n  \
-                            hangar restart --no-copy web")]
-    Restart {
-        #[command(flatten)]
-        bay: BayFlag,
-        /// Don't re-copy files (the env file is still refreshed)
-        #[arg(long)]
-        no_copy: bool,
-        /// run entries or apps (default: all)
-        names: Vec<String>,
-    },
-    /// Copy the vault login to the clipboard and open the vault UI
-    #[command(after_help = "Examples:\n  hangar vault-ui\n  \
-                            hangar vault-ui --json | jq -r .url")]
-    VaultUi,
-    /// Manage your own credentials in the vault
-    #[command(subcommand)]
-    Credential(CredentialCommand),
-    /// Remove bays, or every bay and the tower
-    #[command(after_help = "Without BAY: every VM; --state also deletes \
-                            stateDir and the keychain item. With BAY: only \
-                            those bays (configured or not); --state also \
-                            deletes their folders. Package caches are kept.\n\n\
-                            Examples:\n  hangar destroy && hangar up\n  \
-                            hangar destroy old --state\n  \
-                            hangar destroy --state --yes")]
-    Destroy {
-        /// Bays to remove (default: every VM)
-        bays: Vec<String>,
-        /// Also delete hangar's data: without BAY the vault, tokens, every
-        /// bay's home and the master password; with BAY those bays' folders
-        #[arg(long)]
-        state: bool,
-        /// Don't ask before deleting state
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-/// Which bay a single-bay command acts on.
-#[derive(Debug, clap::Args)]
-struct BayFlag {
-    /// The bay (default: the only one)
-    #[arg(short = 'b', long = "bay", value_name = "NAME")]
-    bay: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
-#[expect(clippy::doc_markdown, reason = "doc comments are the --help text")]
-enum CredentialCommand {
-    /// Store a credential (hidden prompt, or stdin)
-    #[command(after_help = "Examples:\n  \
-                            hangar credential set CLAUDE_CODE_OAUTH_TOKEN\n  \
-                            hangar credential set GITHUB_TOKEN < token.txt")]
+enum SecretCommand {
+    /// Ask for a proxy's tokens and store them in the keychain
+    #[command(after_help = "Typed unseen on a terminal; otherwise one \
+                            token per line on stdin, in the order the \
+                            proxy kind lists them (docs/proxy-kinds.md).")]
     Set {
-        /// UPPER_SNAKE_CASE, named after the variable the tool reads
-        name: String,
+        /// The proxy
+        proxy: String,
+        /// Only this token, e.g. session-token (default: all)
+        token: Option<String>,
     },
-    /// List credential names (never values)
-    #[command(after_help = "Examples:\n  hangar credential list\n  \
-                            hangar credential list --json | jq -r '.[].name'")]
-    List,
-    /// Log an OAuth credential in from your browser; the vault keeps and
-    /// refreshes its tokens
-    #[command(after_help = "With URL, hangar finds the provider's \
-                            endpoints and registers itself as a client \
-                            (or uses --client-id). With the endpoint flags, \
-                            it uses a client you registered. With neither, \
-                            it logs in again with the client the vault \
-                            holds.\n\n\
-                            Examples:\n  \
-                            hangar credential login ATLASSIAN \
-                            https://mcp.atlassian.com/v1/mcp\n  \
-                            hangar credential login EXAMPLE_API \\\n    \
-                            --authorization-url https://auth.example.com/authorize \\\n    \
-                            --token-url https://auth.example.com/token \\\n    \
-                            --client-id abc123 --client-secret --scope read\n  \
-                            hangar credential login ATLASSIAN")]
-    #[command(group = ArgGroup::new("provider")
-        .args(["url", "authorization_url"]))]
-    Login {
-        /// UPPER_SNAKE_CASE, the name a route injects
-        name: String,
-        /// The API (or its OAuth issuer) to find the provider from
-        #[arg(conflicts_with_all = ["authorization_url", "token_url"])]
-        url: Option<String>,
-        /// The provider's authorization endpoint
-        #[arg(long, value_name = "URL", requires_all = ["token_url", "client_id"])]
-        authorization_url: Option<String>,
-        /// The provider's token endpoint
-        #[arg(long, value_name = "URL", requires_all = ["authorization_url", "client_id"])]
-        token_url: Option<String>,
-        /// The client you registered with the provider
-        #[arg(long, value_name = "ID", requires = "provider")]
-        client_id: Option<String>,
-        /// Read the client's secret (hidden prompt, or stdin)
-        #[arg(long, requires = "client_id")]
-        client_secret: bool,
-        /// A scope to ask for; repeat for several
-        #[arg(long = "scope", value_name = "SCOPE", requires = "provider")]
-        scopes: Vec<String>,
-    },
-    /// Delete a credential you stored (for an OAuth one, its login)
-    #[command(after_help = "Example:\n  hangar credential rm GITHUB_TOKEN")]
-    Rm {
-        /// The credential to delete
-        name: String,
-    },
+}
+
+impl OnHangar {
+    fn changes_state(&self) -> bool {
+        matches!(
+            self,
+            Self::Up { .. }
+                | Self::Down { .. }
+                | Self::Restart { .. }
+                | Self::Rm { .. }
+                | Self::Cp { .. }
+                | Self::Secret(_)
+                | Self::Setup { .. }
+        )
+    }
 }
 
 fn main() -> ExitCode {
@@ -293,7 +207,7 @@ fn main() -> ExitCode {
     // Color only on a terminal, and never with NO_COLOR set.
     let color =
         io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    logger::init(level, color);
+    logger::init(level, color, log_file());
     let format = if cli.json {
         Format::Json
     } else {
@@ -311,144 +225,75 @@ fn main() -> ExitCode {
     }
 }
 
+fn log_file() -> Option<PathBuf> {
+    let dir = dirs::hangar_dir(Base::State, &env_var).ok()?;
+    Some(dir.join(commands::LOG_FILE))
+}
+
 fn run(command: Command) -> Result<Outcome> {
     let paths = Paths::locate(&env_var)?;
-    if let Command::Init { force } = command {
-        commands::init(&paths, force)?;
-        return Ok(Outcome::Done);
+    match command {
+        Command::Init { force } => {
+            commands::init(&paths, force)?;
+            Ok(Outcome::Done)
+        }
+        Command::OnHangar(command) => on_hangar(&paths, command),
     }
-    let hangar = Hangar::load(&paths)?;
+}
+
+fn on_hangar(paths: &Paths, command: OnHangar) -> Result<Outcome> {
+    let hangar = Hangar::load(paths)?;
     let _lock = if command.changes_state() {
-        Some(hold_lock()?)
+        let path = hangar.state_root.join("lock");
+        Some(lock::acquire(&path, || {
+            log::info!("waiting for another hangar");
+        })?)
     } else {
         None
     };
+    let hangar = &hangar;
     Ok(match command {
-        Command::Init { .. } => unreachable!("handled above"),
-        Command::Up { bays } => Outcome::Up(commands::up(&hangar, &bays)?),
-        Command::Down { bays } => done(commands::down(&hangar, &bays))?,
-        Command::Status { all } => {
-            Outcome::Status(StatusReport::collect(&hangar), all)
+        OnHangar::Up { names } => {
+            Outcome::Changes(commands::up(hangar, &names, &Terminal)?)
         }
-        Command::Shell { bay, args } => {
-            streamed(commands::shell(&hangar, bay.bay.as_deref(), &args))?
+        OnHangar::Down { names } => {
+            Outcome::Changes(commands::down(hangar, &names)?)
         }
-        Command::Logs { bay, follow, name } => streamed(commands::logs(
-            &hangar,
-            bay.bay.as_deref(),
-            &name,
-            follow,
-        ))?,
-        Command::Setup { bay, force, name } => streamed(commands::setup(
-            &hangar,
-            bay.bay.as_deref(),
-            &name,
-            force,
-        ))?,
-        Command::Copy { bay, src, dest } => {
-            let (bay, copied) = commands::copy_files(
-                &hangar,
-                bay.bay.as_deref(),
-                src.as_deref(),
-                dest.as_deref(),
-            )?;
-            Outcome::Copied(bay, copied)
+        OnHangar::Restart { names } => {
+            Outcome::Changes(commands::restart(hangar, &names, &Terminal)?)
         }
-        Command::Restart {
-            bay,
-            no_copy,
-            names,
-        } => {
-            let (bay, restarted) = commands::restart(
-                &hangar,
-                bay.bay.as_deref(),
-                &names,
-                !no_copy,
-            )?;
-            Outcome::Restarted(bay, restarted)
+        OnHangar::Secret(SecretCommand::Set { proxy, token }) => {
+            Outcome::Changes(commands::secret_set(
+                hangar,
+                &proxy,
+                token.as_deref(),
+                &Terminal,
+            )?)
         }
-        Command::VaultUi => Outcome::VaultLogin(commands::vault_ui(&hangar)?),
-        Command::Credential(action) => match action {
-            CredentialCommand::Set { name } => {
-                let value = credential::read(&hangar, &name)?;
-                let _lock = hold_lock()?;
-                done(credential::store(&hangar, &name, &value))?
-            }
-            CredentialCommand::List => {
-                Outcome::Credentials(credential::list(&hangar)?)
-            }
-            CredentialCommand::Login {
-                name,
-                url,
-                authorization_url,
-                token_url,
-                client_id,
-                client_secret,
-                scopes,
-            } => {
-                let source = credential::ClientSource::from_flags(
-                    url,
-                    authorization_url,
-                    token_url,
-                    client_id,
-                );
-                let args = credential::LoginArgs {
-                    source,
-                    scopes,
-                    client_secret,
-                };
-                done(login(&hangar, &name, args))?
-            }
-            CredentialCommand::Rm { name } => {
-                done(credential::remove(&hangar, &name))?
-            }
+        OnHangar::Rm { name, data, yes } => {
+            Outcome::Changes(commands::rm(hangar, &name, data, yes, &Terminal)?)
+        }
+        OnHangar::Ps { wide } => Outcome::Overview {
+            overview: commands::ps(hangar),
+            wide,
         },
-        Command::Destroy { bays, state, yes } => {
-            done(commands::destroy(&hangar, &bays, state, yes))?
+        OnHangar::Inspect { name } => {
+            Outcome::Detail(Box::new(commands::inspect(hangar, &name)?))
+        }
+        OnHangar::Exec { bay, args } => {
+            commands::exec(hangar, &bay, &args)?;
+            Outcome::Streamed
+        }
+        OnHangar::Logs { name, app, follow } => {
+            commands::logs(hangar, name.as_deref(), app.as_deref(), follow)?;
+            Outcome::Streamed
+        }
+        OnHangar::Cp { src, dest } => {
+            Outcome::Copied(commands::cp(hangar, &src, &dest)?)
+        }
+        OnHangar::Setup { bay, app, force } => {
+            commands::setup(hangar, &bay, &app, force)?;
+            Outcome::Streamed
         }
     })
-}
-
-impl Command {
-    /// `credential set` and `login` lock themselves, after their prompts.
-    fn changes_state(&self) -> bool {
-        matches!(
-            self,
-            Self::Up { .. }
-                | Self::Down { .. }
-                | Self::Restart { .. }
-                | Self::Copy { .. }
-                | Self::Destroy { .. }
-                | Self::Credential(CredentialCommand::Rm { .. })
-        )
-    }
-}
-
-/// Holds the lock only while the vault changes, not for the prompts or
-/// the browser.
-fn login(
-    hangar: &Hangar,
-    name: &str,
-    args: credential::LoginArgs,
-) -> Result<()> {
-    let https = http::https();
-    let login = credential::prepare_login(hangar, &https, name, args)?;
-    let pending = {
-        let _lock = hold_lock()?;
-        credential::begin(hangar, &login)?
-    };
-    credential::finish_login(hangar, &pending, &commands::open_in_browser)
-}
-
-fn hold_lock() -> Result<lock::Lock> {
-    let path = dirs::hangar_dir(dirs::Base::State, &env_var)?.join("lock");
-    lock::acquire(&path, || log::info!("waiting for another hangar"))
-}
-
-fn done(result: Result<()>) -> Result<Outcome> {
-    result.map(|()| Outcome::Done)
-}
-
-fn streamed(result: Result<()>) -> Result<Outcome> {
-    result.map(|()| Outcome::Streamed)
 }

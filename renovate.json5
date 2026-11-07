@@ -21,10 +21,10 @@
       datasourceTemplate: "crate",
     },
     {
-      // The vault image: security fixes must arrive.
+      // The Infisical proxy image: security fixes must arrive.
       customType: "regex",
-      managerFilePatterns: ["/^config/defaults\\.json$/"],
-      matchStrings: ['"image": "(?<depName>infisical/agent-vault):(?<currentValue>[^@"]+)@(?<currentDigest>sha256:[a-f0-9]+)"'],
+      managerFilePatterns: ["/^src/proxy/infisical\\.rs$/"],
+      matchStrings: ['"(?<depName>infisical/cli):(?<currentValue>[^@"]+)@(?<currentDigest>sha256:[a-f0-9]+)"'],
       datasourceTemplate: "docker",
     },
     {

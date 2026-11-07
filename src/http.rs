@@ -1,13 +1,11 @@
-//! HTTP through ureq: plain to the broker's admin API on 127.0.0.1, and
-//! https only to OAuth providers.
+//! Plain GETs through ureq: a proxy's API on 127.0.0.1 and a proxy's CA.
 
 use std::time::Duration;
 
 use ureq::Agent;
-use ureq::http::{self, header};
+use ureq::http;
 
 use crate::error::{Context, Result, bail};
-use crate::secret::Secret;
 
 pub(crate) struct Response {
     pub(crate) status: u16,
@@ -17,27 +15,19 @@ pub(crate) struct Response {
 const MAX_BODY: u64 = 1024 * 1024;
 
 /// Trap: ureq's default config takes a proxy from the environment.
-fn agent(timeout: Duration, https_only: bool) -> Agent {
+fn agent(timeout: Duration) -> Agent {
     Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
-        .https_only(https_only)
         .timeout_global(Some(timeout))
         .accept("application/json")
         .build()
         .into()
 }
 
-fn run(
-    agent: &Agent,
-    request: http::request::Builder,
-    body: Option<&[u8]>,
-) -> std::result::Result<Response, ureq::Error> {
-    let mut response = match body {
-        Some(body) => agent.run(request.body(body)?)?,
-        None => agent.run(request.body(())?)?,
-    };
+fn run(agent: &Agent, url: &str) -> std::result::Result<Response, ureq::Error> {
+    let mut response = agent.run(http::Request::get(url).body(())?)?;
     let body = response
         .body_mut()
         .with_config()
@@ -50,147 +40,60 @@ fn run(
     })
 }
 
-/// A request to the broker's admin API.
-pub(crate) fn send(
-    port: u16,
-    method: &str,
-    path: &str,
-    token: Option<&Secret>,
-    body: Option<&str>,
-    timeout: Duration,
-) -> Result<Response> {
-    // Never the headers or body: they carry tokens and credential values.
-    log::trace!("vault {method} {path}");
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let mut request = http::Request::builder()
-        .method(method)
-        .uri(&url)
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(token) = token {
-        let bearer = format!("Bearer {}", token.expose());
-        request = request.header(header::AUTHORIZATION, bearer);
-    }
-    let body = body.unwrap_or_default().as_bytes();
-    run(&agent(timeout, false), request, Some(body)).context(url)
-}
-
-/// A GET without a token, for probes like `/health`.
+/// A GET to a service on this machine, for probes like `/health`.
 pub(crate) fn get(port: u16, path: &str) -> Result<Response> {
-    send(port, "GET", path, None, None, Duration::from_secs(2))
+    log::trace!("GET 127.0.0.1:{port}{path}");
+    let url = format!("http://127.0.0.1:{port}{path}");
+    run(&agent(Duration::from_secs(2)), &url).context(url)
 }
 
-/// Like [`send`], but a non-2xx status is an error.
-pub(crate) fn call(
-    port: u16,
-    method: &str,
-    path: &str,
-    token: Option<&Secret>,
-    body: Option<&str>,
-) -> Result<String> {
-    let timeout = Duration::from_secs(30);
-    let response = send(port, method, path, token, body, timeout)?;
-    if !(200..300).contains(&response.status) {
-        bail!(
-            "{method} {path}: HTTP {}: {:.200}",
-            response.status,
-            response.body.trim()
-        );
-    }
-    Ok(response.body)
+/// The host and port of a plain-http URL without userinfo or a bare path.
+pub(crate) fn http_authority(url: &str) -> Option<(String, Option<u16>)> {
+    let uri: http::Uri = url.parse().ok()?;
+    let authority = uri.authority()?;
+    let plain = uri.scheme_str() == Some("http")
+        && !authority.as_str().contains('@')
+        && uri.query().is_none();
+    plain.then(|| (authority.host().to_string(), authority.port_u16()))
 }
 
-pub(crate) trait Https {
-    fn get(&self, url: &str) -> Result<Response>;
-    fn post_json(&self, url: &str, body: &str) -> Result<Response>;
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost")
 }
 
-/// The OAuth providers' client.
-pub(crate) fn https() -> Agent {
-    agent(Duration::from_secs(30), true)
-}
-
-impl Https for Agent {
-    fn get(&self, url: &str) -> Result<Response> {
-        run(self, http::Request::get(url), None).context(url)
+/// A GET for a CA: https, or http to this machine.
+pub(crate) fn fetch(url: &str, timeout: Duration) -> Result<Response> {
+    let loopback =
+        http_authority(url).is_some_and(|(host, _)| is_loopback_host(&host));
+    if !loopback && !url.starts_with("https://") {
+        bail!("CA URL must be https, or http on 127.0.0.1");
     }
-
-    fn post_json(&self, url: &str, body: &str) -> Result<Response> {
-        let request = http::Request::post(url)
-            .header(header::CONTENT_TYPE, "application/json");
-        run(self, request, Some(body.as_bytes())).context(url)
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod fake {
-    use super::{Https, Response};
-    use crate::error::{Result, bail};
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
-
-    /// Canned answers by URL; any other URL is a 404. Records each
-    /// request, with a POST's body.
-    #[derive(Default)]
-    pub(crate) struct FakeHttps {
-        pub(crate) answers: BTreeMap<String, (u16, String)>,
-        pub(crate) requests: RefCell<Vec<String>>,
-        pub(crate) fail: bool,
-    }
-
-    impl FakeHttps {
-        pub(crate) fn answer(
-            mut self,
-            url: &str,
-            status: u16,
-            body: &str,
-        ) -> Self {
-            self.answers.insert(url.into(), (status, body.into()));
-            self
-        }
-
-        fn respond(&self, request: String, url: &str) -> Result<Response> {
-            self.requests.borrow_mut().push(request);
-            if self.fail {
-                bail!("{url}: could not resolve host");
-            }
-            let (status, body) = self
-                .answers
-                .get(url)
-                .cloned()
-                .unwrap_or((404, "Not Found".into()));
-            Ok(Response { status, body })
-        }
-    }
-
-    impl Https for FakeHttps {
-        fn get(&self, url: &str) -> Result<Response> {
-            self.respond(format!("GET {url}"), url)
-        }
-
-        fn post_json(&self, url: &str, body: &str) -> Result<Response> {
-            self.respond(format!("POST {url} {body}"), url)
-        }
-    }
+    run(&agent(timeout), url).context(url)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Https, MAX_BODY, agent, https};
-    use crate::testing::{closed_port, serve_each};
+    use super::{MAX_BODY, fetch, get, http_authority, is_loopback_host};
+    use crate::testing::serve_each;
     use std::net::TcpListener;
     use std::time::Duration;
 
     #[test]
-    fn providers_get_https_only_without_a_proxy_redirect_or_long_wait() {
-        let client = https();
-        let config = client.config();
-        assert!(config.https_only());
-        assert!(config.proxy().is_none());
-        assert_eq!(config.max_redirects(), 0);
-        assert_eq!(config.timeouts().global, Some(Duration::from_secs(30)));
-        let url = format!("http://127.0.0.1:{}/", closed_port());
-        let error = Https::get(&client, &url).err().unwrap().to_string();
-        assert!(error.contains("https only"), "{error}");
+    fn fetch_refuses_urls_that_only_look_like_loopback() {
+        for url in [
+            "http://127.0.0.1:80@evil.com/ca",
+            "http://127.0.0.1.evil.com/ca",
+            "http://user@127.0.0.1/ca",
+            "http://example.com/ca",
+        ] {
+            let error = fetch(url, Duration::from_secs(1)).err().unwrap();
+            assert!(error.to_string().starts_with("CA URL must be"), "{url}");
+        }
+        for url in ["http://127.0.0.1:8080/ca", "http://localhost:8080/ca"] {
+            assert!(http_authority(url).is_some_and(|(host, port)| {
+                is_loopback_host(&host) && port == Some(8080)
+            }));
+        }
     }
 
     #[test]
@@ -199,19 +102,14 @@ mod tests {
             ("201 Created", r#"{"a":1}"#),
             ("302 Found\r\nLocation: /elsewhere", ""),
         ]);
-        let client = agent(Duration::from_secs(5), false);
-        let url = format!("http://127.0.0.1:{port}/register");
-        let response = client.post_json(&url, r#"{"b":2}"#).unwrap();
+        let response = get(port, "/health").unwrap();
         assert_eq!(
             (response.status, response.body.as_str()),
             (201, r#"{"a":1}"#)
         );
-        assert_eq!(Https::get(&client, &url).unwrap().status, 302);
+        assert_eq!(get(port, "/health").unwrap().status, 302);
         let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("POST /register "));
-        assert!(requests[0].contains("content-type: application/json\r\n"));
-        assert!(requests[0].ends_with(r#"{"b":2}"#));
-        assert!(requests[1].starts_with("GET /register "));
+        assert!(requests.iter().all(|r| r.starts_with("GET /health ")));
     }
 
     #[test]
@@ -219,15 +117,13 @@ mod tests {
         let huge = "x".repeat(usize::try_from(MAX_BODY).unwrap() + 1);
         let (port, _) = serve_each(vec![("200 OK", huge.leak())]);
         let url = format!("http://127.0.0.1:{port}/huge");
-        let error =
-            Https::get(&agent(Duration::from_secs(5), false), &url).err();
+        let error = fetch(&url, Duration::from_secs(5)).err();
         assert!(error.unwrap().to_string().starts_with(&url));
 
         let silent = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = silent.local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}/slow");
-        let error =
-            Https::get(&agent(Duration::from_millis(200), false), &url).err();
+        let error = fetch(&url, Duration::from_millis(200)).err();
         assert!(error.unwrap().to_string().starts_with(&url));
     }
 }
