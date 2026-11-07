@@ -35,7 +35,6 @@ pub(crate) struct OsKeychain {
     tool: String,
 }
 
-/// What may appear in a `security -i` command line unquoted.
 fn plain(text: &str) -> bool {
     !text.is_empty()
         && text
@@ -57,8 +56,6 @@ pub(crate) fn check_token(token: &str) -> Result<()> {
 }
 
 impl OsKeychain {
-    /// `service` (`$HANGAR_KEYCHAIN_SERVICE`) keeps several hangar setups
-    /// (or tests) apart; `hangar` by default.
     pub(crate) fn new(service: Option<String>) -> Result<Self> {
         let service = service.unwrap_or_else(|| "hangar".to_string());
         if !plain(&service) || service.contains('/') {
@@ -73,9 +70,6 @@ impl OsKeychain {
     }
 }
 
-/// Only debug builds read `$HANGAR_TEST_KEYCHAIN_TOOL`, the CLI tests'
-/// fake. Release builds compile the lookup out, so nothing at runtime
-/// redirects them (`nix/cli.nix` checks the name is not in the binary).
 fn tool() -> String {
     #[cfg(debug_assertions)]
     if let Some(fake) = crate::config::env_var("HANGAR_TEST_KEYCHAIN_TOOL") {
@@ -139,7 +133,6 @@ fn delete_command(tool: &str, service: &str, account: &str) -> Command {
     tool_command(tool, &args)
 }
 
-/// `security` exits 44 when the item doesn't exist.
 #[cfg(target_os = "macos")]
 fn not_found(output: &Output) -> bool {
     output.status.code() == Some(44)
@@ -252,8 +245,6 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     const MISSING: i32 = 1;
 
-    /// An `OsKeychain` running a script instead of the real tool; the
-    /// script logs its argv to `args` and its stdin to `stdin`.
     fn fake(name: &str, body: &str) -> (OsKeychain, PathBuf) {
         let dir = scratch_dir(&format!("keychain-{name}"));
         let tool = dir.join("tool");

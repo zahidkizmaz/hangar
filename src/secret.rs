@@ -15,15 +15,11 @@ impl Secret {
     }
 }
 
-/// A secret read from a file or tool: one trailing newline (LF or CRLF) is
-/// formatting, not part of the value.
 pub(crate) fn trim_line_end(value: &str) -> &str {
     let value = value.strip_suffix('\n').unwrap_or(value);
     value.strip_suffix('\r').unwrap_or(value)
 }
 
-/// How real credentials start. Shared by every check that keeps secrets out
-/// of a bay (`env`, `files`).
 pub(crate) const SECRET_PREFIXES: [&str; 14] = [
     "ghp_",
     "gho_",
@@ -68,7 +64,6 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     })
 }
 
-/// `eyJ` (base64 of `{"`), 20 or more base64url characters, then a `.`.
 fn has_jwt(text: &str) -> bool {
     let base64url = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     text.match_indices("eyJ").any(|(at, _)| {
@@ -97,7 +92,6 @@ mod tests {
             Some("sk-ant-")
         );
         assert_eq!(find_secret("id AKIAIOSFODNN7EXAMPLE end"), Some("AKIA"));
-        // Assembled, so the repo holds no key-shaped literal.
         let key = format!("-----BEGIN OPENSSH {} KEY-----\nabc\n", "PRIVATE");
         assert_eq!(find_secret(&key), Some("a private key"));
         for prose in [

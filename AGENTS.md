@@ -1,11 +1,11 @@
 # AGENTS.md
 
-hangar is a Rust CLI that runs AI coding agents in locked-down sandbox
-VMs, the bays, on a pluggable backend (microsandbox by default). A bay's only way out is a named proxy
-(`src/proxy/<kind>.rs`), which holds the real credentials, or, with
-`"proxy": null`, the open internet. User docs: `README.md` (short
-overview), `docs/usage.md`, `docs/configuration.md`,
-`docs/proxy-kinds.md` and `docs/nix.md`.
+hangar is a Rust CLI that runs AI coding agents in locked-down sandbox VMs, the
+bays, on a pluggable backend (microsandbox by default). A bay's only way out is
+a named proxy (`src/proxy/<kind>.rs`), which holds the real credentials, or,
+with `"proxy": null`, the open internet. User docs: `README.md` (short
+overview), `docs/usage.md`, `docs/configuration.md`, `docs/proxy-kinds.md` and
+`docs/nix.md`.
 
 ## Invariants (never break)
 
@@ -25,9 +25,9 @@ overview), `docs/usage.md`, `docs/configuration.md`,
 - Managed proxies run only in their own VM (`hangar-proxy-<name>`),
   with mounts only under their own data folder.
 - One egress: a bay with a proxy is created with
-  `Egress::HostPort(proxy.egress())` and nothing else; direct bays and
-  managed proxies get `Egress::Open`, plus one host port
-  (`OpenAndHostPort`) for a managed proxy whose upstream is local. Remote (non-loopback) proxies are
+  `Egress::HostPort(proxy.egress())` and nothing else; direct bays and managed
+  proxies get `Egress::Open`, plus one host port (`OpenAndHostPort`) for a
+  managed proxy whose upstream is local. Remote (non-loopback) proxies are
   refused until the egress spec supports them.
 - An existing VM whose record (`bays/<name>/vm`, `proxies/<name>/vm`)
   doesn't match is recreated, never used. `up` prints why. A VM-level
@@ -36,6 +36,10 @@ overview), `docs/usage.md`, `docs/configuration.md`,
 - Kept across a recreate: the bay's home, its package cache and its data
   volume (unless `disk` changed). Nothing else.
 - Every bay gets placeholders only: `env` refuses real-looking values.
+- Nothing an agent does may run on the host: a bay's only ways out are
+  its proxy and an explicit `hangar cp`. A writable mount is refused
+  unless the config marks it `"unsafe": true`, and `up` warns about it
+  every time.
 - Mount and copy safety rules (`mounts.rs`, `files.rs`) apply to the path
   as written and to every resolved symlink target. Writable mounts never
   point at host config (dot dirs, `~/Library`, outside home). No mount or

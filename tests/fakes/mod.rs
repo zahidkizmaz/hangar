@@ -10,14 +10,11 @@ use std::process::{Command, Output, Stdio};
 
 const FAKE_MSB: &str = include_str!("msb.sh");
 const FAKE_KEYCHAIN: &str = include_str!("keychain.sh");
-// Only a debug hangar takes the fake keychain: a release build would call
-// the real one, so the CLI tests don't even compile there.
 const _: () = assert!(
     cfg!(debug_assertions),
     "the CLI tests need a debug build (the fake keychain)"
 );
 
-/// One isolated machine: HOME, the fakes' files and bin.
 pub struct Machine {
     pub home: PathBuf,
     pub fake: PathBuf,
@@ -46,26 +43,22 @@ impl Machine {
         self.fake.join("keychain").join(account.replace('/', "%"))
     }
 
-    /// Puts `token` in the fake keychain as `account`.
     pub fn keychain_set(&self, account: &str, token: &str) {
         fs::create_dir_all(self.fake.join("keychain")).unwrap();
         fs::write(self.keychain_file(account), format!("{token}\n")).unwrap();
     }
 
-    /// The fake keychain's `account`, without its line end.
     pub fn keychain_get(&self, account: &str) -> Option<String> {
         let text = fs::read_to_string(self.keychain_file(account)).ok()?;
         Some(text.trim_end_matches('\n').to_string())
     }
 
-    /// An executable in the machine's bin, first on PATH.
     pub fn script(&self, name: &str, body: &str) {
         let path = self.home.join("bin").join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Makes the fake msb fail at `what` with `why` (see msb.sh).
     pub fn fail(&self, what: &str, why: &str) {
         fs::write(self.fake.join(format!("fail-{what}")), why).unwrap();
     }
@@ -78,14 +71,10 @@ impl Machine {
         fs::read_to_string(self.fake.join(name)).unwrap_or_default()
     }
 
-    /// Runs hangar with a clean environment: only HOME, PATH (machine bin
-    /// first), the fakes' and coverage variables, the fake keychain under
-    /// a test-only service name, plus `env`.
     pub fn hangar(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         self.command(args, env).output().unwrap()
     }
 
-    /// Like `hangar`, with `input` on stdin.
     pub fn hangar_with_stdin(&self, args: &[&str], input: &str) -> Output {
         let mut child = self
             .command(args, &[])
@@ -115,7 +104,6 @@ impl Machine {
             .env("HANGAR_KEYCHAIN_SERVICE", "hangar-test")
             .env("HANGAR_TEST_KEYCHAIN_TOOL", self.home.join("bin/keychain"))
             .envs(env.iter().copied());
-        // Lets `cargo llvm-cov` count the binary's runs.
         if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }
@@ -133,8 +121,6 @@ fn tools_path(fakes: PathBuf) -> OsString {
     std::env::join_paths(std::iter::once(fakes).chain(tools)).unwrap()
 }
 
-/// Stdout, with a change table (`up`, `down`, `rm`, ...) read back into
-/// one `name: result (details)` line per change, which the tests compare.
 pub fn stdout(output: &Output) -> String {
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.starts_with("NAME")
@@ -160,14 +146,11 @@ fn change_lines(table: &str) -> String {
     let mut out = String::new();
     for line in lines.filter(|line| !line.starts_with(' ')) {
         let name = column(line, 0, at("TYPE").unwrap());
-        // ps-style rows hold the whole result; the plain change table
-        // splits it into RESULT and DETAILS.
         let entry = match at("DETAILS") {
             None => column(line, result, usize::MAX),
             Some(details) => {
                 let word = column(line, result, details);
-                let end = at("ADDRESS").unwrap_or(usize::MAX);
-                let what = column(line, details, end);
+                let what = column(line, details, usize::MAX);
                 match (word.as_str(), what.is_empty()) {
                     (_, true) => word,
                     ("failed", false) => format!("failed: {what}"),

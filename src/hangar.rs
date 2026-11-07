@@ -17,20 +17,16 @@ use crate::keychain::{Keychain, OsKeychain};
 use crate::lifecycle::Resource;
 use crate::mounts;
 use crate::proxy::{self, Proxy, Secrets, Spec};
-use crate::sandbox::{Egress, Msb, Sandbox, bay_vm};
+use crate::sandbox::{Msb, Sandbox, bay_vm};
 use crate::state::StateDir;
 
 pub(crate) struct Hangar {
     pub(crate) settings: Settings,
     pub(crate) state: StateDir,
-    /// `$XDG_CACHE_HOME/hangar`: every bay's package cache is under it.
     pub(crate) cache_root: PathBuf,
-    /// `$XDG_STATE_HOME/hangar`: the log and the lock.
     pub(crate) state_root: PathBuf,
-    /// The user's `$HOME`, which the mount rules protect.
     pub(crate) host_home: PathBuf,
     pub(crate) sandbox: Rc<dyn Sandbox>,
-    /// Where the proxies' tokens live.
     pub(crate) keychain: Rc<dyn Keychain>,
     pub(crate) proxies: BTreeMap<String, Box<dyn Proxy>>,
 }
@@ -50,7 +46,6 @@ impl Hangar {
             config::resolve(config::defaults()?, config).context(&invalid)?;
         let sandbox = sandbox(&settings.sandbox_backend).context(&invalid)?;
         let state = StateDir::new(dirs::hangar_dir(Base::Data, &env_var)?);
-        // The mount rules resolve it, so it must exist before any `up`.
         mounts::create(state.root()).context(state.root().display())?;
         let cache_root = dirs::hangar_dir(Base::Cache, &env_var)?;
         check_disjoint(state.root(), &cache_root)?;
@@ -61,6 +56,7 @@ impl Hangar {
             .context(&invalid)?;
         check_ports(&settings, &proxies).context(&invalid)?;
         check_bay_tokens(&settings, &proxies).context(&invalid)?;
+        check_upstreams(&settings, &proxies).context(&invalid)?;
         Ok(Self {
             settings,
             state,
@@ -73,7 +69,6 @@ impl Hangar {
         })
     }
 
-    /// The tokens of proxy `name`, as its config says to find them.
     pub(crate) fn secrets(&self, name: &str) -> Result<Secrets> {
         let entry = self
             .settings
@@ -101,7 +96,6 @@ impl Hangar {
             .collect()
     }
 
-    /// The bay's proxy and its config name; none for a direct bay.
     pub(crate) fn proxy_of(
         &self,
         bay: &BaySettings,
@@ -123,9 +117,6 @@ impl Hangar {
         }
     }
 
-    /// Bays and proxies with a folder in the data dir but no config entry.
-    /// The sandbox can't list VMs, so this is the only way to find them;
-    /// folders whose names aren't valid names aren't hangar's.
     pub(crate) fn leftovers(&self) -> Vec<(Resource, String)> {
         let bays = folders(&self.state.bays())
             .into_iter()
@@ -139,7 +130,6 @@ impl Hangar {
     }
 }
 
-/// The sorted names of the valid-named folders in `dir`.
 fn folders(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .into_iter()
@@ -176,9 +166,38 @@ pub(crate) fn build_proxies(
         .collect()
 }
 
+/// A managed proxy's upstream on this machine may be a bay's port only when
+/// that bay has no proxy: a bay behind a proxy runs agents, and the proxy
+/// hands its upstream the proxy's own token.
+fn check_upstreams(
+    settings: &Settings,
+    proxies: &BTreeMap<String, Box<dyn Proxy>>,
+) -> Result<()> {
+    for (name, proxy) in proxies {
+        let Some(port) = proxy.managed().and_then(|vm| vm.vm().host_port)
+        else {
+            continue;
+        };
+        let serving = settings.bays.iter().filter(|bay| {
+            bay.ports.iter().any(|published| published.host == port)
+        });
+        for bay in serving {
+            if let Some(behind) = &bay.proxy {
+                bail!(
+                    "proxies.{name}: port {port}, its upstream, is bay {}'s, \
+                     which goes through proxy {behind}; the server's bay \
+                     needs \"proxy\": null",
+                    bay.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A proxy gives a bay a token of its own only when the bay goes through
 /// it: a misspelled or moved bay would otherwise get the shared one.
-pub(crate) fn check_bay_tokens(
+fn check_bay_tokens(
     settings: &Settings,
     proxies: &BTreeMap<String, Box<dyn Proxy>>,
 ) -> Result<()> {
@@ -195,18 +214,12 @@ pub(crate) fn check_bay_tokens(
     Ok(())
 }
 
-/// No two things take the same host port: proxies (where they listen or
-/// publish) and bays. Only external proxies may share one, e.g. two
-/// vaults on one Agent Vault server.
-pub(crate) fn check_ports(
+fn check_ports(
     settings: &Settings,
     proxies: &BTreeMap<String, Box<dyn Proxy>>,
 ) -> Result<()> {
     let proxies = proxies.iter().flat_map(|(name, proxy)| {
-        let egress = match proxy.egress() {
-            Egress::HostPort(port) => Some(port),
-            Egress::Open | Egress::OpenAndHostPort(_) => None,
-        };
+        let egress = proxy.egress().host_port();
         let published: Vec<u16> = proxy
             .managed()
             .map(|managed| managed.vm().publish)
@@ -314,6 +327,34 @@ mod tests {
     const MANAGED_AT_3100: &str = r#"{"proxies": {"p":
         {"kind": "fake", "run": "managed", "managed": true, "port": 3100}},
         "bays": [{"name": "work", "proxy": "p", "apps": ["paperclip"]}]}"#;
+
+    #[test]
+    fn a_proxys_local_upstream_must_be_a_bay_without_a_proxy() {
+        use super::check_upstreams;
+        let config = |server_proxy: &str| {
+            format!(
+                r#"{{"proxies": {{"p": {{"kind": "fake", "run": "managed",
+                    "managed": true, "port": 3100, "upstream": 9000}}}},
+                    "apps": {{"api": {{"run": "serve",
+                        "ports": [{{"name": "api", "vm": 9000,
+                                   "purpose": "API"}}]}}}},
+                    "bays": [{{"name": "srv", "proxy": {server_proxy},
+                               "apps": ["api"]}}]}}"#
+            )
+        };
+        let check = |server_proxy: &str| {
+            let config = config(server_proxy);
+            let hangar =
+                hangar_with(&config, &scratch_dir("upstream-check"), settled());
+            check_upstreams(&hangar.settings, &hangar.proxies)
+        };
+        assert!(check("null").is_ok());
+        assert_eq!(
+            check(r#""p""#).unwrap_err().to_string(),
+            "proxies.p: port 9000, its upstream, is bay srv's, which goes \
+             through proxy p; the server's bay needs \"proxy\": null"
+        );
+    }
 
     #[test]
     fn a_bays_own_token_needs_that_bay_behind_the_proxy() {

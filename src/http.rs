@@ -40,14 +40,12 @@ fn run(agent: &Agent, url: &str) -> std::result::Result<Response, ureq::Error> {
     })
 }
 
-/// A GET to a service on this machine, for probes like `/health`.
 pub(crate) fn get(port: u16, path: &str) -> Result<Response> {
     log::trace!("GET 127.0.0.1:{port}{path}");
     let url = format!("http://127.0.0.1:{port}{path}");
     run(&agent(Duration::from_secs(2)), &url).context(url)
 }
 
-/// The host and port of a plain-http URL without userinfo or a bare path.
 pub(crate) fn http_authority(url: &str) -> Option<(String, Option<u16>)> {
     let uri: http::Uri = url.parse().ok()?;
     let authority = uri.authority()?;
@@ -61,7 +59,6 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost")
 }
 
-/// A GET for a CA: https, or http to this machine.
 pub(crate) fn fetch(url: &str, timeout: Duration) -> Result<Response> {
     let loopback =
         http_authority(url).is_some_and(|(host, _)| is_loopback_host(&host));

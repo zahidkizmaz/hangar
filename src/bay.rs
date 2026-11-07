@@ -17,7 +17,7 @@ use crate::mounts::{self, Resolved, Roots};
 use crate::proxy::ca::sha256_hex;
 use crate::proxy::{self, Access, LoginCheck, Proxy};
 use crate::sandbox::{
-    BoxState, Egress, Mount, MountMode, Sandbox, VmSpec, Volume, data_volume,
+    Egress, Mount, MountMode, Sandbox, VmSpec, Volume, data_volume,
 };
 use crate::secret::Secret;
 use crate::state::{BayDir, fnv, write_private};
@@ -25,7 +25,6 @@ use crate::vm_record::VmRecord;
 use crate::{files, packages, process};
 use log::{info, warn};
 
-/// One bay, as its steps see it; built by `Hangar::bay` without I/O.
 pub(crate) struct Bay<'a> {
     pub(crate) name: &'a str,
     pub(crate) vm: String,
@@ -35,24 +34,17 @@ pub(crate) struct Bay<'a> {
 }
 
 impl Bay<'_> {
-    /// The bay's own home and package cache folders.
     pub(crate) fn own_mounts(&self) -> (Option<String>, Option<String>) {
         let shown = |path: &Path| Some(path.display().to_string());
         (shown(&self.dir.home()), shown(&self.cache))
     }
 }
 
-/// The home of `PILOT`, the bay user; `~` in `files` and `mounts`.
 pub(crate) const VM_HOME: &str = "/home/pilot";
-/// Who runs the apps, their setup, shells and copied files in a bay; the
-/// image provides it (`nix/bay/configuration.nix`).
 pub(crate) const PILOT: &str = "pilot";
 const PILOT_ID: u32 = 1000;
-/// Who runs hangar's own steps in a bay.
 pub(crate) const ROOT: &str = "root";
-/// The image's systemd, which the VM boots into.
 const INIT: &str = "/sbin/init";
-/// Pilot's data, Docker's included, on the bay's data volume.
 const PILOT_DATA: &str = "/var/lib/pilot";
 /// hangar's own records inside the VM, on its own disk next to `/nix`:
 /// never in the home, which `home` keeps across new VMs.
@@ -60,8 +52,6 @@ pub(crate) const VM_STATE: &str = "/var/lib/hangar";
 /// The nix profile `packages` go to, on the VM disk with the store it
 /// points into, so a new VM never inherits a dangling one.
 pub(crate) const PROFILE: &str = "/nix/var/nix/profiles/hangar";
-/// Where `cache` is mounted: a `file://` binary cache of installed
-/// packages, so a new VM gets them from the host instead of the internet.
 pub(crate) const VM_CACHE: &str = "/var/cache/hangar";
 
 pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
@@ -74,17 +64,26 @@ pub(crate) fn roots(hangar: &Hangar, bay: &Bay) -> Result<Roots> {
     )
 }
 
-/// Brings the bay in line with its config and says what that changed.
 pub(crate) fn up(hangar: &Hangar, bay: &Bay) -> Outcome {
+    for (vm, spec) in &bay.settings.mounts {
+        if spec.mode == mounts::Mode::Rw {
+            log::warn!(
+                "bay {}: {} is writable at {vm}: what the agent writes there \
+                 can run on this machine",
+                bay.name,
+                spec.host
+            );
+        }
+    }
     reconcile(hangar, bay).unwrap_or_else(Outcome::Failed)
 }
 
 pub(crate) fn down(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
-    if hangar.sandbox.state(&bay.vm)? != BoxState::Running {
-        return Ok(Outcome::Unchanged);
-    }
-    hangar.sandbox.stop(&bay.vm)?;
-    Ok(Outcome::Stopped)
+    Ok(if hangar.sandbox.stop_if_running(&bay.vm)? {
+        Outcome::Stopped
+    } else {
+        Outcome::Unchanged
+    })
 }
 
 fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
@@ -148,7 +147,7 @@ fn listed(label: &str, items: &[String]) -> Option<String> {
 /// Fails the bay when its proxy refuses its login, with the proxy's own
 /// words: a bad token would otherwise surface only as a 407 in the bay.
 fn check_login(name: &str, proxy: &dyn Proxy, bay: &str) -> Result<()> {
-    let Egress::HostPort(port) = proxy.egress() else {
+    let Some(port) = proxy.egress().host_port() else {
         return Ok(());
     };
     let Some(login) = proxy.login(bay)? else {
@@ -157,16 +156,7 @@ fn check_login(name: &str, proxy: &dyn Proxy, bay: &str) -> Result<()> {
     let LoginCheck::Refused(why) = proxy::check_login(port, &login) else {
         return Ok(());
     };
-    let key = proxy
-        .bay_tokens()
-        .into_iter()
-        .find(|(owner, _)| owner == bay)
-        .map(|(_, key)| key)
-        .or_else(|| {
-            let slot = proxy.secrets().iter().find(|slot| slot.for_bays)?;
-            Some(slot.key.to_string())
-        });
-    let command = match key {
+    let command = match proxy::login_key(proxy, bay) {
         Some(key) => format!("hangar secret set {name} {key}"),
         None => format!("hangar secret set {name}"),
     };
@@ -194,8 +184,6 @@ fn resolve_mounts(hangar: &Hangar, bay: &Bay) -> Result<Vec<Resolved>> {
     mounts::resolve(&all, &roots(hangar, bay)?)
 }
 
-/// The VM's outcome when it was created, recreated or started; `None`
-/// when the running one is used.
 fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
     let resolved = resolve_mounts(hangar, bay)?;
     let image = bay.settings.image_ref();
@@ -231,7 +219,6 @@ fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
     }
 }
 
-/// Sorted, so the same config always records the same VM.
 pub(crate) fn wanted_record(
     bay: &Bay,
     image: &str,
@@ -260,8 +247,6 @@ pub(crate) fn wanted_record(
     }
 }
 
-/// The home, the package cache and (unless `disk` changed) the data
-/// volume outlive the VM.
 fn recreate(
     hangar: &Hangar,
     bay: &Bay,
@@ -270,20 +255,14 @@ fn recreate(
     disk: bool,
 ) -> Result<()> {
     let sandbox = hangar.sandbox.as_ref();
-    // Trap: remove is a hard kill that loses unsynced writes.
-    if sandbox.state(&bay.vm)? == BoxState::Running {
-        sandbox.stop(&bay.vm)?;
-    }
     remove_if_present(&bay.dir.vm())?;
-    sandbox.remove(&bay.vm)?;
+    sandbox.discard(&bay.vm)?;
     if disk {
         sandbox.remove_volume(&data_volume(bay.name))?;
     }
     create(hangar, bay, wanted, resolved)
 }
 
-/// A VM that fails to create is left without a record, so the next `up`
-/// recreates it.
 fn create(
     hangar: &Hangar,
     bay: &Bay,
@@ -329,7 +308,6 @@ fn create(
         mounts: &mounts,
         env: &[],
     })?;
-    // A new VM has none of the files the record says were copied.
     remove_if_present(&bay.dir.copies())?;
     write_private(&bay.dir.vm(), wanted.render().as_bytes())
 }
@@ -343,7 +321,6 @@ pub(crate) fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// systemd's state once it can tell.
 const BOOTED: &str = "/run/current-system/sw/bin/systemctl is-system-running --wait \
      2>/dev/null || :";
 const WAIT_PAUSE: Duration = Duration::from_millis(500);
@@ -352,14 +329,10 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Probe {
     Done,
-    /// Not yet, with what it last said.
     Pending(String),
-    /// Waiting won't help.
     Failed(String),
 }
 
-/// Probes every `pause` until done, failed or `timeout` passed; the last
-/// answer.
 pub(crate) fn wait(
     timeout: Duration,
     pause: Duration,
@@ -376,9 +349,6 @@ pub(crate) fn wait(
     }
 }
 
-/// Root's exec fails until activation wrote passwd, and systemd says
-/// `offline` until it's up; `degraded` is booted too. Shutting down or
-/// stuck in maintenance, it never boots.
 fn boot_state(output: Result<Vec<u8>>) -> Probe {
     match output {
         Err(error) => Probe::Pending(error.to_string()),
@@ -392,7 +362,6 @@ fn boot_state(output: Result<Vec<u8>>) -> Probe {
     }
 }
 
-/// The sandbox starts a VM before its systemd is up.
 fn wait_booted(
     sandbox: &dyn Sandbox,
     bay: &Bay,
@@ -412,8 +381,6 @@ fn wait_booted(
     }
 }
 
-/// Ready once a restart the proxy env triggered is done and dockerd
-/// answers: its unit is active before its socket is.
 const DOCKER_READY: &str = r#"jobs=$(systemctl list-jobs --no-legend hangar-proxy-env.service)
 [ -z "$jobs" ] || { echo "restarting the daemons: $jobs" >&2; exit 1; }
 DOCKER_HOST=unix:///run/user/1000/docker.sock exec docker info >/dev/null"#;
@@ -442,15 +409,10 @@ fn wait_for_docker(
     }
 }
 
-/// The bay's env, `KEY='value'` lines every login shell sources with
-/// `set -a` (`nix/bay/configuration.nix`), like `PROXY_ENV_FILE`.
-pub(crate) const ENV_FILE: &str = "/etc/hangar/bay.env";
-/// The daemons' proxy and CA variables, a systemd `EnvironmentFile`.
+const ENV_FILE: &str = "/etc/hangar/bay.env";
 pub(crate) const PROXY_ENV_FILE: &str = "/etc/hangar/proxy.env";
 
-/// A file root keeps in a bay, written from what `fill` prints.
 struct VmFile {
-    /// The exec's `$0`.
     name: &'static str,
     path: &'static str,
     owner: &'static str,
@@ -466,7 +428,6 @@ const BAY_ENV: VmFile = VmFile {
     fill: "cat",
 };
 
-/// Pilot's apps read it too, so pilot's group may.
 const PROXY_ENV: VmFile = VmFile {
     name: "hangar-proxy-env",
     path: PROXY_ENV_FILE,
@@ -475,8 +436,6 @@ const PROXY_ENV: VmFile = VmFile {
     fill: "cat",
 };
 
-/// The image's CAs and the proxy's, which comes on stdin
-/// (`nix/bay/configuration.nix`).
 const CA_BUNDLE: VmFile = VmFile {
     name: "hangar-ca",
     path: "/var/lib/hangar/ca-bundle.crt",
@@ -497,7 +456,6 @@ else mv "$1.tmp" "$1" && echo changed; fi"#
     )
 }
 
-/// True when the file changed.
 fn replace(
     sandbox: &dyn Sandbox,
     vm: &str,
@@ -514,8 +472,6 @@ fn replace(
         .ends_with("changed"))
 }
 
-/// The CA bundle first: a new proxy env restarts the daemons that read it,
-/// and the env's CA hash makes a new CA a new env.
 fn apply_proxy(
     hangar: &Hangar,
     bay: &Bay,
@@ -533,8 +489,6 @@ fn apply_proxy(
     })
 }
 
-/// The proxy for every client, and the CA bundle under every name a tool
-/// looks for; a direct bay gets only the bundle.
 fn proxy_env(kind: Option<&str>, access: &Access) -> Secret {
     let mut env = BTreeMap::new();
     if let Some(url) = &access.url {
@@ -563,8 +517,7 @@ fn proxy_env(kind: Option<&str>, access: &Access) -> Secret {
     ))
 }
 
-/// True when the file changed.
-pub(crate) fn write_env(hangar: &Hangar, bay: &Bay) -> Result<bool> {
+fn write_env(hangar: &Hangar, bay: &Bay) -> Result<bool> {
     let rendered = render_env(&bay.settings.env);
     replace(
         hangar.sandbox.as_ref(),
@@ -608,14 +561,10 @@ const LIST_RUNS: &str =
 const STOP_RUN: &str = r#"systemctl --user stop "$1""#;
 const RUN_PREFIX: &str = "hangar-run-";
 
-/// A `run` entry's transient unit in pilot's user manager: stopping it
-/// stops every process the entry started, and its output is its journal.
 pub(crate) fn run_unit(name: &str) -> String {
     format!("{RUN_PREFIX}{name}.service")
 }
 
-/// Runs an app's setup `check` in a login shell (PATH and app env apply);
-/// only its exit status counts.
 const SETUP_CHECK: &str =
     r#"if sh -lc "$1" >/dev/null 2>&1; then echo done; else echo needed; fi"#;
 
@@ -637,9 +586,6 @@ pub(crate) fn setup_done(
     }
 }
 
-/// The enabled apps whose setup check fails, each with a warning. No
-/// record is kept: the check is the truth, so a wiped home asks for setup
-/// again.
 fn check_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
     let names = needing_setup(hangar, bay)?;
     for name in &names {
@@ -660,8 +606,6 @@ pub(crate) fn needing_setup(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Starts what isn't running, restarts what runs with other inputs and
-/// stops what no app lists; apps that need setup are left alone.
 fn sync_apps(
     hangar: &Hangar,
     bay: &Bay,
@@ -697,7 +641,6 @@ fn unlisted_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The names of the entries whose unit is running.
 pub(crate) fn active_runs(
     hangar: &Hangar,
     bay: &Bay,
@@ -709,8 +652,6 @@ pub(crate) fn active_runs(
         .collect())
 }
 
-/// Every entry's unit systemd knows (a failed one too) with its ACTIVE
-/// column.
 fn listed_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<(String, String)>> {
     let units = user_units(hangar, bay, LIST_RUNS, &["hangar-runs"])?;
     Ok(units
@@ -725,8 +666,6 @@ fn listed_runs(hangar: &Hangar, bay: &Bay) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// The host's half of the unit's description: a hash of the entry's
-/// command, `bay.env` and the copied config files, none of them secret.
 fn description(bay: &Bay, name: &str, command: &str) -> String {
     let env = render_env(&bay.settings.env);
     let copies = files::record_text(bay);
@@ -734,7 +673,6 @@ fn description(bay: &Bay, name: &str, command: &str) -> String {
     format!("hangar run {name} {}", fnv(inputs.into_bytes()))
 }
 
-/// The one place an entry is (re)started: what `START_RUN` printed.
 fn launch(
     hangar: &Hangar,
     bay: &Bay,
@@ -754,7 +692,6 @@ fn launch(
     user_units(hangar, bay, START_RUN, &args)
 }
 
-/// Runs `script` against pilot's user manager; its trimmed stdout.
 fn user_units(
     hangar: &Hangar,
     bay: &Bay,
@@ -768,7 +705,6 @@ fn user_units(
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
-/// A Nix-built image is loaded into the sandbox once per image tag.
 fn ensure_image(hangar: &Hangar, bay: &Bay, image: &str) -> Result<()> {
     let Some(loader) = &bay.settings.image_loader else {
         return Ok(());
@@ -844,7 +780,6 @@ mod tests {
         String::from_utf8(sandbox.stdins.borrow()[at].clone()).unwrap()
     }
 
-    /// The calls a fresh `up` of `config` makes in a fresh state.
     fn first_up_calls(config: &str) -> Vec<String> {
         let state = scratch_dir("bay-up-argv");
         let sandbox = settled();

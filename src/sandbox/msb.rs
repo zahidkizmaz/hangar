@@ -12,7 +12,6 @@ const HOST_ALIAS: &str = "host.microsandbox.internal";
 pub(crate) struct Msb;
 
 impl Sandbox for Msb {
-    /// msb's status (`Running`, `Stopped`, …), or `missing`.
     fn describe(&self, vm: &str) -> Result<(BoxState, String)> {
         Ok(match status(vm)? {
             None => (BoxState::Missing, "missing".into()),
@@ -114,7 +113,6 @@ impl Sandbox for Msb {
     }
 }
 
-/// `Ok(None)` when the sandbox doesn't exist; an error when msb can't run.
 fn status(vm: &str) -> Result<Option<String>> {
     let mut inspect = process::command("msb");
     inspect.args(["inspect", vm, "--format", "json"]);
@@ -174,7 +172,6 @@ fn exec_args<'a>(
     args
 }
 
-/// The arguments stay separate words: `"$@"` keeps their quoting intact.
 fn shell_args(
     vm: &str,
     user: &str,

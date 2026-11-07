@@ -11,12 +11,12 @@ use crate::error::{Context, Error, Result, bail};
 use crate::hangar::Hangar;
 use crate::lifecycle::{self, Outcome, Plan, step};
 use crate::mounts;
-use crate::sandbox::{BoxState, Mount, MountMode, VmSpec};
+use crate::sandbox::{Mount, MountMode, VmSpec};
 use crate::state::write_private;
 use crate::vm_record::VmRecord;
 
-pub(crate) const PROXY_WAIT: Duration = Duration::from_secs(60);
-pub(crate) const PROXY_PAUSE: Duration = Duration::from_millis(500);
+const PROXY_WAIT: Duration = Duration::from_secs(60);
+const PROXY_PAUSE: Duration = Duration::from_millis(500);
 
 type Mounts = Vec<(PathBuf, String, MountMode)>;
 
@@ -54,13 +54,13 @@ pub(crate) fn down(
     name: &str,
     proxy: &dyn Proxy,
 ) -> Result<Outcome> {
-    let sandbox = hangar.sandbox.as_ref();
-    let vm = proxy_vm(name);
-    if proxy.managed().is_none() || sandbox.state(&vm)? != BoxState::Running {
-        return Ok(Outcome::Unchanged);
-    }
-    sandbox.stop(&vm)?;
-    Ok(Outcome::Stopped)
+    let stopped = proxy.managed().is_some()
+        && hangar.sandbox.stop_if_running(&proxy_vm(name))?;
+    Ok(if stopped {
+        Outcome::Stopped
+    } else {
+        Outcome::Unchanged
+    })
 }
 
 fn reconcile(
@@ -146,8 +146,6 @@ fn resolve_mounts(
         .collect()
 }
 
-/// Sorted, so the same proxy always records the same VM. A changed
-/// entrypoint rides in the fingerprint: it recreates like any other.
 pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
     let mut mounts: Vec<String> = vm
         .mounts
@@ -176,8 +174,6 @@ pub(crate) fn wanted_record(vm: &ManagedVm, fingerprint: &str) -> VmRecord {
     }
 }
 
-/// The VM's outcome when it was created, recreated or started; `None`
-/// when the running one is used.
 fn ensure_vm(
     hangar: &Hangar,
     name: &str,
@@ -195,11 +191,7 @@ fn ensure_vm(
         }
         Plan::Recreate(reasons) => {
             remove_if_present(&record)?;
-            // Trap: remove is a hard kill that loses unsynced writes.
-            if sandbox.state(&vm_name)? == BoxState::Running {
-                sandbox.stop(&vm_name)?;
-            }
-            sandbox.remove(&vm_name)?;
+            sandbox.discard(&vm_name)?;
             if reasons.contains(&"fingerprint") {
                 empty_mounts(name, vm)?;
             }
@@ -227,8 +219,6 @@ fn empty_mounts(name: &str, vm: &ManagedVm) -> Result<()> {
     Ok(())
 }
 
-/// A VM that fails to create is left without a record, so the next `up`
-/// recreates it.
 fn create(
     hangar: &Hangar,
     name: &str,
@@ -265,7 +255,6 @@ fn create(
     write_private(&hangar.state.proxy(name).vm(), wanted.render().as_bytes())
 }
 
-/// A fresh VM isn't exec-ready for a few seconds.
 fn wait_exec(
     hangar: &Hangar,
     name: &str,

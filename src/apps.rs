@@ -10,7 +10,6 @@ use crate::json::{self, Json};
 use crate::sandbox::PublishedPort;
 use miniserde::json::Object;
 
-/// The built-in definitions; `apps` replaces one whole.
 const BUILTINS: [(&str, &str); 3] = [
     (
         "claude-code",
@@ -30,7 +29,6 @@ pub(crate) struct AppDef {
     ports: Vec<PublishedPort>,
 }
 
-/// An app's one-time interactive step, and the check that says it's done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Setup {
     pub(crate) command: String,
@@ -43,8 +41,6 @@ pub(crate) struct App {
     pub(crate) setup: Option<Setup>,
 }
 
-/// `apps`, every entry checked, enabled or not, so a typo fails
-/// loudly; the built-ins are read when a bay names them.
 pub(crate) struct Catalog {
     defined: BTreeMap<String, AppDef>,
 }
@@ -239,8 +235,6 @@ fn bay_ports(
     Ok(ports)
 }
 
-/// Two of a bay's apps may not disagree on a variable; apps in different
-/// bays may.
 fn app_env(apps: &[AppDef]) -> Result<BTreeMap<String, String>> {
     let mut env: BTreeMap<String, (&str, &str)> = BTreeMap::new();
     for app in apps {
@@ -350,7 +344,6 @@ mod tests {
             error(r#"{"apps": {"Web": {}}}"#),
             "apps.Web: names are lowercase, digits and -"
         );
-        // Checked even when not enabled.
         assert_eq!(
             error(r#"{"apps": {"web": {"files": {}}}}"#),
             "app web: files: unknown setting"

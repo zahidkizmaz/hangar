@@ -47,7 +47,6 @@ pub(crate) struct Change {
     pub(crate) outcome: Outcome,
 }
 
-/// Runs one step of `up`; its error names the resource and the step.
 pub(crate) fn step<T>(
     owner: &str,
     name: &str,
@@ -82,10 +81,7 @@ pub(crate) fn plan(
     }
 }
 
-pub(crate) fn vm_changes(
-    recorded: &VmRecord,
-    wanted: &VmRecord,
-) -> Vec<&'static str> {
+fn vm_changes(recorded: &VmRecord, wanted: &VmRecord) -> Vec<&'static str> {
     [
         ("image", recorded.image != wanted.image),
         ("proxy", recorded.egress != wanted.egress),

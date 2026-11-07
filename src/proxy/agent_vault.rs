@@ -41,9 +41,7 @@ const UI_PORT: u16 = 14321;
 const CPUS: u32 = 1;
 const MEMORY: &str = "512M";
 const DATA: &str = "/data";
-/// The image's user, `agentvault`.
 const USER: (u32, u32) = (65532, 65532);
-/// The image's entrypoint starts the server; a shell keeps the VM idle.
 const ENTRYPOINT: &str = "/bin/sh";
 /// The master password comes on stdin, never argv or env. `$1` is the
 /// UI's address on the host, for the links and OAuth redirects it makes.
@@ -65,17 +63,14 @@ struct AgentVault {
     ca: CaSpec,
     secrets: Secrets,
     vault: String,
-    /// Bays with a vault of their own, and a token only for it.
     bays: BTreeMap<String, String>,
     server: Option<Server>,
 }
 
-/// The keychain key of the token only `bay` logs in with.
 fn own_token(bay: &str) -> String {
     format!("{TOKEN}@{bay}")
 }
 
-/// The server hangar runs: its VM and how to start it.
 struct Server {
     image: String,
     port: u16,
@@ -118,8 +113,6 @@ impl Proxy for AgentVault {
             .collect()
     }
 
-    /// A managed server answers HTTP: a TCP connect alone would reach the
-    /// sandbox's port forwarder even with no server behind it.
     fn health(&self) -> Health {
         let Some(server) = &self.server else {
             return super::tcp_health(self.port);
@@ -199,7 +192,6 @@ fn port_or(spec: &Spec, key: &str, default: u16) -> Result<u16> {
     }
 }
 
-/// Agent Vault's rule for vault names.
 fn check_vault(name: &str, at: &str) -> Result<()> {
     let slug = !name.is_empty()
         && name
@@ -211,7 +203,6 @@ fn check_vault(name: &str, at: &str) -> Result<()> {
     Ok(())
 }
 
-/// `bays`: bay -> vault, each a vault name.
 fn bay_vaults(spec: &Spec) -> Result<BTreeMap<String, String>> {
     let fields = &spec.fields;
     if !fields.map.contains_key("bays") {
@@ -227,9 +218,6 @@ fn bay_vaults(spec: &Spec) -> Result<BTreeMap<String, String>> {
     Ok(vaults)
 }
 
-/// Both: `vault` (default `default`) and `bays`. Managed: `hostPort`
-/// (default 14322), `uiPort` (14321) and `image`; external: `ca`
-/// (required).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
     let vault = || -> Result<String> {
@@ -284,13 +272,12 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::config::Fields;
-    use crate::json;
+
     use crate::keychain::fake::FakeKeychain;
     use crate::proxy::{Health, Location};
     use crate::sandbox::Egress;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::serve_each;
+    use crate::testing::{build_proxy, serve_each};
 
     const CA: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/testdata/ca.pem");
@@ -300,16 +287,8 @@ mod tests {
         location: Location,
         keychain: Rc<FakeKeychain>,
     ) -> Result<Box<dyn Proxy>> {
-        let value = json::parse(fields).unwrap();
-        let fields = Fields::new(&value, "proxies.av")?;
-        let spec = Spec {
-            secrets: Secrets::new("av", keychain, &fields)?,
-            fields,
-            location,
-            home: Path::new("/home/u"),
-            data: PathBuf::from("/data/av"),
-        };
-        super::super::build(&spec)
+        let data = Path::new("/data/av");
+        build_proxy(super::super::build, "av", fields, location, data, keychain)
     }
 
     fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {

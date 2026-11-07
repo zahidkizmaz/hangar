@@ -15,7 +15,6 @@ pub(crate) struct FakeProxy {
     pub(crate) up: bool,
     pub(crate) managed: Option<FakeManaged>,
     pub(crate) slots: &'static [Slot],
-    /// Bays with a token of their own (`token@<bay>`).
     pub(crate) own: Vec<String>,
 }
 
@@ -25,14 +24,12 @@ pub(crate) struct FakeManaged {
     pub(crate) starts: Cell<u32>,
 }
 
-/// What a fake proxy with `"token": true` takes.
 pub(crate) const TOKEN: &[Slot] = &[Slot {
     key: "token",
     about: "the fake token",
     for_bays: false,
 }];
 
-/// With `"bayToken": true` too: one more, only its bays need.
 const WITH_BAY_TOKEN: &[Slot] = &[
     TOKEN[0],
     Slot {
@@ -139,9 +136,6 @@ impl Managed for FakeManaged {
     }
 }
 
-/// Reads `port` (default 3128), `ca` (PEM text), `login` (`user:password`),
-/// `managed` and `token` (flags: the latter makes it take a `token`
-/// secret).
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
     super::only(

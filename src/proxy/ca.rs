@@ -89,7 +89,6 @@ fn der(pem: &[u8]) -> Result<CertificateDer<'static>> {
         .context("CA isn't a PEM certificate")
 }
 
-/// Lowercase hex of the SHA-256 of the certificate's DER.
 pub(crate) fn fingerprint(pem: &[u8]) -> Result<String> {
     Ok(sha256_hex(der(pem)?.as_ref()))
 }
@@ -107,7 +106,6 @@ fn normalized(pin: &str) -> String {
     hex.replace(':', "").to_lowercase()
 }
 
-/// Everything in the PEM reaches a bay, so the pin must cover all of it.
 fn only_one_certificate(pem: &[u8]) -> Result<()> {
     let blocks = String::from_utf8_lossy(pem).matches("-----BEGIN ").count();
     let certificates = CertificateDer::pem_slice_iter(pem).count();

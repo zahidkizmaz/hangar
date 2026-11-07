@@ -12,13 +12,10 @@ use crate::keychain::{Keychain, STORE, check_token};
 use crate::process;
 use crate::secret::{Secret, trim_line_end};
 
-/// One token a kind needs, and what to tell the user it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Slot {
     pub(crate) key: &'static str,
     pub(crate) about: &'static str,
-    /// Only the bays use it, so `up` asks for it when one of them comes
-    /// up; the proxy starts without it.
     pub(crate) for_bays: bool,
 }
 
@@ -30,7 +27,6 @@ pub(crate) struct Secrets {
 }
 
 impl Secrets {
-    /// Reads the optional `secrets` setting of proxy `proxy`.
     pub(crate) fn new(
         proxy: &str,
         keychain: Rc<dyn Keychain>,
@@ -56,8 +52,6 @@ impl Secrets {
         })
     }
 
-    /// Refuses a `secrets` entry for a token the kind doesn't take: one of
-    /// `slots`, or a bay's own (`extra`).
     pub(crate) fn check(
         &self,
         slots: &[Slot],
@@ -116,13 +110,11 @@ impl Secrets {
         Ok(Secret::new(token.to_string()))
     }
 
-    /// Whether `key` is there: from a command, or in the keychain.
     pub(crate) fn has(&self, key: &str) -> Result<bool> {
         Ok(self.commands.contains_key(key)
             || self.keychain.lookup(&self.account(key))?.is_some())
     }
 
-    /// Whether `key` comes from a command, so `secret set` leaves it.
     pub(crate) fn is_command(&self, key: &str) -> bool {
         self.commands.contains_key(key)
     }

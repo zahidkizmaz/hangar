@@ -37,9 +37,16 @@ let
         ];
         default = "ro";
         description = ''
-          `ro`: mounted read-only. `rw`: mounted writable, only for a
-          dedicated directory in your home. `copy`: copied in on every
-          `hangar up`, never secrets.
+          `ro`: mounted read-only. `rw`: mounted writable; needs `unsafe`.
+          `copy`: copied in on every `hangar up`, never secrets.
+        '';
+      };
+      unsafe = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Accept that an `rw` mount lets the agent leave files this machine
+          runs (git hooks and config, .envrc, scripts).
         '';
       };
     };
@@ -111,7 +118,7 @@ let
           example = {
             "~/projects" = {
               host = "~/work/projects";
-              mode = "rw";
+              mode = "ro";
             };
             "~/.claude/CLAUDE.md" = {
               host = "~/dotfiles/claude/CLAUDE.md";
@@ -213,7 +220,9 @@ let
               memory
               disk
               ;
-            mounts = lib.mapAttrs (_: mount: { inherit (mount) host mode; }) config.mounts;
+            mounts = lib.mapAttrs (
+              _: mount: { inherit (mount) host mode; } // lib.optionalAttrs mount.unsafe { unsafe = true; }
+            ) config.mounts;
           }
           // lib.optionalAttrs (config.imagePackage != null) {
             image = "${config.imagePackage.imageName}:${config.imagePackage.imageTag}";

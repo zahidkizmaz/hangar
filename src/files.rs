@@ -32,7 +32,6 @@ struct FileCopy {
     contents: Vec<u8>,
 }
 
-/// VM path -> hash of what hangar last copied there.
 type Record = BTreeMap<String, String>;
 
 /// A VM path from config: absolute or `~/…`, always in pilot's home and
@@ -60,7 +59,6 @@ pub(crate) fn vm_path(raw: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-/// What a copy changed in the VM: paths only, never contents.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Copied {
     pub(crate) copied: Vec<String>,
@@ -69,21 +67,13 @@ pub(crate) struct Copied {
 
 pub(crate) enum Request<'a> {
     Declared,
-    /// `hangar copy SRC [DEST]`: never recorded as managed. DEST defaults
-    /// to SRC's place under the VM user's home.
-    AdHoc {
-        src: &'a str,
-        dest: Option<&'a str>,
-    },
+    AdHoc { src: &'a str, dest: Option<&'a str> },
 }
 
 pub(crate) fn copy_declared(hangar: &Hangar, bay: &Bay) -> Result<Copied> {
     copy(hangar, bay, &Request::Declared)
 }
 
-/// The one way files reach the VM: every caller (`up`, `copy`, `restart`)
-/// goes through the safety check in [`plan`], the pure [`plan_copy`] and
-/// [`apply_copy`].
 pub(crate) fn copy(
     hangar: &Hangar,
     bay: &Bay,
@@ -148,8 +138,6 @@ fn ad_hoc_entry(
     Ok((dest, host.display().to_string()))
 }
 
-/// The record's text: part of a `run` entry's fingerprint, so a
-/// changed config file shows up as a changed input.
 pub(crate) fn record_text(bay: &Bay) -> String {
     fs::read_to_string(bay.dir.copies()).unwrap_or_default()
 }
@@ -164,14 +152,10 @@ pub(crate) fn host_home() -> Result<PathBuf> {
 struct CopyPlan {
     write: Vec<usize>,
     delete: Vec<String>,
-    /// The record before any write; managed writes are added as they land.
     base: Record,
     managed: bool,
 }
 
-/// Declared (`managed`): write what changed, delete managed files whose
-/// entry is gone. Ad hoc: write everything, delete nothing, and forget the
-/// written paths' hashes so a declared entry for the same path wins again.
 fn plan_copy(copies: &[FileCopy], recorded: Record, managed: bool) -> CopyPlan {
     let wanted = |vm: &str| copies.iter().any(|copy| copy.vm == vm);
     let (base, delete): (Record, Record) = if managed {
@@ -194,8 +178,6 @@ fn plan_copy(copies: &[FileCopy], recorded: Record, managed: bool) -> CopyPlan {
     }
 }
 
-/// Deletes, then writes, saving the record after each managed write so a
-/// failure can't lose track of the ones before it.
 fn apply_copy(
     plan: CopyPlan,
     copies: &[FileCopy],
@@ -257,7 +239,6 @@ fn plan(
     Ok(copies)
 }
 
-/// A host path from config: absolute, `~` or `~/…` (the host `$HOME`).
 pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
     let path = match raw.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -271,21 +252,15 @@ pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
 }
 
 struct Walk<'a> {
-    /// The `mounts` key the walk started from, named in its refusals.
     mount: &'a str,
     roots: &'a Roots,
     copies: &'a mut Vec<FileCopy>,
     total: &'a mut u64,
-    /// Every entry visited, directories included: a web of directory
-    /// links can't make the walk exponential.
     entries: usize,
-    /// The canonical directories above the current one: meeting one again
-    /// is a loop, while the same target linked twice is fine.
     visiting: BTreeSet<PathBuf>,
 }
 
 impl Walk<'_> {
-    /// Every symlink is followed and each resolved target checked.
     fn collect(&mut self, link: &Path, vm: &str) -> Result<()> {
         let host = &fs::canonicalize(link).context(link.display())?;
         for path in [host, link] {
@@ -426,7 +401,6 @@ fn write(sandbox: &dyn Sandbox, vm: &str, copy: &FileCopy) -> Result<()> {
         .map(drop)
 }
 
-/// Over the mode and contents.
 fn hash(copy: &FileCopy) -> String {
     fnv(std::iter::once(u8::from(copy.executable))
         .chain(copy.contents.iter().copied()))
@@ -803,7 +777,6 @@ mod tests {
             ["/home/pilot/a", "/home/pilot/b"]
         );
 
-        // Ad hoc: written, but never recorded.
         let plan = plan_copy(&copies, Record::new(), false);
         let (_, written, _, last) = run_plan(plan, &copies, None);
         assert_eq!(written, ["/home/pilot/a", "/home/pilot/b"]);
@@ -833,7 +806,8 @@ mod tests {
     }
 
     const CODE_MOUNT: &str = r#"{"bays": [{"name": "work", "proxy": null,
-        "mounts": {"~/code": {"host": "~/code", "mode": "rw"}}}]}"#;
+        "mounts": {"~/code": {"host": "~/code", "mode": "rw",
+                   "unsafe": true}}}]}"#;
     const CONFIG_COPY: &str = r#"{"bays": [{"name": "work", "proxy": null,
         "mounts": {"~/cfg": {"host": "~/cfg", "mode": "copy"}}}]}"#;
     const NO_MOUNTS: &str = r#"{"bays": [{"name": "work", "proxy": null}]}"#;

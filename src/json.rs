@@ -12,8 +12,6 @@ pub(crate) fn parse(text: &str) -> Result<Json> {
     json::from_str(text).context("invalid JSON")
 }
 
-/// Reads a derived message; unknown keys are ignored, missing `Option`
-/// fields become `None`.
 pub(crate) fn from_str<T: miniserde::Deserialize>(text: &str) -> Result<T> {
     json::from_str(text).context("unexpected JSON")
 }

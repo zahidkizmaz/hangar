@@ -195,29 +195,33 @@ and the data volume; the package cache is always kept.
 `mounts` maps a VM path in `~` to a host path and a mode:
 
 - `ro`: mounted read-only. The bay sees your changes live.
-- `rw`: mounted writable. Only for a dedicated directory in your home.
 - `copy`: copied into the bay on every `up`, one way. See
   [Your config files in the VM](#your-config-files-in-the-vm).
+- `rw`: mounted writable, only with `"unsafe": true`, see below.
 
 ```json
 "mounts": {
   "~/notes": { "host": "~/notes", "mode": "ro" },
-  "~/projects": { "host": "~/work/projects", "mode": "rw" },
   "~/.claude/CLAUDE.md": { "host": "~/dotfiles/claude/CLAUDE.md", "mode": "copy" }
 }
 ```
 
-**A writable mount is the one way an agent can write on your machine.**
-If a host program reads its config from that directory, an agent could
-plant something there that runs outside the sandbox. So `up` refuses,
-before creating anything:
+**A writable mount is the one way an agent can leave files your machine
+runs.** Anywhere in that folder, at any time, it can write a git hook, a
+repo's `core.fsmonitor` (run by your next `git status`), an `.envrc` or a
+script, and they run as you, outside the bay. So `rw` is refused unless
+the mount says `"unsafe": true`, and `up` warns about it every time. To
+work on code, keep the repo in the bay (`~` survives a new VM) and push
+through the proxy; read your files with `ro`.
+
+Every mount is also refused, before anything is created, when it is:
 
 - any mount of your home or a folder above it, of hangar's data or cache
   dir (or a folder holding them), of another bay's folders, or of a
   credentials place (`.ssh/`, `.gnupg/`, `.aws/`, `.kube/`, `.config/gh/`,
   `.docker/config.json` and the names in the next section);
-- a writable mount outside your home, or under a dot directory (`~/.config`,
-  `~/.local`, …) or `~/Library`;
+- writable and outside your home, or under a dot directory
+  (`~/.config`, `~/.local`, …) or `~/Library`;
 - a source that is neither a regular file nor a directory (sockets,
   devices).
 

@@ -15,7 +15,6 @@ use crate::http;
 use crate::sandbox::{Egress, MountMode, Sandbox};
 use crate::secret::Secret;
 
-/// One line, so Renovate can bump it.
 const IMAGE: &str = "infisical/cli:0.45.3@sha256:9624fb475ae8a6d45ef815c7a16331c7b902fc429cfac67c70e94db0c8c3a975";
 const PORT: u16 = 17323;
 const USER: &str = "x-agent-vault";
@@ -24,7 +23,6 @@ const CA_FIELD: &str = "certificate";
 const CPUS: u32 = 1;
 const MEMORY: &str = "512M";
 const DATA: &str = "/data";
-/// The image's entrypoint runs `infisical`; a shell keeps the VM idle.
 const ENTRYPOINT: &str = "/bin/sh";
 const PROXY_TOKEN: &str = "proxy-token";
 const SESSION_TOKEN: &str = "session-token";
@@ -56,7 +54,6 @@ struct Infisical {
     image: String,
     host_port: u16,
     domain: String,
-    /// The port of an Infisical on this machine (a loopback `domain`).
     local_port: Option<u16>,
     secrets: Secrets,
     data: PathBuf,
@@ -148,7 +145,6 @@ impl Managed for Infisical {
     }
 }
 
-/// Reads `domain`, `hostPort` (default 17323) and `image`.
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     let fields = &spec.fields;
     if let Location::External(_) = spec.location {
@@ -174,12 +170,16 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
 }
 
 /// The port of a loopback `domain`, which the proxy's VM reaches on the
-/// host; `None` for any other.
+/// host; `None` for any other, which must be https: the proxy token
+/// travels to it.
 fn local_port(domain: &str) -> Result<Option<u16>> {
     match http::http_authority(domain) {
         Some((host, port)) if http::is_loopback_host(&host) => port
             .context(format!("{domain}: expected http://127.0.0.1:<port>"))
             .map(Some),
+        _ if domain.starts_with("http://") => {
+            bail!("{domain}: use https for an Infisical not on this machine")
+        }
         _ => Ok(None),
     }
 }
@@ -190,13 +190,13 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::config::Fields;
+
     use crate::json;
     use crate::keychain::fake::FakeKeychain;
     use crate::proxy::Location;
     use crate::proxy::managed::wanted_record;
     use crate::sandbox::fake::FakeSandbox;
-    use crate::testing::{scratch_dir, serve_each};
+    use crate::testing::{build_proxy, scratch_dir, serve_each};
 
     const PEM: &str = include_str!("testdata/ca.pem");
 
@@ -236,16 +236,16 @@ mod tests {
         data: &Path,
         keychain: &Rc<FakeKeychain>,
     ) -> Result<Box<dyn Proxy>> {
-        let value = json::parse(fields).unwrap();
-        let fields = Fields::new(&value, "proxies.infi")?;
-        let spec = Spec {
-            secrets: Secrets::new("infi", keychain.clone(), &fields)?,
+        let data = data.join("data");
+        let keychain = keychain.clone();
+        build_proxy(
+            super::super::build,
+            "infi",
             fields,
             location,
-            home: Path::new("/home/u"),
-            data: data.join("data"),
-        };
-        super::super::build(&spec)
+            &data,
+            keychain,
+        )
     }
 
     fn started(proxy: &dyn Proxy) -> FakeSandbox {
@@ -282,6 +282,12 @@ mod tests {
         let remote = r#", "domain": "https://eu.infisical.com""#;
         let proxy = setup.built(remote).unwrap();
         assert_eq!(proxy.managed().unwrap().vm().host_port, None);
+        let plain = r#", "domain": "http://infisical.example.com""#;
+        assert_eq!(
+            setup.built(plain).err().unwrap().to_string(),
+            "proxies.infi.domain: http://infisical.example.com: use https \
+             for an Infisical not on this machine"
+        );
         let portless = r#", "domain": "http://localhost""#;
         let error = setup.built(portless).err().unwrap().to_string();
         assert_eq!(
@@ -445,7 +451,7 @@ mod tests {
 
     #[test]
     fn the_local_infisical_example_comes_up_server_first() {
-        use crate::commands::{Step, plan_up};
+        use crate::commands::{Target, plan_up};
         use crate::testing::{hangar_with, settled};
         let config = include_str!("../../examples/local-infisical/hangar.json");
         let state = scratch_dir("infisical-example");
@@ -454,8 +460,8 @@ mod tests {
             .unwrap()
             .iter()
             .map(|step| match step {
-                Step::Proxy(name, _) => *name,
-                Step::Bay(bay) => bay.name,
+                Target::Proxy(name, _) => *name,
+                Target::Bay(bay) => bay.name,
             })
             .collect();
         assert_eq!(order, ["infisical", "vault", "work"]);

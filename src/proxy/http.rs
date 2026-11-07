@@ -32,7 +32,6 @@ impl Proxy for Http {
     }
 }
 
-/// Reads `ca`, trusted on top of the system's.
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     only(&spec.fields, &["ca"])?;
     let port = loopback_port(external_url(spec, "http")?)?;
@@ -47,11 +46,10 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
-    use crate::config::Fields;
-    use crate::json;
+
     use crate::proxy::{Health, Location};
     use crate::sandbox::Egress;
     use crate::testing::closed_port;
@@ -62,16 +60,11 @@ mod tests {
         "ae1ec4d78197cbd62b970e2e0d7afc3d5d9a66dbd47f3f39cd56f6fe98387a5f";
 
     fn built(fields: &str, location: Location) -> Result<Box<dyn Proxy>> {
-        let value = json::parse(fields).unwrap();
-        let fields = Fields::new(&value, "proxies.p")?;
-        let spec = Spec {
-            secrets: crate::testing::no_secrets(&fields),
-            fields,
-            location,
-            home: Path::new("/home/u"),
-            data: PathBuf::from("/data/p"),
-        };
-        build(&spec)
+        let keychain = std::rc::Rc::default();
+        let data = Path::new("/data/p");
+        crate::testing::build_proxy(
+            build, "p", fields, location, data, keychain,
+        )
     }
 
     fn at(port: u16) -> Box<dyn Proxy> {

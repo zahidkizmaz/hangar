@@ -27,7 +27,7 @@
       "memory": "8G",
       "mounts": {
         "~/notes": { "host": "~/notes", "mode": "ro" },
-        "~/projects": { "host": "~/work/projects", "mode": "rw" },
+        "~/projects": { "host": "~/work/projects", "mode": "rw", "unsafe": true },
         "~/.config/app": { "host": "~/dotfiles/app", "mode": "copy" }
       }
     },

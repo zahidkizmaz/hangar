@@ -45,9 +45,6 @@ pub(crate) trait Proxy {
     fn managed(&self) -> Option<&dyn Managed> {
         None
     }
-    /// The tokens the kind reads from its [`Secrets`].
-    /// Bays with a token of their own, as `(bay, key)`; the others log in
-    /// with the `for_bays` ones.
     fn bay_tokens(&self) -> Vec<(String, String)> {
         Vec::new()
     }
@@ -71,31 +68,22 @@ pub(crate) struct ManagedVm {
     pub(crate) image: String,
     pub(crate) cpus: u32,
     pub(crate) memory: String,
-    /// Published on the host's 127.0.0.1; the first is what bays use.
     pub(crate) publish: Vec<ProxyPort>,
-    /// The `(uid, gid)` its process runs as, so its mounts look owned by
-    /// it; `None` when it runs as root.
     pub(crate) user: Option<(u32, u32)>,
     pub(crate) mounts: Vec<(PathBuf, String, MountMode)>,
-    /// An `--entrypoint` override, for images that need one.
     pub(crate) entrypoint: Option<String>,
-    /// A port on the host it reaches besides the internet, for an
-    /// upstream on this machine.
     pub(crate) host_port: Option<u16>,
 }
 
-/// A port a managed proxy publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProxyPort {
     pub(crate) name: &'static str,
     pub(crate) host: u16,
     pub(crate) vm: u16,
-    /// Opened in a browser, so shown as a URL.
     pub(crate) http: bool,
 }
 
 impl ProxyPort {
-    /// The bays' way in: plain HTTP proxying, not for a browser.
     pub(crate) fn proxy(host: u16, vm: u16) -> Self {
         Self {
             name: "proxy",
@@ -126,15 +114,13 @@ pub(crate) struct Spec<'a> {
     pub(crate) secrets: Secrets,
 }
 
-/// The keys every kind accepts; a kind adds its own to [`only`].
-pub(crate) const CORE_KEYS: [&str; 4] = ["kind", "run", "url", "secrets"];
+const CORE_KEYS: [&str; 4] = ["kind", "run", "url", "secrets"];
 
-/// Refuses any key that is neither a core key nor one of `own`.
 pub(crate) fn only(fields: &Fields, own: &[&str]) -> Result<()> {
     fields.only(&[&CORE_KEYS[..], own].concat())
 }
 
-pub(crate) type Build = fn(&Spec) -> Result<Box<dyn Proxy>>;
+type Build = fn(&Spec) -> Result<Box<dyn Proxy>>;
 
 pub(crate) struct Access {
     pub(crate) url: Option<Secret>,
@@ -143,7 +129,6 @@ pub(crate) struct Access {
 
 const PROXY_VM_PREFIX: &str = "hangar-proxy-";
 
-/// Every kind, by the name a config's `kind` uses.
 pub(crate) fn kinds() -> Vec<(&'static str, Build)> {
     vec![
         ("http", http::build),
@@ -160,7 +145,6 @@ fn kind_names() -> Vec<&'static str> {
     names
 }
 
-/// The registered kind `kind` names; fails for any other.
 pub(crate) fn check_kind(fields: &Fields) -> Result<Build> {
     let kind = fields.string("kind")?;
     let found = kinds().into_iter().find(|(name, _)| *name == kind);
@@ -183,7 +167,6 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
     Ok(proxy)
 }
 
-/// Where a proxy runs: `"run": "managed"` here, or a `url`.
 pub(crate) fn location(fields: &Fields) -> Result<Location> {
     match (
         fields.optional_string("run")?,
@@ -208,7 +191,6 @@ pub(crate) fn proxy_vm(name: &str) -> String {
     format!("{PROXY_VM_PREFIX}{name}")
 }
 
-/// The `url` of a kind that runs only external.
 pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
     match &spec.location {
         Location::External(url) => Ok(url),
@@ -221,13 +203,31 @@ pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What a login check learned: a refusal is the proxy's own words.
+pub(crate) fn login_key(proxy: &dyn Proxy, bay: &str) -> Option<String> {
+    proxy
+        .bay_tokens()
+        .into_iter()
+        .find(|(owner, _)| owner == bay)
+        .map(|(_, key)| key)
+        .or_else(|| {
+            let slot = proxy.secrets().iter().find(|slot| slot.for_bays)?;
+            Some(slot.key.to_string())
+        })
+}
+
+pub(crate) fn token_keys(proxy: &dyn Proxy) -> Vec<String> {
+    proxy
+        .secrets()
+        .iter()
+        .map(|slot| slot.key.to_string())
+        .chain(proxy.bay_tokens().into_iter().map(|(_, key)| key))
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LoginCheck {
     Taken,
     Refused(String),
-    /// No clear answer (unreachable, or an answer about something else):
-    /// the health check speaks to that.
     Unknown,
 }
 
@@ -261,8 +261,6 @@ pub(crate) fn check_login(port: u16, login: &Login) -> LoginCheck {
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A refusal is 407, 401, 403, 400 or 404, explained by its body or else
-/// its status line.
 fn login_answer(answer: &str) -> LoginCheck {
     let Some(status) = answer.lines().next() else {
         return LoginCheck::Unknown;
@@ -287,7 +285,6 @@ fn login_answer(answer: &str) -> LoginCheck {
     LoginCheck::Refused(reason.chars().take(200).collect())
 }
 
-/// Up when something accepts connections on the loopback `port`.
 pub(crate) fn tcp_health(port: u16) -> Health {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     match TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) {
@@ -308,7 +305,6 @@ pub(crate) fn loopback_port(url: &str) -> Result<u16> {
     port.context(expected())
 }
 
-/// What a bay needs of `proxy` (none: the open internet).
 pub(crate) fn access(
     proxy: Option<(&str, &dyn Proxy)>,
     bay: &str,
@@ -331,14 +327,13 @@ pub(crate) fn access(
     })
 }
 
-/// The userinfo is percent-encoded but for RFC 3986's unreserved marks.
 const USERINFO: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
 
-pub(crate) fn proxy_url(
+fn proxy_url(
     egress: Egress,
     login: Option<&Login>,
     host_alias: &str,
@@ -391,18 +386,14 @@ mod tests {
             ),
             "{requests:?}"
         );
-        // base64 of "av_tok:default"
         assert!(
             requests[0].contains(
                 "Proxy-Authorization: Basic YXZfdG9rOmRlZmF1bHQ=\r\n"
             ),
             "{requests:?}"
         );
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed = silent.local_addr().unwrap().port();
-        drop(silent);
         assert_eq!(
-            check_login(closed, &a_login("a", "b")),
+            check_login(closed_port(), &a_login("a", "b")),
             LoginCheck::Unknown
         );
     }
@@ -426,19 +417,11 @@ mod tests {
     }
     use crate::proxy::fake::FakeProxy;
     use crate::sandbox::Egress;
-    use crate::testing::no_secrets;
+    use crate::testing::{build_proxy, closed_port};
 
     fn built(text: &str) -> Result<Box<dyn Proxy>> {
-        let value = json::parse(text).unwrap();
-        let fields = Fields::new(&value, "proxies.p")?;
-        let spec = Spec {
-            secrets: no_secrets(&fields),
-            fields,
-            location: Location::Managed,
-            home: Path::new("/home/u"),
-            data: PathBuf::from("/data/p"),
-        };
-        build(&spec)
+        let (data, keychain) = (Path::new("/data/p"), std::rc::Rc::default());
+        build_proxy(build, "p", text, Location::Managed, data, keychain)
     }
 
     fn located(text: &str) -> Result<Location> {

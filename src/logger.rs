@@ -17,45 +17,34 @@ struct Logger {
     file: Option<PathBuf>,
 }
 
-/// Target of what a command reports on stdout: the file records it, stderr
-/// would only repeat it.
 pub(crate) const REPORT: &str = "hangar::report";
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
-/// Set once a [`heading`] is on stderr: the lines after it are indented,
-/// until [`end`].
 static UNDER_HEADING: AtomicBool = AtomicBool::new(false);
 
-/// A line naming what a command is about to do, unindented on stderr; the
-/// progress lines after it are indented under it.
 pub(crate) fn heading(text: &str) {
     if HEADINGS.load(Ordering::Relaxed) {
         log::info!(target: HEADING, "{text}");
     }
 }
 
-/// Off for `--json`: machine-read stderr ends with the JSON error alone.
 static HEADINGS: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn without_headings() {
     HEADINGS.store(false, Ordering::Relaxed);
 }
 
-/// Closes a [`heading`] with an empty line, so a result follows apart.
 pub(crate) fn end() {
     if UNDER_HEADING.swap(false, Ordering::Relaxed) {
         let _ = writeln!(io::stderr().lock());
     }
 }
 
-/// Target of a [`heading`].
 const HEADING: &str = "hangar::heading";
 
-/// `file` is created on the first line written to it.
 pub(crate) fn init(level: LevelFilter, file: Option<PathBuf>) {
     let logger = LOGGER.get_or_init(|| Logger::new(level, file));
-    // Only fails when a logger is already set, which can't happen here.
     let _ = log::set_logger(logger);
     log::set_max_level(logger.max_level());
 }
@@ -65,8 +54,6 @@ impl Logger {
         Self { stderr, file }
     }
 
-    /// The file keeps `info` even under `-q`: it's the record of what
-    /// happened.
     fn file_level(&self) -> LevelFilter {
         self.stderr.max(LevelFilter::Info)
     }
@@ -91,7 +78,6 @@ impl Logger {
             return;
         }
         let line = line(&Zoned::now(), record.level(), &message);
-        // clap's indent, so progress lines up with `--help`.
         let indent = if UNDER_HEADING.load(Ordering::Relaxed) {
             "  "
         } else {
@@ -110,7 +96,6 @@ impl Logger {
             record.level(),
             &record.args().to_string(),
         );
-        // A log that can't be written must not break the command.
         let _ = append(path, &line);
     }
 }
@@ -130,8 +115,6 @@ fn append(path: &Path, line: &str) -> io::Result<()> {
     file.write_all(format!("{line}\n").as_bytes())
 }
 
-/// One line per event, even when the message spans several, stamped with
-/// the date, the local time and its offset from UTC.
 fn file_line(now: &Zoned, level: Level, message: &str) -> String {
     let level = level.as_str().to_lowercase();
     format!(
@@ -141,7 +124,6 @@ fn file_line(now: &Zoned, level: Level, message: &str) -> String {
     )
 }
 
-/// `-q` and `-v`/`-vv` win over `HANGAR_LOG`; info by default.
 pub(crate) fn level(
     quiet: bool,
     verbose: usize,
@@ -157,7 +139,6 @@ pub(crate) fn level(
     }
 }
 
-/// The local time and the level, in columns: plain, like clap's output.
 fn line(now: &Zoned, level: Level, message: &str) -> String {
     let level = level.as_str().to_lowercase();
     format!("{}  {level:<5}  {message}", now.strftime("%H:%M:%S"))
@@ -197,7 +178,6 @@ mod tests {
     use jiff::Timestamp;
     use jiff::tz::{TimeZone, offset};
 
-    /// `secs` after the epoch, in a zone `hours` ahead of UTC.
     fn at(secs: i64, hours: i8) -> jiff::Zoned {
         Timestamp::from_second(secs)
             .unwrap()

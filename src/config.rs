@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::apps::{self, App};
 use crate::dirs::{self, Base};
-use crate::error::{Context, Result, bail};
+use crate::error::{Context, Error, Result, bail};
 use crate::files;
 use crate::mounts::{self, Mode, MountSpec};
 use crate::proxy::{self, Location};
@@ -13,8 +13,6 @@ use miniserde::json::Object;
 
 use crate::json::{self, Json};
 
-/// The only copy of the defaults. The Nix module only overrides them, and
-/// `hangar init` writes just the keys a user has to set.
 const DEFAULTS: &str = include_str!("../config/defaults.json");
 
 pub(crate) const INITIAL_CONFIG: &str = r#"{
@@ -41,7 +39,6 @@ const BAY_KEYS: [&str; 13] = [
     "mounts",
 ];
 
-/// Reads a non-empty environment variable; tests pass their own lookup.
 pub(crate) type Var<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 pub(crate) fn env_var(name: &str) -> Option<String> {
@@ -59,18 +56,15 @@ pub(crate) struct Settings {
 pub(crate) struct ProxySettings {
     pub(crate) name: String,
     pub(crate) location: Location,
-    /// The entry as written; the kind reads its own options from it.
     pub(crate) raw: Json,
 }
 
 #[derive(Debug)]
 pub(crate) struct BaySettings {
     pub(crate) name: String,
-    /// `None`: the open internet.
     pub(crate) proxy: Option<String>,
     pub(crate) apps: Vec<App>,
     pub(crate) ports: Vec<PublishedPort>,
-    /// The config's `ports`: app port name -> host port.
     pub(crate) host_ports: BTreeMap<String, u16>,
     pub(crate) image: Option<String>,
     pub(crate) image_repository: String,
@@ -80,14 +74,11 @@ pub(crate) struct BaySettings {
     pub(crate) disk: String,
     pub(crate) packages: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
-    /// The apps' run entries: app name -> command.
     pub(crate) run: BTreeMap<String, String>,
     pub(crate) mounts: BTreeMap<String, MountSpec>,
 }
 
 impl BaySettings {
-    /// `image` when set; otherwise the image released with this hangar, so
-    /// the CLI and the image always match.
     pub(crate) fn image_ref(&self) -> String {
         self.image.clone().unwrap_or_else(|| {
             format!("{}:v{}", self.image_repository, env!("CARGO_PKG_VERSION"))
@@ -121,7 +112,6 @@ pub(crate) fn defaults() -> Result<Json> {
     json::parse(DEFAULTS).context("built-in defaults")
 }
 
-/// The config over the defaults: each bay over the defaults' `bay`.
 pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     let Json::Object(mut config) = config else {
         bail!("config must be a JSON object");
@@ -173,7 +163,6 @@ pub(crate) fn resolve(defaults: Json, config: Json) -> Result<Settings> {
     Ok(settings)
 }
 
-/// Each entry: its kind and location read, its options checked by the kind.
 fn proxy_settings(
     proxies: Option<Json>,
 ) -> Result<BTreeMap<String, ProxySettings>> {
@@ -234,7 +223,6 @@ fn known_proxy(
     bail!("{path}: no proxy \"{name}\"; known: {known}")
 }
 
-/// The bay's `proxy`: a name, `null` for direct, or the default's.
 fn bay_proxy(
     bay: &Json,
     default: Option<&str>,
@@ -266,7 +254,6 @@ fn one_namespace(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-/// `bays` as given; none (absent, `null` or `[]`) is one bay, `default`.
 fn bay_entries(bays: Option<Json>) -> Result<Vec<Json>> {
     let items = match bays {
         None | Some(Json::Null) => Vec::new(),
@@ -324,8 +311,7 @@ impl BaySettings {
     }
 }
 
-/// `^[A-Z][A-Z0-9_]*$`.
-pub(crate) fn valid_key(key: &str) -> bool {
+fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
     chars.next().is_some_and(|first| first.is_ascii_uppercase())
         && chars
@@ -344,8 +330,6 @@ fn looks_like_a_secret(value: &str) -> bool {
         || (value.len() >= 40 && !value.contains(' '))
 }
 
-/// Variables hangar sets itself in the VM: its PATH and home, the proxy
-/// and CA wiring, nix's own settings and `HANGAR_*` (the run marker).
 const RESERVED_ENV: [&str; 17] = [
     "PATH",
     "HOME",
@@ -370,7 +354,6 @@ fn reserved(key: &str) -> bool {
     RESERVED_ENV.contains(&key) || key.starts_with("HANGAR_")
 }
 
-/// Variables under `key`: none of hangar's own, none real-looking.
 pub(crate) fn checked_vars(
     fields: &Fields,
     key: &str,
@@ -391,7 +374,6 @@ pub(crate) fn checked_vars(
     Ok(vars)
 }
 
-/// `[a-z0-9-]+`: app names.
 pub(crate) fn valid_app_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -402,8 +384,6 @@ pub(crate) fn valid_app_name(name: &str) -> bool {
 const NAME_RULE: &str = "lowercase letters and digits, joined by single -, \
                          at most 32 characters";
 
-/// A bay or proxy name, one namespace: `[a-z0-9]+(-[a-z0-9]+)*`, at most
-/// 32 characters. It ends up in VM and file names.
 pub(crate) fn valid_name(name: &str) -> bool {
     name.len() <= 32
         && name.split('-').all(|part| {
@@ -435,6 +415,29 @@ fn mount_mode(entry: &Fields) -> Result<Mode> {
     }
 }
 
+/// Whatever an agent writes to a writable mount is on this machine, where
+/// a git hook, a repo's `core.fsmonitor` or an `.envrc` runs it outside
+/// the bay; it can create those anywhere in the folder, at any time. So
+/// `rw` is only for a folder the user explicitly gives up.
+fn check_unsafe(entry: &Fields, mode: Mode) -> Result<()> {
+    let unsafe_ok = entry.flag_or("unsafe", false)?;
+    match (mode, unsafe_ok) {
+        (Mode::Rw, false) => Err(Error::with_hint(
+            format!(
+                "{}: a writable mount lets the agent leave files this \
+                 machine runs (git hooks and config, .envrc, scripts)",
+                entry.at("mode")
+            ),
+            "use \"ro\" or \"copy\", keep the work in the bay, or accept \
+             it with \"unsafe\": true",
+        )),
+        (Mode::Ro | Mode::Copy, true) => {
+            bail!("{}: only a \"rw\" mount can be unsafe", entry.at("unsafe"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
     if !bay.map.contains_key("mounts") {
         return Ok(BTreeMap::new());
@@ -445,19 +448,19 @@ fn bay_mounts(bay: &Fields) -> Result<BTreeMap<String, MountSpec>> {
         .keys()
         .map(|vm| {
             let entry = entries.object(vm)?;
-            entry.only(&["host", "mode"])?;
+            entry.only(&["host", "mode", "unsafe"])?;
             let expanded = files::vm_path(vm).context(entries.at(vm))?;
+            let mode = mount_mode(&entry)?;
+            check_unsafe(&entry, mode)?;
             let spec = MountSpec {
                 host: entry.string("host")?,
-                mode: mount_mode(&entry)?,
+                mode,
             };
             Ok((expanded, spec))
         })
         .collect()
 }
 
-/// One JSON object being read into a struct; errors name the key's path
-/// (relative when `path` is empty: an app's file).
 pub(crate) struct Fields<'a> {
     pub(crate) map: &'a Object,
     path: String,
@@ -560,7 +563,6 @@ impl<'a> Fields<'a> {
     }
 }
 
-/// Recursive object merge; anything else in `overlay` replaces `base`.
 fn merge(base: &mut Json, overlay: Json) {
     match (base, overlay) {
         (Json::Object(base), Json::Object(overlay)) => {
@@ -582,7 +584,6 @@ mod tests {
 
     const FAKE: &str = r#"{"kind": "fake", "run": "managed"}"#;
 
-    /// `bays` (a JSON fragment) with a proxy `p` and `defaults.proxy`.
     fn with_default_proxy(bays: &str) -> String {
         format!(
             r#"{{"proxies": {{"p": {FAKE}}}, "defaults": {{"proxy": "p"}},
@@ -726,7 +727,7 @@ mod tests {
                 r#"{"~/a": {"host": "~/a", "mode": "ro", "rw": true}}"#,
                 "rw: unknown setting",
             ),
-            (r#"{"~/a": {"mode": "rw"}}"#, "host: expected a string"),
+            (r#"{"~/a": {"mode": "ro"}}"#, "host: expected a string"),
             (
                 r#"{"/run/hangar/x": {"host": "~/a", "mode": "ro"}}"#,
                 "must be in ~",
@@ -872,13 +873,34 @@ mod tests {
         ] {
             assert_eq!(error(&mount(entry)), expected, "{entry}");
         }
-        for (mode, want) in
-            [("ro", Mode::Ro), ("rw", Mode::Rw), ("copy", Mode::Copy)]
-        {
-            let entry = format!(r#"{{"host": "~/c", "mode": "{mode}"}}"#);
-            let bay = resolve_with(&mount(&entry)).bays.remove(0);
+        for (entry, want) in [
+            (r#"{"host": "~/c", "mode": "ro"}"#, Mode::Ro),
+            (r#"{"host": "~/c", "mode": "rw", "unsafe": true}"#, Mode::Rw),
+            (r#"{"host": "~/c", "mode": "copy"}"#, Mode::Copy),
+        ] {
+            let bay = resolve_with(&mount(entry)).bays.remove(0);
             assert_eq!(bay.mounts["/home/pilot/code"].mode, want);
         }
+    }
+
+    #[test]
+    fn a_writable_mount_needs_the_risk_accepted() {
+        let mount = |entry: &str| {
+            one_bay(&format!(r#""mounts": {{"~/code": {entry}}}"#), "")
+        };
+        let refused = error(&mount(r#"{"host": "~/c", "mode": "rw"}"#));
+        assert!(
+            refused.starts_with(
+                "bays.default.mounts.~/code.mode: a writable mount lets the \
+                 agent leave files this machine runs"
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            error(&mount(r#"{"host": "~/c", "mode": "ro", "unsafe": true}"#)),
+            "bays.default.mounts.~/code.unsafe: only a \"rw\" mount can be \
+             unsafe"
+        );
     }
 
     #[test]

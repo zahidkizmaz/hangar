@@ -119,11 +119,11 @@ A bay:
       "mode": "rw", "kind": "home", "applied": true } ] }
 ```
 
-`proxy_port` is the bay's only way out, `null` for the open internet.
-`env` holds names only. `mounts` lists every mount, hangar's own
-(`kind`: `user`, `home` or `cache`) and the `copy` ones (`mode`: `ro`,
-`rw` or `copy`). `applied` says whether the VM was created with it;
-`null` when there's no record, and always for a `copy`.
+`proxy_port` is the bay's only way out, `null` for the open internet. `env`
+holds names only. `mounts` lists every mount, hangar's own (`kind`: `user`,
+`home` or `cache`) and the `copy` ones (`mode`: `ro`, `rw`, `rw-unsafe` for one
+of yours marked unsafe, or `copy`). `applied` says whether the VM was created
+with it; `null` when there's no record, and always for a `copy`.
 
 A proxy:
 
@@ -174,8 +174,8 @@ never shown.
 - Never pass a secret as an argument, in `env` or through a `copy` mount.
   Secrets belong in the proxy; its own tokens stay in the host's
   keychain.
-- Never mount a directory a host program reads config from as writable;
-  hangar refuses the known ones, but a dedicated directory is the rule.
+- Never set `"unsafe": true` on a mount for an agent's convenience: it
+  lets the agent leave files this machine runs. Keep repos in the bay.
 - `rm --data` needs `--yes` without a terminal.
 - `setup` is interactive: it runs the app's setup command with a
   terminal.

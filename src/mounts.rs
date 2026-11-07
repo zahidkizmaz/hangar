@@ -25,8 +25,6 @@ pub(crate) struct MountSpec {
     pub(crate) mode: Mode,
 }
 
-/// A checked mount: its source resolved, so symlinks can't hide where it
-/// points; `file` for a single-file mount.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Resolved {
     pub(crate) vm: String,
@@ -35,7 +33,6 @@ pub(crate) struct Resolved {
     pub(crate) file: bool,
 }
 
-/// The mounts the VM is created with: `ro` and `rw`.
 pub(crate) fn live(
     mounts: &BTreeMap<String, MountSpec>,
 ) -> BTreeMap<String, MountSpec> {
@@ -46,7 +43,6 @@ pub(crate) fn live(
         .collect()
 }
 
-/// The `copy` mounts: VM path -> host path as configured.
 pub(crate) fn copies(
     mounts: &BTreeMap<String, MountSpec>,
 ) -> BTreeMap<String, String> {
@@ -61,8 +57,6 @@ fn overlaps(a: &str, b: &str) -> bool {
     Path::new(a).starts_with(b) || Path::new(b).starts_with(a)
 }
 
-/// The mount a VM path collides with, if any: a VM path is either copied
-/// or mounted, never both.
 pub(crate) fn mount_at<'a>(
     vm: &str,
     mounts: &'a BTreeMap<String, MountSpec>,
@@ -73,9 +67,6 @@ pub(crate) fn mount_at<'a>(
         .find(|mount| overlaps(vm, mount))
 }
 
-/// `mounts` plus hangar's own mounts (`home` at the VM home,
-/// `cache` at the package cache), when on: what the bay is created
-/// with.
 pub(crate) fn with_hangar(
     mounts: &BTreeMap<String, MountSpec>,
     home: Option<&String>,
@@ -94,7 +85,6 @@ pub(crate) fn with_hangar(
     all
 }
 
-/// `mounts` targets don't nest or cover the home mount.
 pub(crate) fn check_targets(
     mounts: &BTreeMap<String, MountSpec>,
 ) -> Result<()> {
@@ -120,8 +110,6 @@ pub(crate) fn check_targets(
     Ok(())
 }
 
-/// What the rules check a source against, all resolved: the user's home,
-/// hangar's data and cache dirs, and this bay's own home and cache.
 #[derive(Debug)]
 pub(crate) struct Roots {
     pub(crate) home: PathBuf,
@@ -162,9 +150,6 @@ impl Roots {
     }
 }
 
-/// Every mount, checked against the rules; the first refusal stops `up`
-/// before anything is created. A missing source is checked on the path it
-/// would have, then created (0700).
 pub(crate) fn resolve(
     mounts: &BTreeMap<String, MountSpec>,
     roots: &Roots,
@@ -212,9 +197,6 @@ fn check(
     let writable = spec.mode == Mode::Rw;
     check_source(&host, writable, roots)
         .map_err(|why| refuse(&context, &host, why))?;
-    // A stow link's own name counts too: `~/.bashrc` is host config
-    // wherever it points. Hangar's own folders are exempt, as in
-    // `check_source`.
     let own =
         host.starts_with(&roots.bay_home) || host.starts_with(&roots.bay_cache);
     if !own {
@@ -237,8 +219,6 @@ fn check(
     Ok((resolved, missing))
 }
 
-/// Where a missing path would end up: its nearest existing ancestor with
-/// symlinks resolved, plus the missing components.
 pub(crate) fn would_be(path: &Path) -> Result<PathBuf> {
     use std::path::Component;
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -257,14 +237,11 @@ pub(crate) fn would_be(path: &Path) -> Result<PathBuf> {
         )));
     }
     match path.strip_prefix(existing) {
-        // `join("")` would add a trailing `/` to the recorded mount.
         Ok(rest) if !rest.as_os_str().is_empty() => Ok(host.join(rest)),
         _ => Ok(host),
     }
 }
 
-/// Creates the missing components of a checked path, each 0700; existing
-/// ancestors are left as they are.
 pub(crate) fn create(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     fs::DirBuilder::new()
@@ -273,9 +250,6 @@ pub(crate) fn create(path: &Path) -> std::io::Result<()> {
         .create(path)
 }
 
-/// Why a resolved source can't be used, if it can't, for what only hangar
-/// may touch: the two roots and other bays' folders. Copies check this
-/// too (`files::plan`).
 pub(crate) fn check_hangar_dirs(
     host: &Path,
     roots: &Roots,
@@ -298,6 +272,13 @@ pub(crate) fn check_hangar_dirs(
         return Err("holds hangar's package caches");
     }
     Ok(())
+}
+
+pub(crate) fn check_copy_out(
+    host: &Path,
+    roots: &Roots,
+) -> std::result::Result<(), &'static str> {
+    check_source(host, true, roots)
 }
 
 fn check_source(
@@ -348,12 +329,9 @@ pub(crate) enum MountKind {
 pub(crate) struct MountStatus {
     pub(crate) vm: String,
     pub(crate) host: String,
-    /// The host path as the config has it, `~` included.
     pub(crate) written: String,
     pub(crate) mode: Mode,
     pub(crate) kind: MountKind,
-    /// The bay was created with it; `None` when that's unknown, and for a
-    /// `copy`, which `up` applies to the running VM.
     pub(crate) applied: Option<bool>,
 }
 
@@ -362,8 +340,6 @@ fn expanded(spec: &MountSpec, home: &Path) -> String {
         .map_or_else(|_| spec.host.clone(), |p| p.display().to_string())
 }
 
-/// Where an expanded host path resolves to, as the record has it; the
-/// path itself when it can't be resolved.
 fn resolved_host(host: &str) -> String {
     let path = Path::new(host);
     fs::canonicalize(path)
@@ -382,9 +358,6 @@ fn record_line(vm: &str, host: &str, writable: bool, file: bool) -> String {
     format!("{vm}\t{host}\t{kind}{mode}")
 }
 
-/// What the bay is created with, one line per mount with its resolved
-/// host: recorded and compared on later `up`s, since mounts only change
-/// with a new VM.
 pub(crate) fn lines(resolved: &[Resolved]) -> Vec<String> {
     resolved
         .iter()
@@ -395,8 +368,6 @@ pub(crate) fn lines(resolved: &[Resolved]) -> Vec<String> {
         .collect()
 }
 
-/// Each configured mount (hangar's own included), and whether the VM has
-/// it: unknown without a `recorded` list.
 pub(crate) fn status(
     mounts: &BTreeMap<String, MountSpec>,
     bay_home: Option<&String>,
@@ -454,7 +425,6 @@ mod tests {
     const STATE: &str = "/home/you/.local/share/hangar";
     const CACHE: &str = "/home/you/.cache/hangar";
 
-    /// The roots as bay `default` sees them, with `state` and `cache`.
     fn bay_roots(state: &str, cache: &str) -> Roots {
         Roots {
             home: HOME.into(),
@@ -482,6 +452,21 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn copying_out_of_a_bay_never_lands_in_host_config() {
+        let roots = bay_roots(STATE, CACHE);
+        let home = roots.home.clone();
+        for refused in [".config/autostart/x", "Library/LaunchAgents/x.plist"] {
+            assert!(
+                super::check_copy_out(&home.join(refused), &roots).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(
+            super::check_copy_out(&home.join("work/out.txt"), &roots).is_ok()
+        );
     }
 
     #[test]
@@ -567,7 +552,6 @@ mod tests {
             ("~/file/below", "isn't a directory"),
             ("~/missing/../x", "can't contain .."),
             ("relative", "expected an absolute path"),
-            // A symlink is judged by where it points.
             ("~/cfg", "keep config"),
         ] {
             let error =
@@ -802,11 +786,9 @@ mod tests {
         assert_eq!(resolved[0].host, home.join("work/paperclip/data"));
         assert_eq!(mode("work/paperclip"), 0o700);
         assert_eq!(mode("work/paperclip/data"), 0o700);
-        // An existing ancestor keeps its own mode.
         assert_eq!(mode("work"), 0o755);
 
         for (host, writable, why) in [
-            // Through a symlink, the would-be path lands in ~/.ssh.
             ("~/keys/new", false, "credentials or keys"),
             ("~/.config/new", true, "keep config"),
             ("~/.local/share/hangar/new", false, "hangar's own state"),
@@ -826,7 +808,6 @@ mod tests {
         assert!(!home.join(".config/new").exists());
         assert!(!home.join(".config").exists());
 
-        // One refusal stops all: the allowed missing source isn't created.
         let error = resolve(
             &mounts(&[
                 ("/home/pilot/a", "~/fine", true),
@@ -875,7 +856,6 @@ mod tests {
             ("/home/pilot/a", "~/a", true),
             ("/home/pilot/b", "~/b", false),
         ]);
-        // The record has where `~/a` resolved to, not the link.
         let recorded = [
             format!("/home/pilot/a\t{}\trw", home.join("data").display()),
             format!("/home/pilot/b\t{}\trw", home.join("b").display()),
@@ -892,7 +872,6 @@ mod tests {
                     kind: MountKind::User,
                     applied: Some(true),
                 },
-                // Created writable, now configured read-only: not applied.
                 MountStatus {
                     vm: "/home/pilot/b".into(),
                     host: home.join("b").display().to_string(),

@@ -40,7 +40,6 @@ impl StateDir {
 pub(crate) struct BayDir(PathBuf);
 
 impl BayDir {
-    /// What the bay's VM was created with (`vm_record`).
     pub(crate) fn vm(&self) -> PathBuf {
         self.0.join("vm")
     }
@@ -49,7 +48,6 @@ impl BayDir {
         self.0.join("copies")
     }
 
-    /// The bay's home, mounted at pilot's home, `/home/pilot` (`home`).
     pub(crate) fn home(&self) -> PathBuf {
         self.0.join("home")
     }
@@ -58,18 +56,15 @@ impl BayDir {
 pub(crate) struct ProxyDir(PathBuf);
 
 impl ProxyDir {
-    /// What a managed proxy's VM was created with (`vm_record`).
     pub(crate) fn vm(&self) -> PathBuf {
         self.0.join("vm")
     }
 
-    /// The proxy's own files; a managed proxy mounts it.
     pub(crate) fn data(&self) -> PathBuf {
         self.0.join("data")
     }
 }
 
-/// `hash\tname` lines as name -> hash; a missing file is empty.
 pub(crate) fn read_hashes(path: &Path) -> BTreeMap<String, String> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -90,7 +85,6 @@ pub(crate) fn write_hashes(
     write_private(path, text.as_bytes())
 }
 
-/// FNV-1a: enough to see that an input changed (not for security).
 pub(crate) fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
     let hash = bytes
         .into_iter()
@@ -100,9 +94,6 @@ pub(crate) fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
     format!("{hash:016x}")
 }
 
-/// Writes a file only its owner can read, creating its folder first.
-/// `mode` only applies on create, so an existing file is narrowed before
-/// the contents go in.
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).context(dir.display())?;

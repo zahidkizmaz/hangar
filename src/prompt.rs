@@ -11,11 +11,8 @@ use crate::process;
 use crate::secret::{Secret, trim_line_end};
 
 pub(crate) trait Prompt {
-    /// Whether a person is there to type.
     fn terminal(&self) -> bool;
-    /// The answer to `question`, without its line end.
     fn ask(&self, question: &str) -> Result<Secret>;
-    /// Whether the user answered yes to `question`.
     fn confirm(&self, question: &str) -> Result<bool>;
 }
 
@@ -59,8 +56,6 @@ fn unseen(question: &str) -> Result<String> {
     read_hidden(&tty, &tty, question, echo)
 }
 
-/// Reads a line from `input` with the echo off; the echo comes back even
-/// when the read fails.
 fn read_hidden(
     input: impl Read,
     mut out: impl Write,
@@ -98,7 +93,6 @@ pub(crate) mod fake {
     use crate::error::{Result, bail};
     use crate::secret::Secret;
 
-    /// Answers from a list, and records each question.
     #[derive(Default)]
     pub(crate) struct FakePrompt {
         pub(crate) terminal: bool,

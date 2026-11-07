@@ -53,6 +53,7 @@ let
           "~/projects" = {
             host = "~/work/projects";
             mode = "rw";
+            unsafe = true;
           };
           "~/.config/app" = {
             host = "~/dotfiles/app";

@@ -15,7 +15,6 @@ fn default_config(machine: &Machine) -> PathBuf {
     machine.home.join(".config/hangar/hangar.json")
 }
 
-/// clap's usage errors: exit 2, the message on stderr.
 fn usage_error(output: &Output) -> String {
     assert_eq!(output.status.code(), Some(2), "stdout: {}", stdout(output));
     stderr(output)
@@ -106,8 +105,6 @@ const BAY_VM: &str = "hangar-bay-default";
 const WEB_APP: &str = r#", "apps": {"web": {"run": "web-serve",
     "setup": {"command": "web-login", "check": "web-ok"}}}"#;
 
-/// A machine whose config has one direct bay `default` on `image`, plus
-/// `bay` (JSON fields) and top-level `rest`.
 fn with_bay(name: &str, bay: &str, rest: &str) -> Machine {
     let machine = Machine::new(name);
     set_bay(&machine, "example/bay:1", bay, rest);
@@ -557,7 +554,6 @@ fn log_file_gets_every_line_timestamped() {
     assert!(log.lines().count() >= 2, "{log}");
     for line in log.lines() {
         let (stamp, rest) = line.split_once(' ').unwrap();
-        // The local time with its offset: 2026-11-07T21:25:46+01:00.
         let offset = stamp.as_bytes().get(19).copied();
         assert!(
             stamp.len() == 25 && matches!(offset, Some(b'+' | b'-')),
@@ -753,8 +749,6 @@ fn bay_through_agent_vault_gets_token_url_on_stdin_only() {
     }
 }
 
-/// An Infisical proxy's CA endpoint on `port`: 503 until the fake msb has
-/// started the proxy in `vm`, then the CA as JSON.
 fn infisical_ca_server(listener: TcpListener, up: PathBuf) {
     let pem = include_str!("../src/proxy/testdata/ca.pem").replace('\n', "\\n");
     let body = format!(r#"{{"certificate": "{pem}"}}"#);
@@ -776,8 +770,6 @@ fn infisical_ca_server(listener: TcpListener, up: PathBuf) {
     });
 }
 
-/// Proxy `infi` (managed infisical) and bay `work` running app `web`
-/// through it; returns the machine and the proxy's host port.
 fn infisical_machine(name: &str) -> (Machine, u16) {
     let machine = Machine::new(name);
     let (listener, port) = listener();
@@ -800,8 +792,6 @@ fn infisical_machine(name: &str) -> (Machine, u16) {
     (machine, port)
 }
 
-/// Runs `up -vv`; its stdout, after checking no token reached argv, a log
-/// or stderr.
 fn up_keeping_tokens_secret(machine: &Machine) -> String {
     let output = machine.hangar(&["up", "-vv"], &[]);
     let said = stderr(ok(&output));
@@ -1005,7 +995,6 @@ fn config_show_prints_the_file_as_written() {
 fn config_edit_opens_the_editor_then_checks_the_file() {
     let machine = with_bay("config-edit", "", "");
     let editor = machine.home.join("bin/editor");
-    // Stands in for $EDITOR: replaces the file with $HANGAR_TEST_WRITE.
     machine.script("editor", r#"printf '%s' "$HANGAR_TEST_WRITE" > "$1""#);
     let editor = editor.to_str().unwrap();
     let edit = |write: &str| {
@@ -1057,4 +1046,30 @@ fn up_shows_a_heading_indented_progress_then_the_bays_state() {
     assert!(table.contains("default  bay   running  direct  -      created"));
     let json = machine.hangar(&["up", "--json"], &[]);
     assert!(!stderr(ok(&json)).contains("Starting"), "{}", stderr(&json));
+}
+
+#[test]
+fn a_writable_mount_is_refused_unless_unsafe_and_then_warned_about() {
+    let machine = with_bay(
+        "rw-mount",
+        r#", "mounts": {"~/scratch": {"host": "~/scratch", "mode": "rw"}}"#,
+        "",
+    );
+    let refused = failed(&machine.hangar(&["up"], &[]));
+    assert!(refused.contains("unsafe"), "{refused}");
+    set_bay(
+        &machine,
+        "example/bay:1",
+        r#", "mounts": {"~/scratch": {"host": "~/scratch", "mode": "rw",
+            "unsafe": true}}"#,
+        "",
+    );
+    let output = machine.hangar(&["up"], &[]);
+    let said = stderr(ok(&output));
+    assert!(
+        said.contains("~/scratch is writable at /home/pilot/scratch"),
+        "{said}"
+    );
+    let wide = run(&machine, &["ps", "--wide"]);
+    assert!(wide.contains("~/scratch:~/scratch:rw-unsafe"), "{wide}");
 }

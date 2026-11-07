@@ -37,6 +37,10 @@ blocked by the sandbox.
 - **Bays sharing a proxy share its credentials.** Use separate proxies or
   sessions where that matters. A host folder mounted into two bays is a
   channel between them; their homes and caches never are.
+- **Nothing an agent does runs on your machine.** Its only ways out are
+  the proxy and what `hangar cp` copies out on request. A writable mount
+  would let it leave files your machine runs (git hooks, `.envrc`), so
+  `rw` needs `"unsafe": true` and `up` warns about it every time.
 - **A bay is disposable.** Remove and recreate it now and then with
   `hangar rm NAME && hangar up NAME`. Code leaves through reviewed PRs.
 

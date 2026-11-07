@@ -10,8 +10,6 @@ pub(crate) fn command(program: &str) -> Command {
     Command::new(program)
 }
 
-/// Runs `command`, writing `stdin` if given, and returns its output
-/// whatever the exit status.
 pub(crate) fn output(
     command: &mut Command,
     stdin: Option<&[u8]>,

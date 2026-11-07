@@ -34,8 +34,6 @@ impl Base {
     }
 }
 
-/// `$XDG_…_HOME/hangar`, or the spec's fallback under `$HOME`; a relative
-/// value is ignored, as the spec says.
 pub(crate) fn hangar_dir(base: Base, var: Var) -> Result<PathBuf> {
     let root = match var(base.var()).filter(|dir| Path::new(dir).is_absolute())
     {

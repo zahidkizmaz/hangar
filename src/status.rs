@@ -7,7 +7,7 @@ use crate::hangar::Hangar;
 use crate::lifecycle::Resource;
 use crate::mounts::{self, MountStatus};
 use crate::proxy::{Health, Location, Managed, Proxy, ProxyPort, proxy_vm};
-use crate::sandbox::{BoxState, Egress, PublishedPort, data_volume};
+use crate::sandbox::{BoxState, PublishedPort, data_volume};
 use crate::vm_record::VmRecord;
 
 pub(crate) struct Overview {
@@ -20,7 +20,6 @@ pub(crate) struct Overview {
 pub(crate) enum RunState {
     Running,
     Exited,
-    /// Never launched: its setup check fails.
     NeedsSetup,
 }
 
@@ -36,30 +35,22 @@ impl RunState {
 
 pub(crate) struct BayStatus {
     pub(crate) name: String,
-    /// `None` when the sandbox can't tell.
     pub(crate) state: Option<BoxState>,
     pub(crate) proxy: Option<String>,
     pub(crate) image: String,
-    /// The configured apps' state; empty unless the bay runs.
     pub(crate) apps: Vec<(String, RunState)>,
-    /// What it publishes on the host's 127.0.0.1.
     pub(crate) ports: Vec<PublishedPort>,
-    /// Every mount, hangar's own and the `copy` ones included.
     pub(crate) mounts: Vec<MountStatus>,
 }
 
 pub(crate) struct ProxyStatus {
     pub(crate) name: String,
     pub(crate) kind: &'static str,
-    /// Runs in its own VM, whose state is `state` (`None`: unknown).
     pub(crate) managed: bool,
     pub(crate) state: Option<BoxState>,
     pub(crate) image: Option<String>,
-    /// `None` when there is nothing to probe: the proxy's VM isn't up.
     pub(crate) health: Option<Health>,
-    /// The host port its bays reach it on.
     pub(crate) port: Option<u16>,
-    /// What a managed one publishes on the host's 127.0.0.1.
     pub(crate) published: Vec<ProxyPort>,
 }
 
@@ -74,12 +65,9 @@ pub(crate) struct BayDetail {
     pub(crate) cpus: u32,
     pub(crate) memory: String,
     pub(crate) disk: String,
-    /// Its proxy's host port, the bay's only way out; `None` for the open
-    /// internet.
     pub(crate) proxy_port: Option<u16>,
     pub(crate) packages: Vec<String>,
     pub(crate) apps: Vec<String>,
-    /// The names of the bay's plain variables.
     pub(crate) env: Vec<String>,
     pub(crate) home: PathBuf,
     pub(crate) cache: PathBuf,
@@ -89,22 +77,18 @@ pub(crate) struct BayDetail {
 pub(crate) struct ProxyDetail {
     pub(crate) status: ProxyStatus,
     pub(crate) vm: Option<String>,
-    /// Where an external proxy runs.
     pub(crate) url: Option<String>,
     pub(crate) data: PathBuf,
     pub(crate) log: Option<PathBuf>,
-    /// The bays that go through it.
     pub(crate) bays: Vec<String>,
     pub(crate) tokens: Vec<(String, TokenSource)>,
 }
 
-/// Where a proxy's token comes from, checked without reading it out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenSource {
     Keychain,
     Command,
     Missing,
-    /// The keychain couldn't be asked.
     Unknown,
 }
 
@@ -119,8 +103,6 @@ impl TokenSource {
     }
 }
 
-/// The state of the bays and proxies named, without asking a bay about
-/// its apps: what `up` and `down` show after they're done.
 pub(crate) fn of(hangar: &Hangar, names: &[&str]) -> Overview {
     Overview {
         bays: hangar
@@ -157,13 +139,9 @@ pub(crate) fn collect(hangar: &Hangar) -> Overview {
 
 pub(crate) fn bay_detail(hangar: &Hangar, bay: &Bay) -> Detail {
     let settings = bay.settings;
-    let proxy_port =
-        hangar
-            .proxy_of(settings)
-            .and_then(|(_, proxy)| match proxy.egress() {
-                Egress::HostPort(port) => Some(port),
-                Egress::Open | Egress::OpenAndHostPort(_) => None,
-            });
+    let proxy_port = hangar
+        .proxy_of(settings)
+        .and_then(|(_, proxy)| proxy.egress().host_port());
     Detail::Bay(BayDetail {
         status: bay_status(hangar, bay, true),
         vm: bay.vm.clone(),
@@ -208,18 +186,12 @@ pub(crate) fn proxy_detail(
     })
 }
 
-/// Each token's source, the bays' own last.
 fn tokens(
     hangar: &Hangar,
     name: &str,
     proxy: &dyn Proxy,
 ) -> Vec<(String, TokenSource)> {
-    let keys: Vec<String> = proxy
-        .secrets()
-        .iter()
-        .map(|slot| slot.key.to_string())
-        .chain(proxy.bay_tokens().into_iter().map(|(_, key)| key))
-        .collect();
+    let keys = crate::proxy::token_keys(proxy);
     let secrets = match hangar.secrets(name) {
         Ok(secrets) => secrets,
         Err(error) => {
@@ -249,7 +221,6 @@ fn tokens(
         .collect()
 }
 
-/// `apps` asks the bay itself, so only `ps` and `inspect` do.
 fn bay_status(hangar: &Hangar, bay: &Bay, apps: bool) -> BayStatus {
     let state = vm_state(hangar, &bay.vm);
     let apps = match state {
@@ -312,17 +283,13 @@ fn proxy_status(hangar: &Hangar, name: &str, proxy: &dyn Proxy) -> ProxyStatus {
         state,
         image: managed.map(|managed| managed.vm().image),
         health: probeable.then(|| proxy.health()),
-        port: match proxy.egress() {
-            Egress::HostPort(port) => Some(port),
-            Egress::Open | Egress::OpenAndHostPort(_) => None,
-        },
+        port: proxy.egress().host_port(),
         published: managed
             .map(|managed| managed.vm().publish)
             .unwrap_or_default(),
     }
 }
 
-/// `None`, with a warning, when the sandbox can't tell.
 fn vm_state(hangar: &Hangar, vm: &str) -> Option<BoxState> {
     match hangar.sandbox.state(vm) {
         Ok(state) => Some(state),
@@ -333,8 +300,6 @@ fn vm_state(hangar: &Hangar, vm: &str) -> Option<BoxState> {
     }
 }
 
-/// What `ps` found wrong, one sentence each; they are logged and make `ps`
-/// exit 3.
 pub(crate) fn events(overview: &Overview) -> Vec<String> {
     let apps = overview.bays.iter().flat_map(|bay| {
         bay.apps.iter().filter_map(|(app, state)| {

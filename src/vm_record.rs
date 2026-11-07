@@ -6,21 +6,13 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use crate::sandbox::Egress;
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VmRecord {
     pub(crate) image: Option<String>,
-    /// `Egress::record()`: what the VM may reach.
     pub(crate) egress: Option<String>,
-    /// `cpus=4 memory=6G disk=40G`.
     pub(crate) resources: Option<String>,
-    /// Managed proxies only: what their image and settings hash to.
     pub(crate) fingerprint: Option<String>,
-    /// `(name, host, vm)`.
     pub(crate) ports: Vec<(String, u16, u16)>,
-    /// `vm\thost\tro|rw`, as `mounts::lines` writes them; none means the
-    /// VM was created without mounts.
     pub(crate) mounts: Vec<String>,
 }
 
@@ -38,10 +30,7 @@ impl VmRecord {
         {
             match key {
                 "image" => record.image = Some(value.to_string()),
-                "egress" => {
-                    record.egress =
-                        Egress::from_record(value).map(Egress::record);
-                }
+                "egress" => record.egress = Some(value.to_string()),
                 "resources" => record.resources = Some(value.to_string()),
                 "fingerprint" => record.fingerprint = Some(value.to_string()),
                 "port" => record.ports.extend(port(value)),
@@ -87,6 +76,7 @@ fn port(value: &str) -> Option<(String, u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::VmRecord;
+    use crate::sandbox::Egress;
     use crate::testing::scratch_dir;
 
     fn record() -> VmRecord {
@@ -115,15 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn numeric_egress_is_unknown() {
-        assert_eq!(VmRecord::parse("egress\t14322\n").egress, None);
+    fn an_odd_egress_never_matches_a_wanted_one() {
+        let parsed = VmRecord::parse("egress\t14322\n").egress;
+        assert_ne!(parsed, Some(Egress::HostPort(14322).record()));
     }
 
     #[test]
     fn unreadable_values_are_unknown_not_a_match() {
-        let parsed = VmRecord::parse(
-            "egress\tlots\nport\tx\t1\nport\ty\t2\tz\nnew\tkey\nnoise\n",
-        );
+        let parsed =
+            VmRecord::parse("port\tx\t1\nport\ty\t2\tz\nnew\tkey\nnoise\n");
         assert_eq!(parsed, VmRecord::default());
     }
 

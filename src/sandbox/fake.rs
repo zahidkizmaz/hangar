@@ -15,7 +15,6 @@ pub(crate) struct Created {
     pub(crate) name: String,
     pub(crate) init: Option<String>,
     pub(crate) entrypoint: Option<String>,
-    /// `name:guest:size`.
     pub(crate) volumes: Vec<String>,
     pub(crate) egress: Egress,
     pub(crate) publish: Vec<(u16, u16)>,
@@ -25,21 +24,14 @@ pub(crate) struct Created {
 #[derive(Default)]
 pub(crate) struct FakeSandbox {
     pub(crate) states: RefCell<BTreeMap<String, BoxState>>,
-    /// `create NAME`, `exec NAME COMMAND…`, …; never stdin.
     pub(crate) calls: RefCell<Vec<String>>,
-    /// What each `exec` got on stdin, in call order.
     pub(crate) stdins: RefCell<Vec<Vec<u8>>>,
     pub(crate) created: RefCell<Vec<Created>>,
     pub(crate) images: RefCell<Vec<String>>,
     pub(crate) volumes: RefCell<BTreeSet<String>>,
-    /// `exec` prints the reply of the first pattern its call contains; a
-    /// VM has booted unless one says otherwise.
     pub(crate) replies: RefCell<Vec<(String, String)>>,
-    /// Used up one by one before `replies`: `None` fails the exec.
     pub(crate) replies_once: RefCell<Vec<(String, Option<String>)>>,
-    /// `shell` commands exit 0 (else 1).
     pub(crate) shell_succeeds: Cell<bool>,
-    /// `create` leaves the VM behind, then fails.
     pub(crate) fail_create: Cell<bool>,
 }
 
@@ -52,22 +44,18 @@ impl FakeSandbox {
         fake
     }
 
-    /// Answers `exec` calls containing `pattern` with `reply`.
     pub(crate) fn reply(&self, pattern: &str, reply: &str) {
         self.replies
             .borrow_mut()
             .push((pattern.to_string(), reply.to_string()));
     }
 
-    /// Answers the next `exec` containing `pattern` with `reply`, or fails
-    /// it when `None`.
     pub(crate) fn reply_once(&self, pattern: &str, reply: Option<&str>) {
         self.replies_once
             .borrow_mut()
             .push((pattern.to_string(), reply.map(String::from)));
     }
 
-    /// Calls that change a VM or run something in it.
     pub(crate) fn changes(&self) -> Vec<String> {
         self.calls
             .borrow()
@@ -94,7 +82,6 @@ fn booted(call: &str) -> Vec<u8> {
     }
 }
 
-/// `user@vm`, or just `vm` for the image's default user.
 fn target(vm: &str, user: Option<&str>) -> String {
     user.map_or_else(|| vm.to_string(), |user| format!("{user}@{vm}"))
 }

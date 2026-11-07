@@ -7,7 +7,7 @@ use std::path::Path;
 use miniserde::json::{Number, Object};
 
 use crate::bay::VM_HOME;
-use crate::commands::UpReport;
+use crate::commands::Report;
 use crate::error::Error;
 use crate::files::Copied;
 use crate::json::{self, Json};
@@ -20,8 +20,6 @@ use crate::status::{
     self, BayDetail, BayStatus, Detail, Overview, ProxyDetail, ProxyStatus,
 };
 
-/// Every JSON document's `version`: 1 until the first release, then bumped
-/// when a field changes meaning or goes away.
 const VERSION: u64 = 1;
 
 #[derive(Clone, Copy)]
@@ -31,29 +29,20 @@ pub(crate) enum Format {
 }
 
 trait Render {
-    /// Text for people; empty prints nothing.
     fn human(&self) -> String;
-    /// The documented `--json` shape; `Null` prints nothing.
     fn json(&self) -> Json;
 }
 
 pub(crate) enum Outcome {
     Done,
-    /// The command wrote its own output.
     Streamed,
-    /// What `up`, `down`, `restart` and `rm` did, one line each.
-    Changes(UpReport),
-    /// `ps`; `wide` adds the image, apps and mounts.
-    Overview {
-        overview: Overview,
-        wide: bool,
-    },
+    Changes(Report),
+    Overview { overview: Overview, wide: bool },
     Detail(Box<Detail>),
     Copied(Copied),
 }
 
 impl Outcome {
-    /// 1 when any change failed, 3 when `ps` detected an event.
     pub(crate) fn exit_code(&self) -> u8 {
         let failed = |change: &Change| {
             matches!(change.outcome, lifecycle::Outcome::Failed(_))
@@ -70,8 +59,6 @@ impl Outcome {
     }
 }
 
-/// What changed goes to the log file too, so it stays a full record.
-/// The log file gets one `name: outcome` line per change.
 fn record(result: &Outcome) {
     let lines: Vec<String> = match result {
         Outcome::Changes(report) => {
@@ -184,11 +171,13 @@ impl Render for Outcome {
                         .changes
                         .iter()
                         .map(|change| {
-                            let addresses = report
-                                .addresses
-                                .get(&change.name)
-                                .map_or(&[][..], Vec::as_slice);
-                            change_json(change, addresses)
+                            let found = report
+                                .overview
+                                .as_ref()
+                                .map_or_else(Vec::new, |overview| {
+                                    addresses(overview, &change.name)
+                                });
+                            change_json(change, &found)
                         })
                         .collect(),
                 ),
@@ -207,7 +196,6 @@ fn lines(lines: impl IntoIterator<Item = String>) -> String {
     lines.into_iter().collect::<Vec<_>>().join("\n")
 }
 
-/// The outcome's word and its reasons (or changes).
 fn outcome_parts(outcome: &lifecycle::Outcome) -> (&'static str, &[String]) {
     use lifecycle::Outcome::{
         Created, Failed, Recreated, Removed, Stopped, Unchanged, Updated,
@@ -227,37 +215,45 @@ fn change_line(change: &Change) -> String {
     format!("{}: {}", change.name, result_text(change))
 }
 
-/// The changes as a table; ADDRESS, one per line, only when one has any.
-fn change_rows(report: &UpReport) -> Vec<Vec<String>> {
-    let addressed = report.addresses.values().any(|list| !list.is_empty());
-    let mut header =
-        vec![one("NAME"), one("TYPE"), one("RESULT"), one("DETAILS")];
-    if addressed {
-        header.push(one("ADDRESS"));
-    }
+fn change_rows(report: &Report) -> Vec<Vec<String>> {
+    let header = vec![one("NAME"), one("TYPE"), one("RESULT"), one("DETAILS")];
     let rows = report.changes.iter().map(|change| {
-        let (word, reasons) = outcome_parts(&change.outcome);
-        let details = match &change.outcome {
-            lifecycle::Outcome::Failed(error) => match error.hint() {
-                Some(hint) => format!("{} (try: {hint})", error.message()),
-                None => error.message().to_string(),
-            },
-            lifecycle::Outcome::Recreated(_) => reasons.join(", "),
-            _ => reasons.join("; "),
-        };
-        let mut row = vec![
+        let (word, _) = outcome_parts(&change.outcome);
+        vec![
             one(&change.name),
             one(change.resource.as_str()),
             one(word),
-            one(&details),
-        ];
-        if addressed {
-            let found = report.addresses.get(&change.name);
-            row.push(found.cloned().unwrap_or_else(|| one("")));
-        }
-        row
+            one(&details(&change.outcome)),
+        ]
     });
     spread(std::iter::once(header).chain(rows).collect())
+}
+
+fn addresses(overview: &Overview, name: &str) -> Vec<String> {
+    if let Some(bay) = overview.bays.iter().find(|bay| bay.name == name) {
+        return bay
+            .ports
+            .iter()
+            .map(|port| address(port.host, port.http))
+            .collect();
+    }
+    overview
+        .proxies
+        .iter()
+        .find(|proxy| proxy.name == name)
+        .map_or_else(Vec::new, proxy_addresses)
+}
+
+fn proxy_addresses(proxy: &ProxyStatus) -> Vec<String> {
+    if proxy.published.is_empty() {
+        proxy.port.map(loopback).into_iter().collect()
+    } else {
+        proxy
+            .published
+            .iter()
+            .map(|port| address(port.host, port.http))
+            .collect()
+    }
 }
 
 fn change_json(change: &Change, addresses: &[String]) -> Json {
@@ -276,7 +272,6 @@ fn change_json(change: &Change, addresses: &[String]) -> Json {
     ])
 }
 
-/// A table cell: its lines, `-` for none.
 fn cell(lines: impl IntoIterator<Item = String>) -> Vec<String> {
     let lines: Vec<String> = lines.into_iter().collect();
     if lines.is_empty() {
@@ -290,8 +285,6 @@ fn one(text: &str) -> Vec<String> {
     vec![text.to_string()]
 }
 
-/// Rows of multi-line cells as printed rows: a row takes as many lines as
-/// its tallest cell, the others left blank below their first line.
 fn spread(rows: Vec<Vec<Vec<String>>>) -> Vec<Vec<String>> {
     rows.into_iter()
         .flat_map(|row| {
@@ -328,7 +321,7 @@ fn bay_row(bay: &BayStatus, wide: bool) -> Vec<Vec<String>> {
         one("bay"),
         one(state_word(bay.state)),
         one(proxy),
-        cell(bay.ports.iter().map(port_address)),
+        cell(bay.ports.iter().map(|port| address(port.host, port.http))),
     ];
     if wide {
         let apps = bay
@@ -354,11 +347,7 @@ fn bay_row(bay: &BayStatus, wide: bool) -> Vec<Vec<String>> {
 
 fn proxy_row(proxy: &ProxyStatus, wide: bool) -> Vec<Vec<String>> {
     let state = proxy_state(proxy).unwrap_or("external");
-    let ports = if proxy.published.is_empty() {
-        cell(proxy.port.map(loopback))
-    } else {
-        cell(proxy.published.iter().map(proxy_address))
-    };
+    let ports = cell(proxy_addresses(proxy));
     let mut row =
         vec![one(&proxy.name), one("proxy"), one(state), one("-"), ports];
     if wide {
@@ -393,25 +382,29 @@ fn overview_rows(overview: &Overview, wide: bool) -> Vec<Vec<String>> {
     )
 }
 
-/// What a change came to, with its reasons or error.
-fn result_text(change: &Change) -> String {
-    let (word, reasons) = outcome_parts(&change.outcome);
-    match &change.outcome {
+fn details(outcome: &lifecycle::Outcome) -> String {
+    let (_, reasons) = outcome_parts(outcome);
+    match outcome {
         lifecycle::Outcome::Failed(error) => match error.hint() {
-            Some(hint) => format!("{word}: {} (try: {hint})", error.message()),
-            None => format!("{word}: {}", error.message()),
+            Some(hint) => format!("{} (try: {hint})", error.message()),
+            None => error.message().to_string(),
         },
-        _ if reasons.is_empty() => word.to_string(),
-        lifecycle::Outcome::Recreated(_) => {
-            format!("{word} ({})", reasons.join(", "))
-        }
-        _ => format!("{word} ({})", reasons.join("; ")),
+        lifecycle::Outcome::Recreated(_) => reasons.join(", "),
+        _ => reasons.join("; "),
     }
 }
 
-/// `ps`'s rows for what the command touched, each with what it came to:
-/// a name changed twice (`restart`) shows its last change.
-fn state_rows(report: &UpReport, overview: &Overview) -> Vec<Vec<String>> {
+fn result_text(change: &Change) -> String {
+    let (word, _) = outcome_parts(&change.outcome);
+    let details = details(&change.outcome);
+    match &change.outcome {
+        _ if details.is_empty() => word.to_string(),
+        lifecycle::Outcome::Failed(_) => format!("{word}: {details}"),
+        _ => format!("{word} ({details})"),
+    }
+}
+
+fn state_rows(report: &Report, overview: &Overview) -> Vec<Vec<String>> {
     let mut header = overview_header(false);
     header.push(one("RESULT"));
     let mut names: Vec<&str> = Vec::new();
@@ -444,17 +437,14 @@ fn loopback(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// What to open: a URL for an HTTP port, else the address.
-pub(crate) fn port_address(port: &PublishedPort) -> String {
-    if port.http {
-        format!("http://{}", loopback(port.host))
+fn address(host: u16, http: bool) -> String {
+    if http {
+        format!("http://{}", loopback(host))
     } else {
-        loopback(port.host)
+        loopback(host)
     }
 }
 
-/// An image ref with its digest cut to 12 hex digits, as `docker` shows
-/// IDs; `inspect` keeps it whole.
 fn short_image(image: &str) -> String {
     const SHORT: usize = 12;
     match image.split_once("@sha256:") {
@@ -465,15 +455,6 @@ fn short_image(image: &str) -> String {
     }
 }
 
-pub(crate) fn proxy_address(port: &ProxyPort) -> String {
-    if port.http {
-        format!("http://{}", loopback(port.host))
-    } else {
-        loopback(port.host)
-    }
-}
-
-/// A VM path in pilot's home as `~/…`.
 fn in_home(vm: &str) -> String {
     match vm.strip_prefix(VM_HOME) {
         Some("") => "~".into(),
@@ -530,7 +511,7 @@ fn proxy_ports_json(ports: &[ProxyPort]) -> Json {
                     ("name", json::string(port.name)),
                     ("host", number(port.host)),
                     ("vm", number(port.vm)),
-                    ("address", json::string(&proxy_address(port))),
+                    ("address", json::string(&address(port.host, port.http))),
                 ])
             })
             .collect(),
@@ -547,7 +528,7 @@ fn ports_json(ports: &[PublishedPort]) -> Json {
                     ("app", json::string(&port.app)),
                     ("host", number(port.host)),
                     ("vm", number(port.vm)),
-                    ("address", json::string(&port_address(port))),
+                    ("address", json::string(&address(port.host, port.http))),
                     ("purpose", json::string(&port.purpose)),
                 ])
             })
@@ -555,12 +536,10 @@ fn ports_json(ports: &[PublishedPort]) -> Json {
     )
 }
 
-/// `unknown` when the sandbox couldn't tell.
 fn state_word(state: Option<BoxState>) -> &'static str {
     state.map_or("unknown", BoxState::as_str)
 }
 
-/// `None` for a proxy that runs elsewhere.
 fn proxy_state(proxy: &ProxyStatus) -> Option<&'static str> {
     proxy.managed.then(|| state_word(proxy.state))
 }
@@ -587,11 +566,13 @@ fn apps_json(bay: &BayStatus) -> Json {
     )
 }
 
+/// A writable mount of the user's own is one they marked unsafe.
 fn mount_mode(mount: &MountStatus) -> &'static str {
-    match mount.mode {
-        Mode::Ro => "ro",
-        Mode::Rw => "rw",
-        Mode::Copy => "copy",
+    match (mount.mode, mount.kind) {
+        (Mode::Ro, _) => "ro",
+        (Mode::Rw, MountKind::User) => "rw-unsafe",
+        (Mode::Rw, _) => "rw",
+        (Mode::Copy, _) => "copy",
     }
 }
 
@@ -603,7 +584,6 @@ fn mount_kind(kind: MountKind) -> &'static str {
     }
 }
 
-/// `label:` then the first value, the rest lined up under it.
 fn field(label: &str, values: Vec<String>) -> Vec<String> {
     let label = format!("{label}:");
     let mut values = values.into_iter();
@@ -632,7 +612,7 @@ fn bay_text(bay: &BayDetail) -> Vec<String> {
         format!(
             "{}  {}  {} (app {})",
             port.name,
-            port_address(port),
+            address(port.host, port.http),
             port.purpose,
             port.app
         )
@@ -706,10 +686,9 @@ fn proxy_text(proxy: &ProxyDetail) -> Vec<String> {
         if status.published.is_empty() {
             field("address", status.port.map(loopback).into_iter().collect())
         } else {
-            let ports = status
-                .published
-                .iter()
-                .map(|port| format!("{}  {}", port.name, proxy_address(port)));
+            let ports = status.published.iter().map(|port| {
+                format!("{}  {}", port.name, address(port.host, port.http))
+            });
             field("ports", ports.collect())
         },
         field("bays", proxy.bays.clone()),
@@ -803,8 +782,6 @@ fn detail_json(detail: &Detail) -> Json {
     }
 }
 
-/// Rows padded to each column's widest cell, two spaces apart; nothing
-/// without rows below the header.
 fn table(rows: &[Vec<String>]) -> Vec<String> {
     if rows.len() < 2 {
         return Vec::new();
@@ -834,7 +811,7 @@ fn table(rows: &[Vec<String>]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{Outcome, Render, error_json};
-    use crate::commands::UpReport;
+    use crate::commands::Report;
     use crate::error::Error;
     use crate::lifecycle::{self, Change, Resource};
     use crate::mounts::{Mode, MountKind, MountStatus};
@@ -880,14 +857,8 @@ mod tests {
                 outcome,
             })
             .collect();
-        let addresses = [(
-            "p".to_string(),
-            vec!["127.0.0.1:3100".to_string(), "http://127.0.0.1:3101".into()],
-        )]
-        .into();
-        Outcome::Changes(UpReport {
+        Outcome::Changes(Report {
             changes,
-            addresses,
             overview: None,
         })
     }
@@ -897,9 +868,8 @@ mod tests {
         let outcome = changes();
         assert_eq!(
             outcome.human(),
-            "NAME  TYPE   RESULT     DETAILS            ADDRESS\n\
-             p     proxy  created                       127.0.0.1:3100\n\
-             \x20                                          http://127.0.0.1:3101\n\
+            "NAME  TYPE   RESULT     DETAILS\n\
+             p     proxy  created\n\
              a     bay    recreated  image, ports\n\
              b     bay    updated    env; copies +x\n\
              c     bay    unchanged\n\
@@ -909,7 +879,7 @@ mod tests {
              g     bay    failed     bust"
         );
         assert_eq!(outcome.exit_code(), 1);
-        let ok = Outcome::Changes(UpReport::default());
+        let ok = Outcome::Changes(Report::default());
         assert_eq!(ok.exit_code(), 0);
         assert_eq!(Outcome::Done.exit_code(), 0);
     }
@@ -918,7 +888,7 @@ mod tests {
     fn up_json_shape() {
         let json = to_string(&changes().json());
         assert!(json.starts_with(
-            r#"{"changes":[{"addresses":["127.0.0.1:3100","http://127.0.0.1:3101"],"error":null,"name":"p","outcome":"created","reasons":[],"type":"proxy"},{"addresses":[],"error":null,"name":"a","outcome":"recreated","reasons":["image","ports"],"type":"bay"}"#
+            r#"{"changes":[{"addresses":[],"error":null,"name":"p","outcome":"created","reasons":[],"type":"proxy"},{"addresses":[],"error":null,"name":"a","outcome":"recreated","reasons":["image","ports"],"type":"bay"}"#
         ), "{json}");
         assert!(json.contains(
             r#"{"addresses":[],"error":{"error":"boom","hint":"retry"},"name":"f","outcome":"failed","reasons":[],"type":"bay"}"#
