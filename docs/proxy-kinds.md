@@ -136,8 +136,12 @@ Tokens: `master-password`, asked on the first `up` of the proxy, and
    owns the server), and add services and credentials to the vault.
    An OAuth credential's "Connect" runs in your browser, so no OAuth
    token ever enters a bay.
-3. Create an agent token with the proxy role, then `hangar up` a bay
-   and paste it.
+3. On the **Agents** page, create an agent and give it the proxy role
+   on the vault; a vault's own Agents tab only adds agents that already
+   exist. Paste its token (`av_agt_…`) when `hangar up` asks, just
+   before the first bay behind the proxy starts. `up` checks every
+   bay's login with the proxy, so a wrong token fails that bay with the
+   proxy's reason and the `secret set` that fixes it.
 
 One you run yourself, `"url"`:
 

@@ -15,7 +15,7 @@ use crate::hangar::Hangar;
 use crate::lifecycle::{self, Outcome, Plan, disk_changed};
 use crate::mounts::{self, Resolved, Roots};
 use crate::proxy::ca::sha256_hex;
-use crate::proxy::{self, Access};
+use crate::proxy::{self, Access, LoginCheck, Proxy};
 use crate::sandbox::{
     BoxState, Egress, Mount, MountMode, Sandbox, VmSpec, Volume, data_volume,
 };
@@ -98,6 +98,9 @@ fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
     })?;
     step(bay, "proxy env", || {
         let proxy = hangar.proxy_of(bay.settings);
+        if let Some((name, proxy)) = proxy {
+            check_login(name, proxy, bay.name)?;
+        }
         let access = proxy::access(proxy, bay.name, sandbox.host_address())?;
         let env = proxy_env(proxy.map(|(_, proxy)| proxy.kind()), &access);
         let ca = access.ca_pem.as_deref().unwrap_or_default();
@@ -140,6 +143,37 @@ fn step<T>(
 
 fn listed(label: &str, items: &[String]) -> Option<String> {
     (!items.is_empty()).then(|| format!("{label} {}", items.join(" ")))
+}
+
+/// Fails the bay when its proxy refuses its login, with the proxy's own
+/// words: a bad token would otherwise surface only as a 407 in the bay.
+fn check_login(name: &str, proxy: &dyn Proxy, bay: &str) -> Result<()> {
+    let Egress::HostPort(port) = proxy.egress() else {
+        return Ok(());
+    };
+    let Some(login) = proxy.login(bay)? else {
+        return Ok(());
+    };
+    let LoginCheck::Refused(why) = proxy::check_login(port, &login) else {
+        return Ok(());
+    };
+    let key = proxy
+        .bay_tokens()
+        .into_iter()
+        .find(|(owner, _)| owner == bay)
+        .map(|(_, key)| key)
+        .or_else(|| {
+            let slot = proxy.secrets().iter().find(|slot| slot.for_bays)?;
+            Some(slot.key.to_string())
+        });
+    let command = match key {
+        Some(key) => format!("hangar secret set {name} {key}"),
+        None => format!("hangar secret set {name}"),
+    };
+    Err(Error::with_hint(
+        format!("proxy {name} refused the login of bay {bay}: {why}"),
+        format!("run '{command}'"),
+    ))
 }
 
 fn egress(hangar: &Hangar, bay: &Bay) -> Egress {

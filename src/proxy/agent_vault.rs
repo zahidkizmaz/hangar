@@ -21,7 +21,8 @@ const TOKEN: &str = "token";
 const MASTER_PASSWORD: &str = "master-password";
 const TOKEN_SLOT: Slot = Slot {
     key: TOKEN,
-    about: "the Agent Vault token the bays log in with",
+    about: "an agent token from Agent Vault's Agents page, with the proxy \
+            role on the vault",
     for_bays: true,
 };
 const SLOTS: &[Slot] = &[TOKEN_SLOT];

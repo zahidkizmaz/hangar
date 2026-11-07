@@ -453,7 +453,10 @@ fn own_token(proxy: &dyn Proxy, bay: &str) -> Option<Token> {
         .find(|(owner, _)| owner == bay)
         .map(|(_, key)| Token {
             key,
-            about: format!("the token bay {bay} logs in with"),
+            about: match proxy.secrets().iter().find(|slot| slot.for_bays) {
+                Some(slot) => format!("{}; only for bay {bay}", slot.about),
+                None => format!("the token bay {bay} logs in with"),
+            },
         })
 }
 
@@ -1179,7 +1182,7 @@ mod tests {
             *prompt.questions.borrow(),
             [
                 "v bay-token (the fake bay token); Enter skips it",
-                "v token@x (the token bay x logs in with); Enter skips it",
+                "v token@x (the fake bay token; only for bay x); Enter skips it",
             ]
         );
         let items = keychain.items.borrow();
@@ -1211,6 +1214,34 @@ mod tests {
         assert_eq!(error.hint(), Some("it keeps: token, bay-token, token@x"));
         rm(&hangar, "v", true, true, &no_prompt()).unwrap();
         assert!(keychain.items.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_bay_whose_login_the_proxy_refuses_fails_with_why_and_the_fix() {
+        let (port, _server) = crate::testing::serve_each(vec![(
+            "407 Proxy Authentication Required",
+            "invalid or expired session",
+        )]);
+        let config = format!(
+            r#"{{"proxies": {{"p": {{"kind": "fake", "port": {port},
+                "url": "http://127.0.0.1:{port}", "login": "u:pw",
+                "bayToken": true}}}},
+                "bays": [{{"name": "a", "proxy": "p"}}]}}"#
+        );
+        let sandbox = settled();
+        let hangar = hangar_with(&config, &scratch_dir("cmd-login"), sandbox);
+        let report = up(&hangar, &names(&["a"])).unwrap();
+        let crate::lifecycle::Outcome::Failed(error) =
+            &report.changes[1].outcome
+        else {
+            panic!("{:?}", summary(&report));
+        };
+        assert_eq!(
+            error.message(),
+            "bay a: proxy env: proxy p refused the login of bay a: invalid or \
+             expired session"
+        );
+        assert_eq!(error.hint(), Some("run 'hangar secret set p bay-token'"));
     }
 
     #[test]

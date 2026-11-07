@@ -11,6 +11,7 @@ mod infisical;
 pub(crate) mod managed;
 mod secrets;
 
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -220,6 +221,72 @@ pub(crate) fn external_url<'a>(spec: &'a Spec, kind: &str) -> Result<&'a str> {
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What a login check learned: a refusal is the proxy's own words.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoginCheck {
+    Taken,
+    Refused(String),
+    /// No clear answer (unreachable, or an answer about something else):
+    /// the health check speaks to that.
+    Unknown,
+}
+
+/// Asks the proxy on the loopback `port` whether it takes `login`, the
+/// way a bay's client would: a CONNECT with Basic auth. Nothing reaches
+/// an upstream; the host is reserved and never resolves.
+pub(crate) fn check_login(port: u16, login: &Login) -> LoginCheck {
+    use base64::Engine;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT)
+    else {
+        return LoginCheck::Unknown;
+    };
+    let _ = stream.set_read_timeout(Some(LOGIN_TIMEOUT));
+    let pair = format!("{}:{}", login.user.expose(), login.password.expose());
+    let basic =
+        Secret::new(base64::engine::general_purpose::STANDARD.encode(pair));
+    let target = "hangar-login-check.invalid:443";
+    let request = Secret::new(format!(
+        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\
+         Proxy-Authorization: Basic {}\r\n\r\n",
+        basic.expose()
+    ));
+    if stream.write_all(request.expose().as_bytes()).is_err() {
+        return LoginCheck::Unknown;
+    }
+    let mut answer = Vec::new();
+    let _ = stream.take(4096).read_to_end(&mut answer);
+    login_answer(&String::from_utf8_lossy(&answer))
+}
+
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A refusal is 407, 401, 403, 400 or 404, explained by its body or else
+/// its status line.
+fn login_answer(answer: &str) -> LoginCheck {
+    let Some(status) = answer.lines().next() else {
+        return LoginCheck::Unknown;
+    };
+    let code = status.split_whitespace().nth(1).unwrap_or("");
+    if !matches!(code, "400" | "401" | "403" | "404" | "407") {
+        return if code == "200" {
+            LoginCheck::Taken
+        } else {
+            LoginCheck::Unknown
+        };
+    }
+    let body = answer
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .trim();
+    let reason = if body.is_empty() {
+        status.splitn(3, ' ').nth(2).unwrap_or(code).trim()
+    } else {
+        body.lines().next().unwrap_or(body)
+    };
+    LoginCheck::Refused(reason.chars().take(200).collect())
+}
+
 /// Up when something accepts connections on the loopback `port`.
 pub(crate) fn tcp_health(port: u16) -> Health {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
@@ -291,6 +358,72 @@ pub(crate) fn proxy_url(
 mod tests {
     use super::*;
     use crate::json;
+    use crate::testing::serve_each;
+
+    fn a_login(user: &str, password: &str) -> Login {
+        Login {
+            user: Secret::new(user.into()),
+            password: Secret::new(password.into()),
+        }
+    }
+
+    #[test]
+    fn a_login_check_is_a_connect_with_basic_auth_and_never_leaves() {
+        let (port, server) = serve_each(vec![
+            (
+                "407 Proxy Authentication Required",
+                "invalid or expired session\n",
+            ),
+            ("200 Connection established", ""),
+        ]);
+        assert_eq!(
+            check_login(port, &a_login("av_tok", "default")),
+            LoginCheck::Refused("invalid or expired session".into())
+        );
+        assert_eq!(
+            check_login(port, &a_login("good", "default")),
+            LoginCheck::Taken
+        );
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0].starts_with(
+                "CONNECT hangar-login-check.invalid:443 HTTP/1.1\r\n"
+            ),
+            "{requests:?}"
+        );
+        // base64 of "av_tok:default"
+        assert!(
+            requests[0].contains(
+                "Proxy-Authorization: Basic YXZfdG9rOmRlZmF1bHQ=\r\n"
+            ),
+            "{requests:?}"
+        );
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = silent.local_addr().unwrap().port();
+        drop(silent);
+        assert_eq!(
+            check_login(closed, &a_login("a", "b")),
+            LoginCheck::Unknown
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_fails_a_login_and_names_why() {
+        let answer = |status: &str, body: &str| {
+            login_answer(&format!("HTTP/1.1 {status}\r\nX: y\r\n\r\n{body}"))
+        };
+        assert_eq!(
+            answer("404 Not Found", "vault not found\n"),
+            LoginCheck::Refused("vault not found".into())
+        );
+        assert_eq!(
+            answer("403 Forbidden", ""),
+            LoginCheck::Refused("Forbidden".into())
+        );
+        assert_eq!(answer("502 Bad Gateway", "dns"), LoginCheck::Unknown);
+        assert_eq!(answer("200 OK", ""), LoginCheck::Taken);
+        assert_eq!(login_answer(""), LoginCheck::Unknown);
+    }
     use crate::proxy::fake::FakeProxy;
     use crate::sandbox::Egress;
     use crate::testing::no_secrets;
