@@ -70,7 +70,7 @@ hangar init # writes ~/.config/hangar/hangar.json
 ```
 
 `hangar init` writes one direct bay, `default`. Add a proxy and point the
-bay at it; the README has a full example with a managed Infisical proxy,
+bay at it; the README has an example with a managed Agent Vault proxy,
 and [proxy-kinds.md](proxy-kinds.md) has every kind. Then:
 
 ```sh

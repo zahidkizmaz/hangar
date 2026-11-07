@@ -1,86 +1,74 @@
 # hangar
 
-Locked-down VMs for AI coding agents, with your secrets kept outside them.
+hangar runs AI coding agents such as Claude Code and Codex in microVMs,
+called bays, on your own machine. It runs on macOS (Apple Silicon) and on
+Linux with KVM.
 
 ## Why
 
-Coding agents do their best work when they can run real tools: clone repos,
-install packages, start Docker, run the test suite, open a PR. Doing that
-on your own machine hands them your files, your network and every token in
-your environment. hangar gives each agent a disposable VM, a bay, whose
-only way out is a proxy you choose. The proxy holds the real credentials;
-the bay holds placeholders.
+Agents work best when they can clone repos, install packages, run Docker
+and run tests. Doing that on your machine gives them your files, your
+network and every token in your environment. In hangar, a bay's only way
+out is a proxy you choose. The proxy holds the real credentials; the bay
+holds only placeholders. Nothing an agent does runs on your machine:
+writable host mounts need an explicit `"unsafe": true`.
 
-## Advantages
-
-- **One egress.** A bay with a proxy can reach that proxy's port and
-  nothing else: no direct internet, DNS or LAN.
-- **Secrets stay out.** A bay gets only its proxy login, on stdin.
-  Enrolment tokens never enter a bay.
-- **Pluggable proxies.** A managed Infisical Agent Vault proxy in its own
-  VM, an Agent Vault you run yourself, or any HTTP proxy. A new kind is
-  one Rust file.
-- **No root for apps.** Agents, shells and copied files run as the user
-  `pilot`, with rootless Docker and no sudo.
-- **Declarative.** One `hangar.json` or the NixOS / nix-darwin module.
+- **Declarative.** One `hangar.json`, or the NixOS / nix-darwin module.
   `hangar up` creates, updates or recreates whatever changed and says why.
+- **Pluggable proxies.** A managed Agent Vault, Infisical's Agent Vault
+  proxy, or any HTTP proxy. Proxy tokens live in the OS keychain.
+- **Pluggable sandbox.** Bays run on microsandbox (`msb`) by default.
 
-## Quick start
+## Install
 
-You need [microsandbox](https://microsandbox.dev) (`msb`); on Linux also
-access to `/dev/kvm` and `secret-tool` (libsecret). You also need
-Infisical Agent Vault set up, with a proxy token and a session token (see
-[docs/proxy-kinds.md](docs/proxy-kinds.md#infisical)).
+You need [microsandbox](https://microsandbox.dev) (`msb`). On Linux you
+also need access to `/dev/kvm` and `secret-tool` (libsecret).
 
 ```sh
 brew install superradcompany/tap/microsandbox # or see microsandbox.dev
 cargo install --git https://github.com/zahidkizmaz/hangar
-hangar init # writes ~/.config/hangar/hangar.json
 ```
 
-Replace `~/.config/hangar/hangar.json` with:
+On NixOS or nix-darwin, the module installs both: [docs/nix.md](docs/nix.md).
+
+## Quick start
+
+`hangar init` writes a starter config; `hangar config edit` opens it.
+A managed Agent Vault proxy and one bay:
 
 ```json
 {
-  "proxies": {
-    "vault": { "kind": "infisical", "run": "managed" }
-  },
+  "proxies": { "vault": { "kind": "agent-vault", "run": "managed" } },
   "defaults": { "proxy": "vault" },
   "bays": [{ "name": "work", "apps": ["claude-code"] }]
 }
 ```
 
-Until a hangar release is tagged, the default bay image isn't
-published: build and load it, or use the Nix module's `imagePackage`
-([docs/nix.md](docs/nix.md#local-images)). The Infisical access bundle
-must allow the hosts a bay fetches from
-([list](docs/proxy-kinds.md#infisical-setup)).
-
 ```sh
-hangar up         # asks for the proxy's two tokens once (kept in the
-                  # OS keychain), then starts the proxy's VM and the bay
+hangar up         # starts the proxy, then the bay; asks for tokens once
 hangar ps         # what runs, and anything wrong
 hangar exec work  # a shell in the bay
 ```
 
-On NixOS or nix-darwin, the module takes the same keys:
-[docs/nix.md](docs/nix.md).
+Until a hangar release is tagged, the default bay image isn't published:
+build and load it, or use the Nix module's `imagePackage`
+([docs/nix.md](docs/nix.md#local-images)). Setting up the proxy itself is
+covered in [docs/proxy-kinds.md](docs/proxy-kinds.md#agent-vault).
 
-## Docs
+Other commands: `down`, `inspect`, `logs`, `cp`, `setup`, `secret set`,
+`config show` and `rm`. See `hangar --help`.
 
-- [Using hangar](docs/usage.md): install, the security model, the
-  commands, Docker in a bay, troubleshooting.
-- [Configuration](docs/configuration.md): every setting, apps, mounts and
-  the bay image.
-- [Proxy kinds](docs/proxy-kinds.md): `infisical`, `agent-vault`, `http`,
-  and how to add one.
-- [Nix](docs/nix.md): the NixOS and nix-darwin modules.
-- [CLI for scripts and agents](docs/cli.md): `--json` output and exit
-  codes.
+## Documentation
+
+- [Using hangar](docs/usage.md): security model, commands, troubleshooting
+- [Configuration](docs/configuration.md): every setting, apps and mounts
+- [Proxy kinds](docs/proxy-kinds.md): `agent-vault`, `infisical`, `http`
+- [Nix](docs/nix.md): the NixOS and nix-darwin modules
+- [CLI for scripts and agents](docs/cli.md): `--json` output, exit codes
 - [Architecture](docs/architecture.md),
-  [Sandbox backends](docs/sandbox-backends.md) and
-  [Development](docs/development.md). Coding agents start with
-  [AGENTS.md](AGENTS.md).
+  [sandbox backends](docs/sandbox-backends.md),
+  [development](docs/development.md); coding agents start with
+  [AGENTS.md](AGENTS.md)
 
 ## License
 
