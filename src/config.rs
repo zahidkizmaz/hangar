@@ -78,11 +78,35 @@ pub(crate) struct BaySettings {
     pub(crate) mounts: BTreeMap<String, MountSpec>,
 }
 
+/// Where release images are pushed; `config/defaults.json` says the same.
+const RELEASE_REPOSITORY: &str = "ghcr.io/zahidkizmaz/hangar-bay";
+
 impl BaySettings {
     pub(crate) fn image_ref(&self) -> String {
         self.image.clone().unwrap_or_else(|| {
-            format!("{}:v{}", self.image_repository, env!("CARGO_PKG_VERSION"))
+            release_image(
+                &self.image_repository,
+                env!("CARGO_PKG_VERSION"),
+                option_env!("HANGAR_BAY_IMAGE_DIGEST"),
+            )
         })
+    }
+}
+
+/// The image released with this hangar. A release build carries the
+/// image's digest, so a re-pushed tag changes nothing; it only fits the
+/// repository it was pushed to.
+fn release_image(
+    repository: &str,
+    version: &str,
+    digest: Option<&str>,
+) -> String {
+    let tag = format!("{repository}:v{version}");
+    match digest {
+        Some(digest) if repository == RELEASE_REPOSITORY => {
+            format!("{tag}@{digest}")
+        }
+        _ => tag,
     }
 }
 
@@ -901,6 +925,28 @@ mod tests {
             "bays.default.mounts.~/code.unsafe: only a \"rw\" mount can be \
              unsafe"
         );
+    }
+
+    #[test]
+    fn a_release_pins_its_own_image_by_digest() {
+        use super::{RELEASE_REPOSITORY, release_image};
+        let digest = Some("sha256:abc");
+        assert_eq!(
+            release_image(RELEASE_REPOSITORY, "0.1.0", digest),
+            format!("{RELEASE_REPOSITORY}:v0.1.0@sha256:abc")
+        );
+        assert_eq!(
+            release_image(RELEASE_REPOSITORY, "0.1.0", None),
+            format!("{RELEASE_REPOSITORY}:v0.1.0")
+        );
+        assert_eq!(
+            release_image("ghcr.io/fork/bay", "0.1.0", digest),
+            "ghcr.io/fork/bay:v0.1.0"
+        );
+        let bay = resolve_with(r#"{"bays": [{"name": "a", "proxy": null}]}"#)
+            .bays
+            .remove(0);
+        assert_eq!(bay.image_repository, RELEASE_REPOSITORY);
     }
 
     #[test]

@@ -271,10 +271,11 @@ docker, nix, direnv with nix-direnv, git, gh, uv and common CLI tools
 (ripgrep, fd, jq, yq, ast-grep, just, make, …). CI publishes it to
 `ghcr.io/zahidkizmaz/hangar-bay`.
 
-By default a bay uses the image tagged with hangar's own version
+By default a bay uses the image released with hangar's own version
 (`ghcr.io/zahidkizmaz/hangar-bay:v<version>`), so the CLI and the image
-always match. A fork sets `imageRepository`, or `image` to any ref (a
-digest pins it). Any image must be built from
+always match. A release binary pins it by digest, so a re-pushed tag
+changes nothing; a build from source uses the tag. A fork sets
+`imageRepository`, or `image` to any ref (a digest pins it). Any image must be built from
 `nix/bay/configuration.nix`: hangar boots its systemd and runs apps as
 units of its user `pilot` (uid 1000). To build and load one locally, see
 [Local images](nix.md#local-images).
