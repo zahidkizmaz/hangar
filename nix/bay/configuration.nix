@@ -147,12 +147,27 @@ in
   '';
   programs.git = {
     enable = true;
+    # Full git brings perl and python.
+    package = pkgs.gitMinimal;
     # The proxy swaps in the real token; git only needs a placeholder.
     config.credential."https://github.com".helper =
       "!f() { echo username=x-access-token; echo password=__placeholder__; }; f";
   };
   # With nix-direnv.
   programs.direnv.enable = true;
+
+  # Smaller image, fewer tools for an agent: NixOS defaults a bay never
+  # uses.
+  boot.bcache.enable = false;
+  boot.kexec.enable = false;
+  # Only dosfstools: a bay never mounts FAT.
+  system.fsPackages = lib.mkForce [ ];
+  fonts.fontconfig.enable = false;
+  programs.nano.enable = false;
+  # moby's XFS tools bring python and icu; the bay's disk isn't XFS.
+  virtualisation.docker.rootless.package = pkgs.docker.override {
+    xfsprogs = pkgs.emptyDirectory;
+  };
 
   # On top of NixOS's core packages (coreutils, curl, …), nix and docker.
   environment.systemPackages = with pkgs; [
