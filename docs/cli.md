@@ -81,9 +81,9 @@ URL for an HTTP port.
   "proxies": [
     { "name": "vault", "kind": "infisical", "state": "running",
       "image": "infisical/cli:0.45.3@sha256:…", "health": "up",
-      "port": 17323 },
+      "address": "127.0.0.1:17323" },
     { "name": "corp", "kind": "http", "state": null, "image": null,
-      "health": "unreachable", "port": 3128 } ],
+      "health": "unreachable", "address": "127.0.0.1:3128" } ],
   "leftovers": [ { "name": "old", "type": "bay" } ] }
 ```
 
@@ -93,7 +93,8 @@ URL for an HTTP port.
   apps with a run entry while it runs: `running`, `exited` or
   `needs-setup`.
 - `health` is `up`, `unreachable`, or `null` when a managed proxy's VM
-  isn't running. `port` is the host port its bays reach it on.
+  isn't running. `address` is where its bays reach it: a host port, or
+  the IP of a proxy on another machine.
 - A bay's `ports` are published on `127.0.0.1`; `address` is a URL for an
   HTTP port, else `127.0.0.1:<port>`.
 - `leftovers`: bays and proxies with a folder in the data dir but no config
@@ -105,7 +106,7 @@ A bay:
 
 ```json
 { "version": 1, "name": "work", "type": "bay", "state": "running",
-  "proxy": "vault", "proxy_port": 17323,
+  "proxy": "vault", "proxy_address": "127.0.0.1:17323",
   "image": "ghcr.io/zahidkizmaz/hangar-bay:v0.1.0",
   "vm": "hangar-bay-work", "cpus": 4, "memory": "6G", "disk": "40G",
   "home": "/home/you/.local/share/hangar/bays/work/home",
@@ -119,7 +120,7 @@ A bay:
       "mode": "rw", "kind": "home", "applied": true } ] }
 ```
 
-`proxy_port` is the bay's only way out, `null` for the open internet. `env`
+`proxy_address` is the bay's only way out, `null` for the open internet. `env`
 holds names only. `mounts` lists every mount, hangar's own (`kind`: `user`,
 `home` or `cache`) and the `copy` ones (`mode`: `ro`, `rw`, `rw-unsafe` for one
 of yours marked unsafe, or `copy`). `applied` says whether the VM was created
@@ -129,7 +130,8 @@ A proxy:
 
 ```json
 { "version": 1, "name": "vault", "type": "proxy", "kind": "infisical",
-  "state": "running", "health": "up", "health_error": null, "port": 17323,
+  "state": "running", "health": "up", "health_error": null,
+  "address": "127.0.0.1:17323",
   "url": null, "image": "infisical/cli:0.45.3@sha256:…",
   "vm": "hangar-proxy-vault",
   "data": "/home/you/.local/share/hangar/proxies/vault/data",

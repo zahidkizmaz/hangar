@@ -5,8 +5,9 @@
 Every VM runs on the sandbox backend, msb (microsandbox) by default:
 
 - `hangar-bay-<name>`, a bay, where agents run. With a proxy, its only
-  outbound path is that proxy's port on the host's loopback: bay →
-  `host:<port>` → proxy → upstream. With `"proxy": null` it has the open
+  outbound path is that proxy's port on the host's loopback (bay →
+  `host:<port>` → proxy → upstream), or the IP and port of a proxy on
+  another machine. With `"proxy": null` it has the open
   internet.
 - `hangar-proxy-<name>`, a managed proxy (kinds with `"run": "managed"`).
   Its own egress is the open internet; it publishes its port on the
@@ -35,7 +36,7 @@ The core never trusts a kind with the security-critical parts:
 | the CA a bay trusts | `proxy::access` checks it is exactly one PEM certificate (`ca::verify`), pinned when the kind sets `sha256` |
 | secrets off argv, env and logs | logins and URLs are `Secret`s; tokens go on `exec` stdin; `VmSpec.env` is non-secret |
 | proxy tokens off disk | `keychain` keeps them in the OS keychain (tool by absolute path, token on its stdin); `proxy::Secrets` reads them when needed |
-| remote proxies | `proxy::loopback_port` refuses a non-loopback `url` |
+| remote proxies | `proxy::external_egress` takes a `url` on another machine only with `"unsafe": true`; the bay reaches its IP only |
 
 Kinds and how to add one: [proxy-kinds.md](proxy-kinds.md).
 

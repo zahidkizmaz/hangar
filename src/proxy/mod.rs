@@ -12,7 +12,7 @@ pub(crate) mod managed;
 mod secrets;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -231,14 +231,12 @@ pub(crate) enum LoginCheck {
     Unknown,
 }
 
-/// Asks the proxy on the loopback `port` whether it takes `login`, the
-/// way a bay's client would: a CONNECT with Basic auth. Nothing reaches
-/// an upstream; the host is reserved and never resolves.
-pub(crate) fn check_login(port: u16, login: &Login) -> LoginCheck {
+/// Asks the proxy at `address` whether it takes `login`, the way a bay's
+/// client would: a CONNECT with Basic auth. Nothing reaches an upstream;
+/// the host is reserved and never resolves.
+pub(crate) fn check_login(address: (&str, u16), login: &Login) -> LoginCheck {
     use base64::Engine;
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT)
-    else {
+    let Ok(mut stream) = connect(address) else {
         return LoginCheck::Unknown;
     };
     let _ = stream.set_read_timeout(Some(LOGIN_TIMEOUT));
@@ -285,29 +283,58 @@ fn login_answer(answer: &str) -> LoginCheck {
     LoginCheck::Refused(reason.chars().take(200).collect())
 }
 
-pub(crate) fn tcp_health(port: u16) -> Health {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    match TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) {
+pub(crate) fn tcp_health(address: (&str, u16)) -> Health {
+    match connect(address) {
         Ok(_) => Health::Up,
-        Err(why) => Health::Down(format!("127.0.0.1:{port}: {why}")),
+        Err(why) => Health::Down(format!("{}:{}: {why}", address.0, address.1)),
     }
 }
 
-pub(crate) fn loopback_port(url: &str) -> Result<u16> {
-    let expected = || format!("{url}: expected http://127.0.0.1:<port>");
-    let (host, port) = http_authority(url).context(expected())?;
-    if !is_loopback_host(&host) {
-        return Err(Error::with_hint(
-            format!("{url}: remote proxies aren't supported yet"),
-            "see docs/proxy-kinds.md",
-        ));
+fn connect(address: (&str, u16)) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::other("no address");
+    for socket in address.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&socket, HEALTH_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(why) => last = why,
+        }
     }
-    port.context(expected())
+    Err(last)
+}
+
+/// A bay's login crosses the network in the clear, so a proxy off this
+/// machine needs `"unsafe": true`.
+pub(crate) fn external_egress(spec: &Spec) -> Result<Egress> {
+    let fields = &spec.fields;
+    let url = match &spec.location {
+        Location::External(url) => url.as_str(),
+        Location::Managed => bail!("{}: expected \"url\"", fields.path()),
+    };
+    let expected = || format!("{url}: expected http://<host>:<port>");
+    let (host, port) = http_authority(url).context(expected())?;
+    let port = port.context(expected())?;
+    let unsafe_ok = fields.flag_or("unsafe", false)?;
+    match (is_loopback_host(&host), unsafe_ok) {
+        (true, false) => Ok(Egress::HostPort(port)),
+        (true, true) => bail!(
+            "{}: only a proxy on another machine can be unsafe",
+            fields.at("unsafe")
+        ),
+        (false, true) => Ok(Egress::Remote(host, port)),
+        (false, false) => Err(Error::with_hint(
+            format!(
+                "{url}: bays would send their login to this proxy \
+                 unencrypted"
+            ),
+            "if the network to it is trusted, set \"unsafe\": true on \
+             the proxy",
+        )),
+    }
 }
 
 pub(crate) fn access(
     proxy: Option<(&str, &dyn Proxy)>,
     bay: &str,
+    egress: &Egress,
     host_alias: &str,
 ) -> Result<Access> {
     let Some((name, proxy)) = proxy else {
@@ -322,7 +349,7 @@ pub(crate) fn access(
     }
     let login = proxy.login(bay)?;
     Ok(Access {
-        url: proxy_url(proxy.egress(), login.as_ref(), host_alias),
+        url: proxy_url(egress, login.as_ref(), host_alias),
         ca_pem,
     })
 }
@@ -334,19 +361,22 @@ const USERINFO: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 fn proxy_url(
-    egress: Egress,
+    egress: &Egress,
     login: Option<&Login>,
     host_alias: &str,
 ) -> Option<Secret> {
-    let Egress::HostPort(port) = egress else {
-        return None;
+    let host = match egress {
+        Egress::HostPort(_) => host_alias,
+        Egress::Remote(host, _) => host,
+        Egress::Open | Egress::OpenAndHostPort(_) => return None,
     };
+    let (_, port) = egress.proxy()?;
     let userinfo = login.map_or_else(String::new, |login| {
         let user = utf8_percent_encode(login.user.expose(), USERINFO);
         let password = utf8_percent_encode(login.password.expose(), USERINFO);
         format!("{user}:{password}@")
     });
-    Some(Secret::new(format!("http://{userinfo}{host_alias}:{port}")))
+    Some(Secret::new(format!("http://{userinfo}{host}:{port}")))
 }
 
 #[cfg(test)]
@@ -372,11 +402,11 @@ mod tests {
             ("200 Connection established", ""),
         ]);
         assert_eq!(
-            check_login(port, &a_login("av_tok", "default")),
+            check_login(("127.0.0.1", port), &a_login("av_tok", "default")),
             LoginCheck::Refused("invalid or expired session".into())
         );
         assert_eq!(
-            check_login(port, &a_login("good", "default")),
+            check_login(("127.0.0.1", port), &a_login("good", "default")),
             LoginCheck::Taken
         );
         let requests = server.join().unwrap();
@@ -393,7 +423,7 @@ mod tests {
             "{requests:?}"
         );
         assert_eq!(
-            check_login(closed_port(), &a_login("a", "b")),
+            check_login(("127.0.0.1", closed_port()), &a_login("a", "b")),
             LoginCheck::Unknown
         );
     }
@@ -525,29 +555,64 @@ mod tests {
         assert_eq!(proxy_vm("main"), "hangar-proxy-main");
     }
 
+    fn egress_of(url: &str, fields: &str) -> Result<Egress> {
+        crate::testing::build_proxy(
+            http::build,
+            "p",
+            fields,
+            Location::External(url.into()),
+            Path::new("/data/p"),
+            std::rc::Rc::default(),
+        )
+        .map(|proxy| proxy.egress())
+    }
+
     #[test]
-    fn loopback_only_until_remote_proxies_exist() {
-        assert_eq!(loopback_port("http://127.0.0.1:3128").unwrap(), 3128);
-        assert_eq!(loopback_port("http://localhost:3128").unwrap(), 3128);
-        let error = loopback_port("http://vault.example.com:14322")
-            .err()
-            .unwrap();
+    fn a_local_proxy_is_one_host_port() {
+        let plain = r#"{"kind": "http"}"#;
+        for url in ["http://127.0.0.1:3128", "http://localhost:3128"] {
+            assert_eq!(egress_of(url, plain).unwrap(), Egress::HostPort(3128));
+        }
+        let error = error_of(egress_of(
+            "http://127.0.0.1:3128",
+            r#"{"kind": "http", "unsafe": true}"#,
+        ));
+        assert!(error.contains("only a proxy on another machine"), "{error}");
+    }
+
+    #[test]
+    fn a_remote_proxy_must_be_marked_unsafe() {
+        let url = "http://vault.example.com:14322";
+        let error = egress_of(url, r#"{"kind": "http"}"#).err().unwrap();
+        assert!(error.to_string().contains("unencrypted"), "{error}");
+        assert!(error.hint().unwrap().contains("\"unsafe\": true"));
         assert_eq!(
-            error.to_string(),
-            "http://vault.example.com:14322: remote proxies aren't \
-             supported yet: see docs/proxy-kinds.md"
+            egress_of(url, r#"{"kind": "http", "unsafe": true}"#).unwrap(),
+            Egress::Remote("vault.example.com".into(), 14322)
         );
-        assert_eq!(error.hint(), Some("see docs/proxy-kinds.md"));
-        assert!(loopback_port("http://127.0.0.1.evil.com:1").is_err());
+    }
+
+    #[test]
+    fn a_proxy_url_is_plain_http_with_a_port() {
         for url in [
             "https://127.0.0.1:1",
             "http://127.0.0.1",
             "ftp://x",
             "http://127.0.0.1:80@evil.com:1",
         ] {
-            let error = error_of(loopback_port(url));
+            let error = error_of(egress_of(url, r#"{"kind": "http"}"#));
             assert!(error.contains("expected http://"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_remote_proxy_url_names_its_host() {
+        let egress = Egress::Remote("vault.example.com".into(), 14322);
+        let url = proxy_url(&egress, Some(&login("tok", "v")), "alias");
+        assert_eq!(
+            url.unwrap().expose(),
+            "http://tok:v@vault.example.com:14322"
+        );
     }
 
     #[test]
@@ -555,20 +620,20 @@ mod tests {
         let egress = Egress::HostPort(17323);
         let alias = "host.microsandbox.internal";
         let secret =
-            proxy_url(egress, Some(&login("x-agent-vault", "a:b@c/d")), alias);
+            proxy_url(&egress, Some(&login("x-agent-vault", "a:b@c/d")), alias);
         assert_eq!(
             secret.unwrap().expose(),
             "http://x-agent-vault:a%3Ab%40c%2Fd@host.microsandbox.internal\
              :17323"
         );
-        let bare = proxy_url(egress, None, alias).unwrap();
+        let bare = proxy_url(&egress, None, alias).unwrap();
         assert_eq!(bare.expose(), "http://host.microsandbox.internal:17323");
-        assert!(proxy_url(Egress::Open, None, alias).is_none());
+        assert!(proxy_url(&Egress::Open, None, alias).is_none());
     }
 
     #[test]
     fn access_direct_has_no_url_and_no_ca() {
-        let access = access(None, "w", "host").unwrap();
+        let access = access(None, "w", &Egress::Open, "host").unwrap();
         assert!(access.url.is_none());
         assert!(access.ca_pem.is_none());
     }
@@ -581,7 +646,8 @@ mod tests {
             login: Some(("u".into(), "pw".into())),
             ..FakeProxy::at(5)
         };
-        let access = access(Some(("p", &proxy)), "w", "host").unwrap();
+        let access =
+            access(Some(("p", &proxy)), "w", &proxy.egress(), "host").unwrap();
         assert_eq!(access.url.unwrap().expose(), "http://u:pw@host:5");
         assert_eq!(access.ca_pem, Some(pem));
     }
@@ -592,7 +658,8 @@ mod tests {
             ca: Some(b"nope".to_vec()),
             ..FakeProxy::at(5)
         };
-        let error = error_of(access(Some(("p", &proxy)), "w", "host"));
+        let error =
+            error_of(access(Some(("p", &proxy)), "w", &proxy.egress(), "host"));
         assert_eq!(error, "proxy p: CA isn't a PEM certificate");
     }
 
@@ -608,7 +675,12 @@ mod tests {
                 ca: Some(pem.into_bytes()),
                 ..FakeProxy::at(5)
             };
-            let error = error_of(access(Some(("p", &proxy)), "w", "host"));
+            let error = error_of(access(
+                Some(("p", &proxy)),
+                "w",
+                &proxy.egress(),
+                "host",
+            ));
             assert_eq!(error, "proxy p: CA must be exactly one certificate");
         }
     }
@@ -619,7 +691,8 @@ mod tests {
             login: Some(("u".into(), "hunter2".into())),
             ..FakeProxy::at(5)
         };
-        let access = access(Some(("p", &proxy)), "w", "host").unwrap();
+        let access =
+            access(Some(("p", &proxy)), "w", &proxy.egress(), "host").unwrap();
         let shown = format!("{:?}", access.url);
         assert!(!shown.contains("hunter2"), "{shown}");
     }

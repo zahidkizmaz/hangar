@@ -229,11 +229,11 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
     if let Some(disk) = spec.disk {
         args.extend(["--root-disk".into(), disk.into()]);
     }
-    match spec.egress {
+    match &spec.egress {
         Egress::Open => {}
         Egress::HostPort(port) => {
             args.push("--no-net".into());
-            args.extend(["--net-rule".into(), host_rule(port)]);
+            args.extend(["--net-rule".into(), host_rule(*port)]);
             // Trap: forwarded connections don't count as `host`, so ingress
             // to published ports must be `any`; they still bind to host
             // loopback.
@@ -242,12 +242,20 @@ fn create_args(spec: &VmSpec) -> Vec<String> {
                 args.push(format!("allow:ingress@any:tcp:{guest}"));
             }
         }
+        // Trap: in msb 0.7.13 a domain rule resets TLS through it; plain
+        // TCP, like a proxy's CONNECT, is fine. The rule also lets the
+        // bay resolve that one name.
+        Egress::Remote(host, port) => args.extend([
+            "--no-net".into(),
+            "--net-rule".into(),
+            format!("allow@{host}:tcp:{port}"),
+        ]),
         // Trap: any rule drops msb's implicit `allow@public`.
         Egress::OpenAndHostPort(port) => args.extend([
             "--net-rule".into(),
             "allow@public".into(),
             "--net-rule".into(),
-            host_rule(port),
+            host_rule(*port),
         ]),
     }
     for (host, guest) in spec.publish {
@@ -480,6 +488,32 @@ mod tests {
             .collect();
         assert_eq!(rules, ["allow@public", "allow@host:tcp:8080"]);
         assert!(!args.contains(&"--no-net".to_string()));
+    }
+
+    #[test]
+    fn a_remote_proxy_is_the_only_address_a_bay_reaches() {
+        let spec = VmSpec {
+            name: "n",
+            image: "img",
+            cpus: 1,
+            memory: "1G",
+            disk: None,
+            entrypoint: None,
+            volumes: &[],
+            init: None,
+            egress: Egress::Remote("192.0.2.7".into(), 14322),
+            publish: &[],
+            mounts: &[],
+            env: &[],
+        };
+        let args = create_args(&spec);
+        let rules: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--net-rule")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(rules, ["allow@192.0.2.7:tcp:14322"]);
+        assert!(args.contains(&"--no-net".to_string()));
     }
 
     #[test]

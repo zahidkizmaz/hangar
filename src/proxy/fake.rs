@@ -79,7 +79,7 @@ impl Proxy for FakeProxy {
     }
 
     fn egress(&self) -> Egress {
-        self.egress
+        self.egress.clone()
     }
 
     fn ca(&self) -> Result<Option<Vec<u8>>> {

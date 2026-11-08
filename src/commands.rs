@@ -1226,11 +1226,11 @@ mod tests {
         let Detail::Bay(bay) = inspect(&hangar, "a").unwrap() else {
             panic!("not a bay");
         };
-        assert_eq!(bay.proxy_port, Some(3100));
+        assert_eq!(bay.proxy_address.as_deref(), Some("127.0.0.1:3100"));
         let Detail::Bay(direct) = inspect(&hangar, "b").unwrap() else {
             panic!("not a bay");
         };
-        assert_eq!(direct.proxy_port, None);
+        assert_eq!(direct.proxy_address, None);
     }
 
     #[test]

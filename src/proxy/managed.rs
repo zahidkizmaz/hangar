@@ -529,7 +529,7 @@ mod tests {
             "fake"
         }
         fn egress(&self) -> Egress {
-            self.0.egress
+            self.0.egress.clone()
         }
         fn ca(&self) -> crate::error::Result<Option<Vec<u8>>> {
             Ok(None)
@@ -621,7 +621,7 @@ mod tests {
             "fake"
         }
         fn egress(&self) -> Egress {
-            self.0.egress
+            self.0.egress.clone()
         }
         fn ca(&self) -> crate::error::Result<Option<Vec<u8>>> {
             Ok(None)

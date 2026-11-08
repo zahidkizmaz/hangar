@@ -6,10 +6,11 @@
 pub(crate) mod fake;
 mod msb;
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::error::Result;
+use crate::error::{Context, Result, bail};
 
 pub(crate) use msb::Msb;
 
@@ -34,26 +35,59 @@ impl BoxState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Egress {
     Open,
     HostPort(u16),
     OpenAndHostPort(u16),
+    Remote(String, u16),
 }
 
 impl Egress {
-    pub(crate) fn host_port(self) -> Option<u16> {
+    pub(crate) fn host_port(&self) -> Option<u16> {
         match self {
-            Self::HostPort(port) => Some(port),
+            Self::HostPort(port) => Some(*port),
+            Self::Open | Self::OpenAndHostPort(_) | Self::Remote(..) => None,
+        }
+    }
+
+    /// The one address a bay behind this egress can reach.
+    pub(crate) fn proxy(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::HostPort(port) => Some(("127.0.0.1", *port)),
+            Self::Remote(host, port) => Some((host, *port)),
             Self::Open | Self::OpenAndHostPort(_) => None,
         }
     }
 
-    pub(crate) fn record(self) -> String {
+    pub(crate) fn proxy_address(&self) -> Option<String> {
+        self.proxy().map(|(host, port)| format!("{host}:{port}"))
+    }
+
+    /// A remote proxy by IP: an msb rule by name breaks a CONNECT through
+    /// it, and the bay gets no DNS. Resolved once per `up`; the record
+    /// keeps the IP, so a move recreates the bay.
+    pub(crate) fn resolved(&self) -> Result<Self> {
+        let Self::Remote(host, port) = self else {
+            return Ok(self.clone());
+        };
+        let addresses: Vec<SocketAddr> = (host.as_str(), *port)
+            .to_socket_addrs()
+            .context(format!("proxy host {host}"))?
+            .collect();
+        let Some(ipv4) = addresses.iter().find(|address| address.is_ipv4())
+        else {
+            bail!("proxy host {host}: no IPv4 address");
+        };
+        Ok(Self::Remote(ipv4.ip().to_string(), *port))
+    }
+
+    pub(crate) fn record(&self) -> String {
         match self {
             Self::Open => "open".into(),
             Self::HostPort(port) => format!("host:{port}"),
             Self::OpenAndHostPort(port) => format!("open+host:{port}"),
+            Self::Remote(host, port) => format!("remote:{host}:{port}"),
         }
     }
 }
@@ -202,5 +236,24 @@ mod tests {
         assert_eq!(Egress::OpenAndHostPort(5).record(), "open+host:5");
         assert_eq!(Egress::HostPort(5).host_port(), Some(5));
         assert_eq!(Egress::OpenAndHostPort(5).host_port(), None);
+        let remote = Egress::Remote("192.0.2.7".into(), 5);
+        assert_eq!(remote.record(), "remote:192.0.2.7:5");
+        assert_eq!(remote.proxy_address().as_deref(), Some("192.0.2.7:5"));
+    }
+
+    #[test]
+    fn a_remote_proxy_resolves_to_its_ipv4_address() {
+        let named = Egress::Remote("localhost".into(), 14322);
+        assert_eq!(
+            named.resolved().unwrap(),
+            Egress::Remote("127.0.0.1".into(), 14322)
+        );
+        let pinned = Egress::Remote("192.0.2.7".into(), 1);
+        assert_eq!(pinned.resolved().unwrap(), pinned);
+        assert_eq!(
+            Egress::HostPort(3).resolved().unwrap(),
+            Egress::HostPort(3)
+        );
+        assert!(Egress::Remote("nope.invalid".into(), 1).resolved().is_err());
     }
 }

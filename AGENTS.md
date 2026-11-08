@@ -25,10 +25,10 @@ overview), `docs/usage.md`, `docs/configuration.md`, `docs/proxy-kinds.md` and
 - Managed proxies run only in their own VM (`hangar-proxy-<name>`),
   with mounts only under their own data folder.
 - One egress: a bay with a proxy is created with
-  `Egress::HostPort(proxy.egress())` and nothing else; direct bays and managed
+  `proxy.egress()` and nothing else; direct bays and managed
   proxies get `Egress::Open`, plus one host port (`OpenAndHostPort`) for a
-  managed proxy whose upstream is local. Remote (non-loopback) proxies are
-  refused until the egress spec supports them.
+  managed proxy whose upstream is local. A proxy on another machine is
+  `Egress::Remote`, by IP, and needs `"unsafe": true`.
 - An existing VM whose record (`bays/<name>/vm`, `proxies/<name>/vm`)
   doesn't match is recreated, never used. `up` prints why. A VM-level
   change is never applied in place, and an in-place change never

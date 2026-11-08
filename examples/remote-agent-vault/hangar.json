@@ -1,0 +1,15 @@
+{
+  "proxies": {
+    "vault": {
+      "kind": "agent-vault",
+      "url": "http://vault.example.com:14322",
+      "unsafe": true,
+      "ca": {
+        "url": "https://vault.example.com/v1/mitm/ca.pem",
+        "sha256": "replace-with-the-ca-fingerprint"
+      }
+    }
+  },
+  "defaults": { "proxy": "vault" },
+  "bays": [{ "name": "work", "apps": ["claude-code"] }]
+}

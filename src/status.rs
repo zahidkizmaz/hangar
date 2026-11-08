@@ -50,7 +50,7 @@ pub(crate) struct ProxyStatus {
     pub(crate) state: Option<BoxState>,
     pub(crate) image: Option<String>,
     pub(crate) health: Option<Health>,
-    pub(crate) port: Option<u16>,
+    pub(crate) address: Option<String>,
     pub(crate) published: Vec<ProxyPort>,
 }
 
@@ -65,7 +65,7 @@ pub(crate) struct BayDetail {
     pub(crate) cpus: u32,
     pub(crate) memory: String,
     pub(crate) disk: String,
-    pub(crate) proxy_port: Option<u16>,
+    pub(crate) proxy_address: Option<String>,
     pub(crate) packages: Vec<String>,
     pub(crate) apps: Vec<String>,
     pub(crate) env: Vec<String>,
@@ -139,16 +139,16 @@ pub(crate) fn collect(hangar: &Hangar) -> Overview {
 
 pub(crate) fn bay_detail(hangar: &Hangar, bay: &Bay) -> Detail {
     let settings = bay.settings;
-    let proxy_port = hangar
+    let proxy_address = hangar
         .proxy_of(settings)
-        .and_then(|(_, proxy)| proxy.egress().host_port());
+        .and_then(|(_, proxy)| proxy.egress().proxy_address());
     Detail::Bay(BayDetail {
         status: bay_status(hangar, bay, true),
         vm: bay.vm.clone(),
         cpus: settings.cpus,
         memory: settings.memory.clone(),
         disk: settings.disk.clone(),
-        proxy_port,
+        proxy_address,
         packages: settings.packages.clone(),
         apps: settings.apps.iter().map(|app| app.name.clone()).collect(),
         env: settings.env.keys().cloned().collect(),
@@ -283,7 +283,7 @@ fn proxy_status(hangar: &Hangar, name: &str, proxy: &dyn Proxy) -> ProxyStatus {
         state,
         image: managed.map(|managed| managed.vm().image),
         health: probeable.then(|| proxy.health()),
-        port: proxy.egress().host_port(),
+        address: proxy.egress().proxy_address(),
         published: managed
             .map(|managed| managed.vm().publish)
             .unwrap_or_default(),
@@ -359,7 +359,7 @@ mod tests {
             state: None,
             image: None,
             health,
-            port: None,
+            address: None,
             published: Vec::new(),
         }
     }

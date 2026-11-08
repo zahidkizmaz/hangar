@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use super::ca::{CaSource, CaSpec};
 use super::{
     Health, Location, Login, Managed, ManagedVm, Proxy, ProxyPort, Secrets,
-    Slot, Spec, loopback_port, only,
+    Slot, Spec, external_egress, only,
 };
 use crate::error::{Result, bail};
 use crate::http;
@@ -59,7 +59,7 @@ printf '%s\n' "$password" |
     --host 0.0.0.0 --port 14321 >>server.log 2>&1 &"#;
 
 struct AgentVault {
-    port: u16,
+    egress: Egress,
     ca: CaSpec,
     secrets: Secrets,
     vault: String,
@@ -85,7 +85,7 @@ impl Proxy for AgentVault {
     }
 
     fn egress(&self) -> Egress {
-        Egress::HostPort(self.port)
+        self.egress.clone()
     }
 
     fn ca(&self) -> Result<Option<Vec<u8>>> {
@@ -115,7 +115,7 @@ impl Proxy for AgentVault {
 
     fn health(&self) -> Health {
         let Some(server) = &self.server else {
-            return super::tcp_health(self.port);
+            return self.egress.proxy().map_or(Health::Up, super::tcp_health);
         };
         match http::get(server.ui_port, "/health") {
             Ok(response) if response.status == 200 => Health::Up,
@@ -226,7 +226,7 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
         check_vault(&vault, &fields.at("vault"))?;
         Ok(vault)
     };
-    let Location::External(url) = &spec.location else {
+    let Location::External(_) = &spec.location else {
         only(fields, &["vault", "bays", "hostPort", "uiPort", "image"])?;
         let port = port_or(spec, "hostPort", PROXY_PORT)?;
         let ui_port = port_or(spec, "uiPort", UI_PORT)?;
@@ -241,7 +241,7 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
             sha256: None,
         };
         return Ok(Box::new(AgentVault {
-            port,
+            egress: Egress::HostPort(port),
             ca,
             secrets: spec.secrets.clone(),
             vault: vault()?,
@@ -255,9 +255,9 @@ pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
             }),
         }));
     };
-    only(fields, &["ca", "vault", "bays"])?;
+    only(fields, &["ca", "vault", "bays", "unsafe"])?;
     Ok(Box::new(AgentVault {
-        port: loopback_port(url)?,
+        egress: external_egress(spec)?,
         ca: CaSpec::parse(&fields.object("ca")?, spec.home)?,
         secrets: spec.secrets.clone(),
         vault: vault()?,
@@ -586,6 +586,29 @@ mod tests {
         assert_eq!(
             vault.bay_tokens(),
             [("oss".to_string(), "token@oss".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_remote_agent_vault_example_is_reached_by_its_host() {
+        use crate::commands::{Target, plan_up};
+        use crate::testing::{hangar_with, scratch_dir, settled};
+        let config =
+            include_str!("../../examples/remote-agent-vault/hangar.json");
+        let state = scratch_dir("remote-agent-vault-example");
+        let hangar = hangar_with(config, &state, settled());
+        let order: Vec<&str> = plan_up(&hangar, &[])
+            .unwrap()
+            .iter()
+            .map(|step| match step {
+                Target::Proxy(name, _) => *name,
+                Target::Bay(bay) => bay.name,
+            })
+            .collect();
+        assert_eq!(order, ["vault", "work"]);
+        assert_eq!(
+            hangar.proxies["vault"].egress(),
+            Egress::Remote("vault.example.com".into(), 14322)
         );
     }
 }

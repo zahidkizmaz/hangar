@@ -75,6 +75,15 @@ pub(crate) fn up(hangar: &Hangar, bay: &Bay) -> Outcome {
             );
         }
     }
+    if let Some((name, proxy)) = hangar.proxy_of(bay.settings)
+        && let Egress::Remote(host, _) = proxy.egress()
+    {
+        log::warn!(
+            "bay {}: proxy {name} is on {host}: the bay's login crosses the \
+             network unencrypted",
+            bay.name
+        );
+    }
     reconcile(hangar, bay).unwrap_or_else(Outcome::Failed)
 }
 
@@ -88,10 +97,12 @@ pub(crate) fn down(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
 
 fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
     let sandbox = hangar.sandbox.as_ref();
-    let (vm, mut changes) = match step(bay, "vm", || ensure_vm(hangar, bay))? {
-        Some(Outcome::Updated(changes)) => (None, changes),
-        vm => (vm, Vec::new()),
-    };
+    let egress = step(bay, "egress", || egress(hangar, bay).resolved())?;
+    let (vm, mut changes) =
+        match step(bay, "vm", || ensure_vm(hangar, bay, &egress))? {
+            Some(Outcome::Updated(changes)) => (None, changes),
+            vm => (vm, Vec::new()),
+        };
     step(bay, "boot", || {
         wait_booted(sandbox, bay, WAIT_TIMEOUT, WAIT_PAUSE)
     })?;
@@ -100,7 +111,8 @@ fn reconcile(hangar: &Hangar, bay: &Bay) -> Result<Outcome> {
         if let Some((name, proxy)) = proxy {
             check_login(name, proxy, bay.name)?;
         }
-        let access = proxy::access(proxy, bay.name, sandbox.host_address())?;
+        let access =
+            proxy::access(proxy, bay.name, &egress, sandbox.host_address())?;
         let env = proxy_env(proxy.map(|(_, proxy)| proxy.kind()), &access);
         let ca = access.ca_pem.as_deref().unwrap_or_default();
         changes.extend(apply_proxy(hangar, bay, &env, ca)?.map(String::from));
@@ -147,13 +159,14 @@ fn listed(label: &str, items: &[String]) -> Option<String> {
 /// Fails the bay when its proxy refuses its login, with the proxy's own
 /// words: a bad token would otherwise surface only as a 407 in the bay.
 fn check_login(name: &str, proxy: &dyn Proxy, bay: &str) -> Result<()> {
-    let Some(port) = proxy.egress().host_port() else {
+    let egress = proxy.egress();
+    let Some(address) = egress.proxy() else {
         return Ok(());
     };
     let Some(login) = proxy.login(bay)? else {
         return Ok(());
     };
-    let LoginCheck::Refused(why) = proxy::check_login(port, &login) else {
+    let LoginCheck::Refused(why) = proxy::check_login(address, &login) else {
         return Ok(());
     };
     let command = match proxy::login_key(proxy, bay) {
@@ -184,26 +197,25 @@ fn resolve_mounts(hangar: &Hangar, bay: &Bay) -> Result<Vec<Resolved>> {
     mounts::resolve(&all, &roots(hangar, bay)?)
 }
 
-fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
+fn ensure_vm(
+    hangar: &Hangar,
+    bay: &Bay,
+    egress: &Egress,
+) -> Result<Option<Outcome>> {
     let resolved = resolve_mounts(hangar, bay)?;
     let image = bay.settings.image_ref();
-    let wanted = wanted_record(
-        bay,
-        &image,
-        egress(hangar, bay),
-        mounts::lines(&resolved),
-    );
+    let wanted = wanted_record(bay, &image, egress, mounts::lines(&resolved));
     let recorded = VmRecord::load(&bay.dir.vm());
     let sandbox = hangar.sandbox.as_ref();
     match lifecycle::plan(sandbox.state(&bay.vm)?, recorded.as_ref(), &wanted) {
         Plan::Create => {
-            create(hangar, bay, &wanted, &resolved)?;
+            create(hangar, bay, egress, &wanted, &resolved)?;
             Ok(Some(Outcome::Created))
         }
         Plan::Recreate(reasons) => {
             let disk = recorded
                 .is_some_and(|recorded| disk_changed(&recorded, &wanted));
-            recreate(hangar, bay, &wanted, &resolved, disk)?;
+            recreate(hangar, bay, egress, &wanted, &resolved, disk)?;
             let mut reasons: Vec<String> =
                 reasons.into_iter().map(String::from).collect();
             if disk {
@@ -222,7 +234,7 @@ fn ensure_vm(hangar: &Hangar, bay: &Bay) -> Result<Option<Outcome>> {
 pub(crate) fn wanted_record(
     bay: &Bay,
     image: &str,
-    egress: Egress,
+    egress: &Egress,
     mut mounts: Vec<String>,
 ) -> VmRecord {
     let settings = bay.settings;
@@ -250,6 +262,7 @@ pub(crate) fn wanted_record(
 fn recreate(
     hangar: &Hangar,
     bay: &Bay,
+    egress: &Egress,
     wanted: &VmRecord,
     resolved: &[Resolved],
     disk: bool,
@@ -260,12 +273,13 @@ fn recreate(
     if disk {
         sandbox.remove_volume(&data_volume(bay.name))?;
     }
-    create(hangar, bay, wanted, resolved)
+    create(hangar, bay, egress, wanted, resolved)
 }
 
 fn create(
     hangar: &Hangar,
     bay: &Bay,
+    egress: &Egress,
     wanted: &VmRecord,
     resolved: &[Resolved],
 ) -> Result<()> {
@@ -303,7 +317,7 @@ fn create(
             size: &settings.disk,
         }],
         init: Some(INIT),
-        egress: egress(hangar, bay),
+        egress: egress.clone(),
         publish: &publish,
         mounts: &mounts,
         env: &[],

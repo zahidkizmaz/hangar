@@ -109,7 +109,7 @@ impl Sandbox for FakeSandbox {
                 .iter()
                 .map(|v| format!("{}:{}:{}", v.name, v.guest, v.size))
                 .collect(),
-            egress: spec.egress,
+            egress: spec.egress.clone(),
             publish: spec.publish.to_vec(),
             mounts: spec
                 .mounts

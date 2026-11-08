@@ -8,7 +8,7 @@ trusts. Every entry under `proxies` has these keys:
 | --- | --- |
 | `kind` | `infisical`, `agent-vault` or `http` |
 | `run` | `"managed"`: hangar runs it in its own VM, `hangar-proxy-<name>` |
-| `url` | it already runs: `http://127.0.0.1:<port>` |
+| `url` | it already runs: `http://<host>:<port>`, see [Remote proxies](#remote-proxies) |
 | `secrets` | optional: a command per token, see [Proxy tokens](#proxy-tokens) |
 
 Set `run` or `url`, not both. The other keys belong to the kind; an
@@ -147,7 +147,8 @@ One you run yourself, `"url"`:
 
 | Key | Default |
 | --- | --- |
-| `url` | required: `http://127.0.0.1:<port>`, its proxy port |
+| `url` | required: `http://<host>:<port>`, its proxy port |
+| `unsafe` | `false`; `true` to allow a `url` on another machine |
 | `ca` | required: see [The `ca` object](#the-ca-object) |
 | `vault` | `"default"`: the vault name |
 | `bays` | `{}`: bay → vault, as below |
@@ -174,7 +175,8 @@ Any HTTP proxy on this machine.
 
 | Key | Default |
 | --- | --- |
-| `url` | required: `http://127.0.0.1:<port>` |
+| `url` | required: `http://<host>:<port>` |
+| `unsafe` | `false`; `true` to allow a `url` on another machine |
 | `ca` | none: a CA the bays trust on top of the system's, see below |
 
 There is no login. Health is a TCP connect to the port.
@@ -193,18 +195,23 @@ Set `file` or `url`. The PEM must be exactly one certificate, and with
 
 ## Trust
 
-hangar trusts whatever answers on the proxy's loopback host port. Any
-process on your machine that binds that port first would get the bays'
-traffic and logins. Set `ca.sha256` to pin the CA where the kind supports
+hangar trusts whatever answers on the proxy's address. Any process on
+your machine that binds a loopback proxy port first would get the bays'
+traffic and logins, and so would anyone on the path to a remote one. Set `ca.sha256` to pin the CA where the kind supports
 it (`agent-vault`, `http`).
 
 ## Remote proxies
 
-Not supported yet: a `url` whose host isn't loopback is an error. A bay's
-egress is one port on the host. A per-domain egress rule broke TLS to
-the allowed host when tried on msb, so remote proxies need IP and port
-rules: `Egress` gets a variant for a remote address, which each sandbox
-backend turns into its own rule.
+A `url` on another machine needs `"unsafe": true` on the proxy: the
+proxy port is plain HTTP, so a bay's login crosses the network
+unencrypted. Use it over a network you trust (a VPN, a private subnet);
+`up` warns every time.
+
+At `up`, hangar resolves the host to an IPv4 address on this machine. The
+bay can reach that IP and port only, and gets no DNS. msb rules by
+name are no use here: in msb 0.7.13 a rule by name breaks TLS and a
+CONNECT through it. The bay's record keeps the IP, so when the proxy
+moves the next `up` recreates the bay.
 
 ## Adding a kind
 
@@ -215,8 +222,8 @@ A kind is one file, `src/proxy/<kind>.rs`, plus one line in
 The file exports `build(&Spec) -> Result<Box<dyn Proxy>>`. `Spec` holds
 the entry's fields, where it runs (`Location`), your home (for `~` in
 paths), the proxy's own data folder and its `Secrets`. `build` checks
-its keys with `proxy::only` and gets an external kind's port from
-`proxy::external_url` and `proxy::loopback_port`. A kind that needs
+its keys with `proxy::only` and gets an external kind's egress from
+`proxy::external_egress`. A kind that needs
 tokens lists them as `Slot`s from `Proxy::secrets` and reads each with
 `Secrets::get` when it needs it, never in `build`: the keychain, the
 prompts and `secret set` come from the core.

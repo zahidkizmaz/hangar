@@ -1,12 +1,12 @@
 //! An HTTP proxy that already runs on the host.
 
 use super::ca::CaSpec;
-use super::{Health, Login, Proxy, Spec, external_url, loopback_port, only};
+use super::{Health, Login, Proxy, Spec, external_egress, external_url, only};
 use crate::error::Result;
 use crate::sandbox::Egress;
 
 struct Http {
-    port: u16,
+    egress: Egress,
     ca: Option<CaSpec>,
 }
 
@@ -16,7 +16,7 @@ impl Proxy for Http {
     }
 
     fn egress(&self) -> Egress {
-        Egress::HostPort(self.port)
+        self.egress.clone()
     }
 
     fn ca(&self) -> Result<Option<Vec<u8>>> {
@@ -28,19 +28,20 @@ impl Proxy for Http {
     }
 
     fn health(&self) -> Health {
-        super::tcp_health(self.port)
+        self.egress.proxy().map_or(Health::Up, super::tcp_health)
     }
 }
 
 pub(crate) fn build(spec: &Spec) -> Result<Box<dyn Proxy>> {
-    only(&spec.fields, &["ca"])?;
-    let port = loopback_port(external_url(spec, "http")?)?;
+    only(&spec.fields, &["ca", "unsafe"])?;
+    external_url(spec, "http")?;
+    let egress = external_egress(spec)?;
     let ca = if spec.fields.map.contains_key("ca") {
         Some(CaSpec::parse(&spec.fields.object("ca")?, spec.home)?)
     } else {
         None
     };
-    Ok(Box::new(Http { port, ca }))
+    Ok(Box::new(Http { egress, ca }))
 }
 
 #[cfg(test)]

@@ -246,7 +246,7 @@ fn addresses(overview: &Overview, name: &str) -> Vec<String> {
 
 fn proxy_addresses(proxy: &ProxyStatus) -> Vec<String> {
     if proxy.published.is_empty() {
-        proxy.port.map(loopback).into_iter().collect()
+        proxy.address.iter().cloned().collect()
     } else {
         proxy
             .published
@@ -481,7 +481,7 @@ fn overview_json(overview: &Overview) -> Json {
             ("state", optional(proxy_state(proxy))),
             ("image", optional(proxy.image.as_deref())),
             ("health", optional(health_word(proxy))),
-            ("port", proxy.port.map_or(Json::Null, number)),
+            ("address", optional(proxy.address.as_deref())),
             ("published", proxy_ports_json(&proxy.published)),
         ])
     });
@@ -595,9 +595,9 @@ fn field(label: &str, values: Vec<String>) -> Vec<String> {
 
 fn bay_text(bay: &BayDetail) -> Vec<String> {
     let status = &bay.status;
-    let network = match (&status.proxy, bay.proxy_port) {
-        (Some(proxy), Some(port)) => {
-            format!("only through proxy {proxy} ({})", loopback(port))
+    let network = match (&status.proxy, &bay.proxy_address) {
+        (Some(proxy), Some(address)) => {
+            format!("only through proxy {proxy} ({address})")
         }
         (Some(proxy), None) => format!("only through proxy {proxy}"),
         (None, _) => "the open internet (no proxy)".into(),
@@ -684,7 +684,7 @@ fn proxy_text(proxy: &ProxyDetail) -> Vec<String> {
         ),
         field("health", vec![health]),
         if status.published.is_empty() {
-            field("address", status.port.map(loopback).into_iter().collect())
+            field("address", status.address.iter().cloned().collect())
         } else {
             let ports = status.published.iter().map(|port| {
                 format!("{}  {}", port.name, address(port.host, port.http))
@@ -732,7 +732,7 @@ fn detail_json(detail: &Detail) -> Json {
                 ("type", json::string("bay")),
                 ("state", json::string(state_word(status.state))),
                 ("proxy", optional(status.proxy.as_deref())),
-                ("proxy_port", bay.proxy_port.map_or(Json::Null, number)),
+                ("proxy_address", optional(bay.proxy_address.as_deref())),
                 ("image", json::string(&status.image)),
                 ("vm", json::string(&bay.vm)),
                 ("cpus", number(bay.cpus)),
@@ -768,7 +768,7 @@ fn detail_json(detail: &Detail) -> Json {
                 ("state", optional(proxy_state(status))),
                 ("health", optional(health_word(status))),
                 ("health_error", why),
-                ("port", status.port.map_or(Json::Null, number)),
+                ("address", optional(status.address.as_deref())),
                 ("published", proxy_ports_json(&status.published)),
                 ("url", optional(proxy.url.as_deref())),
                 ("image", optional(status.image.as_deref())),
@@ -904,7 +904,7 @@ mod tests {
             state,
             image: state.map(|_| "fake:1".into()),
             health: None,
-            port: Some(3100),
+            address: Some("127.0.0.1:3100".into()),
             published: state
                 .map(|_| vec![ProxyPort::proxy(3100, 3100)])
                 .unwrap_or_default(),
@@ -995,7 +995,7 @@ mod tests {
         );
         assert_eq!(
             to_string(&overview(false).json()),
-            r#"{"bays":[{"apps":[{"name":"web","state":"exited"}],"image":"img:1","name":"work","ports":[{"address":"http://127.0.0.1:3000","app":"web","host":3000,"name":"ui","purpose":"Web UI","vm":3000},{"address":"127.0.0.1:5433","app":"web","host":5433,"name":"db","purpose":"Database","vm":5432}],"proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"health":null,"image":"fake:1","kind":"fake","name":"p","port":3100,"published":[{"address":"127.0.0.1:3100","host":3100,"name":"proxy","vm":3100}],"state":"stopped"},{"health":null,"image":null,"kind":"fake","name":"ext","port":3100,"published":[],"state":null}],"version":1}"#
+            r#"{"bays":[{"apps":[{"name":"web","state":"exited"}],"image":"img:1","name":"work","ports":[{"address":"http://127.0.0.1:3000","app":"web","host":3000,"name":"ui","purpose":"Web UI","vm":3000},{"address":"127.0.0.1:5433","app":"web","host":5433,"name":"db","purpose":"Database","vm":5432}],"proxy":"p","state":"running"}],"leftovers":[{"name":"gone","type":"proxy"}],"proxies":[{"address":"127.0.0.1:3100","health":null,"image":"fake:1","kind":"fake","name":"p","published":[{"address":"127.0.0.1:3100","host":3100,"name":"proxy","vm":3100}],"state":"stopped"},{"address":"127.0.0.1:3100","health":null,"image":null,"kind":"fake","name":"ext","published":[],"state":null}],"version":1}"#
         );
     }
 
@@ -1034,13 +1034,13 @@ mod tests {
 
     #[test]
     fn a_bay_detail_says_how_it_reaches_the_network_and_what_it_publishes() {
-        let bay = |proxy_port| BayDetail {
+        let bay = |proxy_port: Option<u16>| BayDetail {
             status: work_bay(),
             vm: "hangar-bay-work".into(),
             cpus: 2,
             memory: "4G".into(),
             disk: "20G".into(),
-            proxy_port,
+            proxy_address: proxy_port.map(|port| format!("127.0.0.1:{port}")),
             packages: vec!["nixpkgs#jq".into()],
             apps: vec!["web".into(), "tool".into()],
             env: vec!["A".into(), "B".into()],
@@ -1071,7 +1071,7 @@ mod tests {
         );
         let json = to_string(&detail(bay(Some(3100))).json());
         for part in [
-            r#""proxy_port":3100"#,
+            r#""proxy_address":"127.0.0.1:3100""#,
             r#""cpus":2,"#,
             r#""env":["A","B"]"#,
             r#""mode":"copy""#,
