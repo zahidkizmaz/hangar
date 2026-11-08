@@ -25,6 +25,7 @@ rustPlatform.buildRustPackage {
       ../tests/fakes
       ../tests/module.json
       ../examples/local-infisical/hangar.json
+      ../examples/local-agent-vault/hangar.json
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;

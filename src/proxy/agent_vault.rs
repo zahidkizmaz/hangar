@@ -564,4 +564,28 @@ mod tests {
         drop(listener);
         assert!(matches!(proxy.health(), Health::Down(_)));
     }
+
+    #[test]
+    fn the_local_agent_vault_example_starts_the_vault_then_its_bays() {
+        use crate::commands::{Target, plan_up};
+        use crate::testing::{hangar_with, scratch_dir, settled};
+        let config =
+            include_str!("../../examples/local-agent-vault/hangar.json");
+        let state = scratch_dir("agent-vault-example");
+        let hangar = hangar_with(config, &state, settled());
+        let order: Vec<&str> = plan_up(&hangar, &[])
+            .unwrap()
+            .iter()
+            .map(|step| match step {
+                Target::Proxy(name, _) => *name,
+                Target::Bay(bay) => bay.name,
+            })
+            .collect();
+        assert_eq!(order, ["vault", "work", "oss"]);
+        let vault = &hangar.proxies["vault"];
+        assert_eq!(
+            vault.bay_tokens(),
+            [("oss".to_string(), "token@oss".to_string())]
+        );
+    }
 }

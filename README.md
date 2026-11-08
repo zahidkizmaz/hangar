@@ -65,6 +65,7 @@ Other commands: `down`, `inspect`, `logs`, `cp`, `setup`, `secret set`,
 - [Proxy kinds](docs/proxy-kinds.md): `agent-vault`, `infisical`, `http`
 - [Nix](docs/nix.md): the NixOS and nix-darwin modules
 - [CLI for scripts and agents](docs/cli.md): `--json` output, exit codes
+- [Examples](examples): a local Agent Vault, a self-hosted Infisical
 - [Architecture](docs/architecture.md),
   [sandbox backends](docs/sandbox-backends.md),
   [development](docs/development.md); coding agents start with
