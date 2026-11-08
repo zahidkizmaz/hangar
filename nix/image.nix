@@ -15,7 +15,7 @@ dockerTools.streamLayeredImage {
     '')
   ];
   includeNixDB = true;
-  # /home/pilot is there for bays with `home = false`. agentd makes /tmp
+  # /home/pilot is where the bay's home is mounted. agentd makes /tmp
   # and tmpfiles /var/empty.
   extraCommands = ''
     mkdir -p etc root home/pilot

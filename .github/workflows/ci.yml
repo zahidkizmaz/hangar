@@ -32,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      - uses: DeterminateSystems/determinate-nix-action@16f94ba7aae399b9f9077c254b6719ec6de7e3e3 # v3.24.2
       # The cache only saves time: it must never block or fail CI.
       - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
         timeout-minutes: 3
@@ -47,7 +47,7 @@ jobs:
         run: nix build --print-build-logs .#bay-image
       - run: nix develop --command prek run --all-files --show-diff-on-failure
       - run: nix develop --command cargo deny check
-      # The baseline was measured on macOS (keychain code differs per OS).
+      # The floor is measured on macOS only.
       # Raise the floor as tests are added; never lower it.
       - if: runner.os == 'macOS'
         run: nix develop --command cargo llvm-cov nextest --summary-only --fail-under-lines 98

@@ -1,8 +1,4 @@
-use std::fmt::{self, Write as _};
-use std::fs::File;
-use std::io::Read;
-
-use crate::error::{Context, Result};
+use std::fmt;
 
 /// A credential that redacts itself in `Debug`. There is deliberately no
 /// `Display`: formatting a secret must go through `expose()`, so a mistake
@@ -19,15 +15,11 @@ impl Secret {
     }
 }
 
-/// A secret read from a file or tool: one trailing newline (LF or CRLF) is
-/// formatting, not part of the value.
 pub(crate) fn trim_line_end(value: &str) -> &str {
     let value = value.strip_suffix('\n').unwrap_or(value);
     value.strip_suffix('\r').unwrap_or(value)
 }
 
-/// How real credentials start. Shared by every check that keeps secrets out
-/// of a bay (`env`, `files`).
 pub(crate) const SECRET_PREFIXES: [&str; 14] = [
     "ghp_",
     "gho_",
@@ -52,6 +44,9 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         return Some("a private key");
     }
+    if has_jwt(text) {
+        return Some("a JWT");
+    }
     let token = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     text.split(|c: char| !token(c)).find_map(|word| {
         SECRET_PREFIXES.iter().find_map(|prefix| {
@@ -69,15 +64,13 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn random_hex(bytes: usize) -> Result<String> {
-    let mut buffer = vec![0; bytes];
-    File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut buffer))
-        .context("/dev/urandom")?;
-    Ok(buffer.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    }))
+fn has_jwt(text: &str) -> bool {
+    let base64url = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices("eyJ").any(|(at, _)| {
+        let rest = &text[at + 3..];
+        let body = rest.find(|c| !base64url(c)).unwrap_or(rest.len());
+        body >= 20 && rest[body..].starts_with('.')
+    })
 }
 
 impl fmt::Debug for Secret {
@@ -88,7 +81,7 @@ impl fmt::Debug for Secret {
 
 #[cfg(test)]
 mod tests {
-    use super::{Secret, find_secret, random_hex, trim_line_end};
+    use super::{Secret, find_secret, trim_line_end};
 
     #[test]
     fn real_looking_credentials_are_found_but_prose_is_not() {
@@ -99,7 +92,6 @@ mod tests {
             Some("sk-ant-")
         );
         assert_eq!(find_secret("id AKIAIOSFODNN7EXAMPLE end"), Some("AKIA"));
-        // Assembled, so the repo holds no key-shaped literal.
         let key = format!("-----BEGIN OPENSSH {} KEY-----\nabc\n", "PRIVATE");
         assert_eq!(find_secret(&key), Some("a private key"));
         for prose in [
@@ -114,11 +106,19 @@ mod tests {
     }
 
     #[test]
-    fn random_hex_has_two_digits_per_byte() {
-        let hex = random_hex(16).unwrap();
-        assert_eq!(hex.len(), 32);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(hex, random_hex(16).unwrap());
+    fn a_jwt_is_found_but_prose_mentioning_ey_j_is_not() {
+        let body = "a".repeat(20);
+        let jwt = format!("eyJ{body}.eyJ{body}.sig");
+        assert_eq!(find_secret(&format!("token={jwt}")), Some("a JWT"));
+        assert_eq!(find_secret(&format!("\"{jwt}\"")), Some("a JWT"));
+        for prose in [
+            "JWTs start with eyJ, the base64 of {\"",
+            "eyJhbGciOiJIUzI1NiJ9.",
+            &format!("eyJ{body} and no dot"),
+            &format!("eyJ{body}"),
+        ] {
+            assert_eq!(find_secret(prose), None, "{prose}");
+        }
     }
 
     #[test]

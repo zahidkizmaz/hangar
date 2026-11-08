@@ -7,17 +7,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::{self, JoinHandle};
 
-use crate::broker::Broker;
-use crate::broker::fake::FakeBroker;
 use crate::config::{Settings, defaults, resolve};
 use crate::error::Result;
-use crate::hangar::Hangar;
+use crate::hangar::{Hangar, build_proxies};
 use crate::json;
 use crate::mounts::Roots;
 use crate::sandbox::Sandbox;
+use crate::sandbox::fake::FakeSandbox;
 use crate::state::StateDir;
 
-/// An empty directory unique to this test process and `name`.
 pub(crate) fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("hangar-test-{}-{name}", std::process::id()));
@@ -26,7 +24,6 @@ pub(crate) fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// A port nothing listens on.
 pub(crate) fn closed_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -35,7 +32,6 @@ pub(crate) fn closed_port() -> u16 {
         .port()
 }
 
-/// `config` (a JSON text) merged over the defaults.
 pub(crate) fn resolved(config: &str) -> Result<Settings> {
     resolve(defaults()?, json::parse(config)?)
 }
@@ -48,13 +44,19 @@ pub(crate) fn config_error(config: &str) -> String {
     resolved(config).unwrap_err().to_string()
 }
 
-/// A config with one bay `default` holding `bay` (a JSON fragment, e.g.
-/// `"apps": ["web"]`), plus top-level `rest`.
+pub(crate) const DIRECT: &str =
+    r#"{"bays": [{"name": "default", "proxy": null}]}"#;
+
 pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
-    let bay = if bay.is_empty() {
-        String::new()
+    let proxy = if bay.contains(r#""proxy""#) {
+        ""
     } else {
-        format!(", {bay}")
+        r#", "proxy": null"#
+    };
+    let bay = if bay.is_empty() {
+        proxy.to_string()
+    } else {
+        format!("{proxy}, {bay}")
     };
     let rest = if rest.is_empty() {
         String::new()
@@ -64,8 +66,6 @@ pub(crate) fn one_bay(bay: &str, rest: &str) -> String {
     format!(r#"{{"bays": [{{"name": "default"{bay}}}]{rest}}}"#)
 }
 
-/// Roots for bay `default` in a scratch home, with `state` (created) and
-/// `cache` under it.
 pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
     let state = home.join(state);
     fs::create_dir_all(&state).unwrap();
@@ -80,7 +80,6 @@ pub(crate) fn roots(home: &Path, state: &str, cache: &str) -> Roots {
     .unwrap()
 }
 
-/// An environment of just `pairs`, for code that takes a `Var`.
 pub(crate) fn vars(
     pairs: &[(&str, &str)],
 ) -> impl Fn(&str) -> Option<String> + use<> {
@@ -96,23 +95,19 @@ pub(crate) fn vars(
     }
 }
 
-/// A `Hangar` on `config` (merged over the defaults), with its state in
-/// `state` (the package caches in `<state>-cache` and the user's home in
-/// `<state>-home`, next to it), `sandbox` in place of a real backend and a
-/// [`FakeBroker`].
 pub(crate) fn hangar_with(
     config: &str,
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
 ) -> Hangar {
-    hangar_with_broker(config, state, sandbox, Box::new(FakeBroker::default()))
+    hangar_holding(config, state, sandbox, no_keychain())
 }
 
-pub(crate) fn hangar_with_broker(
+pub(crate) fn hangar_holding(
     config: &str,
     state: &Path,
     sandbox: Rc<dyn Sandbox>,
-    broker: Box<dyn Broker>,
+    keychain: Rc<dyn crate::keychain::Keychain>,
 ) -> Hangar {
     let settings = settings(config);
     let sibling = |suffix: &str| {
@@ -122,18 +117,34 @@ pub(crate) fn hangar_with_broker(
     };
     let host_home = sibling("-home");
     fs::create_dir_all(&host_home).unwrap();
+    let state_dir = StateDir::new(state.to_path_buf());
+    let proxies =
+        build_proxies(&settings, &state_dir, &host_home, &keychain).unwrap();
     Hangar {
         settings,
-        state: StateDir::new(state.to_path_buf()),
+        state: state_dir,
         cache_root: sibling("-cache"),
+        state_root: sibling("-state"),
         host_home,
         sandbox,
-        broker,
+        keychain,
+        proxies,
     }
 }
 
-/// Answers one request per `(status, body)`, in order, and returns
-/// what it received.
+pub(crate) fn no_keychain() -> Rc<dyn crate::keychain::Keychain> {
+    Rc::new(crate::keychain::fake::FakeKeychain::default())
+}
+
+pub(crate) fn settled() -> Rc<FakeSandbox> {
+    let sandbox = Rc::new(FakeSandbox::default());
+    sandbox.reply("umask 077", "same\n");
+    sandbox.reply("hangar-packages /", "{}");
+    sandbox.reply("hangar-profile", r#"{"elements":{}}"#);
+    sandbox.reply("hangar-setup-check", "done");
+    sandbox
+}
+
 pub(crate) fn serve_each(
     responses: Vec<(&'static str, &'static str)>,
 ) -> (u16, JoinHandle<Vec<String>>) {
@@ -146,8 +157,7 @@ pub(crate) fn serve_each(
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 let mut buffer = [0; 4096];
-                // Head and body may arrive in separate writes.
-                while !complete(&request) {
+                while !request.contains("\r\n\r\n") {
                     let read = stream.read(&mut buffer).unwrap();
                     request.push_str(&String::from_utf8_lossy(&buffer[..read]));
                 }
@@ -155,7 +165,6 @@ pub(crate) fn serve_each(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
-                // A client may hang up before it has read everything.
                 let _ = stream.write_all(response.as_bytes());
                 request
             })
@@ -164,15 +173,23 @@ pub(crate) fn serve_each(
     (port, server)
 }
 
-fn complete(request: &str) -> bool {
-    let Some((head, body)) = request.split_once("\r\n\r\n") else {
-        return false;
+pub(crate) fn build_proxy(
+    build: fn(&crate::proxy::Spec) -> Result<Box<dyn crate::proxy::Proxy>>,
+    name: &str,
+    fields: &str,
+    location: crate::proxy::Location,
+    data: &Path,
+    keychain: Rc<crate::keychain::fake::FakeKeychain>,
+) -> Result<Box<dyn crate::proxy::Proxy>> {
+    let value = json::parse(fields).unwrap();
+    let fields =
+        crate::config::Fields::new(&value, &format!("proxies.{name}"))?;
+    let spec = crate::proxy::Spec {
+        secrets: crate::proxy::Secrets::new(name, keychain, &fields)?,
+        fields,
+        location,
+        home: Path::new("/home/u"),
+        data: data.to_path_buf(),
     };
-    let length = head
-        .to_ascii_lowercase()
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length: "))
-        .and_then(|length| length.parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= length
+    build(&spec)
 }

@@ -14,19 +14,15 @@ fn tracked_path() -> String {
     format!("{VM_STATE}/packages.json")
 }
 
-/// No record yet (a new VM): nothing is ours.
 const READ_TRACKED: &str = r#"cat "$1" 2>/dev/null || echo '{}'"#;
 const SAVE_TRACKED: &str = r#"mkdir -p "${1%/*}" && cat >"$1""#;
 const NIX: &str = "/run/current-system/sw/bin/nix";
-/// A new VM has no profile until the first install.
 const LIST: &str = r#"[ -e "$1" ] || { echo '{"elements":{}}'; exit; }
 exec /run/current-system/sw/bin/nix profile list --json --profile "$1""#;
 
-/// Copies the profile's closure into the cache, signatures included.
 const FILL_CACHE: &str = r#"exec /run/current-system/sw/bin/nix copy --to "$1" \
   "$(readlink -f "$2")""#;
 
-/// Installable -> the profile element it became.
 type Tracked = BTreeMap<String, String>;
 
 #[derive(Debug, PartialEq)]
@@ -47,7 +43,7 @@ pub(crate) fn reconcile(
     vm: &str,
     desired: &[String],
     cache: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let vm = Vm { sandbox, name: vm };
     let record = tracked_path();
     let read = ["/bin/sh", "-c", READ_TRACKED, "hangar-packages", &record];
@@ -60,19 +56,20 @@ pub(crate) fn reconcile(
         remove.extend(plan.remove.iter().map(String::as_str));
         exec(vm, &remove)?;
     }
-    let installs = !plan.install.is_empty();
-    apply(
+    let removed = plan.remove.iter().map(|element| format!("-{element}"));
+    let removed: Vec<String> = removed.collect();
+    let added = apply(
         plan,
         |installable| install(vm, installable, cache),
         |tracked| save(vm, tracked),
     )?;
-    if cache && installs {
+    if cache && !added.is_empty() {
         fill_cache(vm);
     }
-    Ok(())
+    let added = added.into_iter().map(|element| format!("+{element}"));
+    Ok(added.chain(removed).collect())
 }
 
-/// The cache only saves time: a failed copy never fails `up`.
 fn fill_cache(vm: Vm) {
     info!("filling the package cache");
     let dest = format!("file://{VM_CACHE}/nix?compression=zstd");
@@ -82,26 +79,24 @@ fn fill_cache(vm: Vm) {
     }
 }
 
-/// Saves the record after every step, so a failed install can't orphan the
-/// ones before it.
 fn apply(
     plan: Plan,
     mut install: impl FnMut(&str) -> Result<Option<String>>,
     mut save: impl FnMut(&Tracked) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut tracked = plan.keep;
     save(&tracked)?;
+    let mut added = Vec::new();
     for installable in &plan.install {
         if let Some(element) = install(installable)? {
-            tracked.insert(installable.clone(), element);
+            tracked.insert(installable.clone(), element.clone());
             save(&tracked)?;
+            added.push(element);
         }
     }
-    Ok(())
+    Ok(added)
 }
 
-/// The new profile element, or none when it was already installed by hand
-/// (then it isn't ours to remove later).
 fn install(vm: Vm, installable: &str, cache: bool) -> Result<Option<String>> {
     info!("installing {installable}");
     let before = profile(vm)?;
@@ -182,8 +177,6 @@ fn install_command(installable: &str, cache: bool) -> Vec<String> {
         "hangar-install".into(),
     ];
     command.push(PROFILE.into());
-    // Tried before the internet caches (lower priority wins;
-    // cache.nixos.org is 40). Not `trusted`: paths still need a signature.
     if cache {
         command.push("--extra-substituters".into());
         command.push(format!("file://{VM_CACHE}/nix?priority=10"));
@@ -281,7 +274,6 @@ mod tests {
             .unwrap();
         assert_eq!(command[at + 1], "file:///var/cache/hangar/nix?priority=10");
         assert_eq!(command.last().unwrap(), "llm#codex");
-        // Nothing makes the writable cache trusted or skips signature checks.
         assert!(command.iter().all(|arg| !arg.contains("trusted")
             && !arg.contains("require-sigs")
             && !arg.contains("no-check-sigs")));
@@ -322,7 +314,7 @@ mod tests {
             keep: Tracked::new(),
         };
         let mut saved = Vec::new();
-        apply(
+        let added = apply(
             plan,
             |_| Ok(None),
             |record| {
@@ -332,5 +324,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(saved, [Tracked::new()]);
+        assert_eq!(added, Vec::<String>::new());
     }
 }

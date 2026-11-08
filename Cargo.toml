@@ -21,17 +21,21 @@ codegen-units = 1
 strip = true
 
 [dependencies]
+base64 = "0.23.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
-http = "1.5.0"
-log = "0.4.34"
+jiff = "0.2.39"
+libc = "0.2.191"
+log = "0.4.35"
 miniserde = "0.1.46"
 percent-encoding = "2.3.2"
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+ring = "0.17.14"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 
 # Dev tools, run through cargo-run-bin (`cargo install cargo-run-bin
 # cargo-binstall`): `cargo nextest`, `cargo llvm-cov` and `cargo deny` use
 # these versions, downloaded prebuilt by cargo-binstall.
 [package.metadata.bin]
-cargo-nextest = { version = "0.9.146", locked = true }
+cargo-nextest = { version = "0.9.151", locked = true }
 cargo-llvm-cov = { version = "0.9.1", locked = true }
 cargo-deny = { version = "0.20.2", locked = true }

@@ -6,16 +6,14 @@
 pub(crate) mod fake;
 mod msb;
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::error::Result;
+use crate::error::{Context, Result, bail};
 
 pub(crate) use msb::Msb;
 
-pub(crate) const TOWER_VM: &str = "hangar-tower";
-
-/// A bay's VM: the prefix keeps every bay name clear of `TOWER_VM`.
 pub(crate) fn bay_vm(bay: &str) -> String {
     format!("hangar-bay-{bay}")
 }
@@ -37,12 +35,61 @@ impl BoxState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Egress {
-    /// Only this port on the host: a bay, to the proxy.
-    OnlyHostPort(u16),
-    /// Anything: the tower needs the internet.
     Open,
+    HostPort(u16),
+    OpenAndHostPort(u16),
+    Remote(String, u16),
+}
+
+impl Egress {
+    pub(crate) fn host_port(&self) -> Option<u16> {
+        match self {
+            Self::HostPort(port) => Some(*port),
+            Self::Open | Self::OpenAndHostPort(_) | Self::Remote(..) => None,
+        }
+    }
+
+    /// The one address a bay behind this egress can reach.
+    pub(crate) fn proxy(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::HostPort(port) => Some(("127.0.0.1", *port)),
+            Self::Remote(host, port) => Some((host, *port)),
+            Self::Open | Self::OpenAndHostPort(_) => None,
+        }
+    }
+
+    pub(crate) fn proxy_address(&self) -> Option<String> {
+        self.proxy().map(|(host, port)| format!("{host}:{port}"))
+    }
+
+    /// A remote proxy by IP: an msb rule by name breaks a CONNECT through
+    /// it, and the bay gets no DNS. Resolved once per `up`; the record
+    /// keeps the IP, so a move recreates the bay.
+    pub(crate) fn resolved(&self) -> Result<Self> {
+        let Self::Remote(host, port) = self else {
+            return Ok(self.clone());
+        };
+        let addresses: Vec<SocketAddr> = (host.as_str(), *port)
+            .to_socket_addrs()
+            .context(format!("proxy host {host}"))?
+            .collect();
+        let Some(ipv4) = addresses.iter().find(|address| address.is_ipv4())
+        else {
+            bail!("proxy host {host}: no IPv4 address");
+        };
+        Ok(Self::Remote(ipv4.ip().to_string(), *port))
+    }
+
+    pub(crate) fn record(&self) -> String {
+        match self {
+            Self::Open => "open".into(),
+            Self::HostPort(port) => format!("host:{port}"),
+            Self::OpenAndHostPort(port) => format!("open+host:{port}"),
+            Self::Remote(host, port) => format!("remote:{host}:{port}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,37 +108,32 @@ impl MountMode {
     }
 }
 
-/// A port a VM publishes on the host's 127.0.0.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishedPort {
-    /// The app that brings it; `None` for the tower's own.
-    pub(crate) app: Option<String>,
-    /// The bay that publishes it; `None` for the tower's own.
-    pub(crate) bay: Option<String>,
+    pub(crate) app: String,
     pub(crate) name: String,
     pub(crate) host: u16,
     pub(crate) vm: u16,
     pub(crate) purpose: String,
-    /// Probed with an HTTP GET; a TCP connect otherwise.
     pub(crate) http: bool,
 }
 
-impl PublishedPort {
-    /// `bay/name` for a bay's port, so two bays' ports never look alike.
-    pub(crate) fn owner(&self) -> String {
-        match &self.bay {
-            Some(bay) => format!("{bay}/{}", self.name),
-            None => self.name.clone(),
-        }
-    }
+pub(crate) fn data_volume(bay: &str) -> String {
+    format!("hangar-bay-{bay}-data")
 }
 
 pub(crate) struct Mount<'a> {
     pub(crate) host: &'a Path,
     pub(crate) guest: &'a str,
     pub(crate) mode: MountMode,
-    /// `(uid, gid)` the files appear as in the VM.
     pub(crate) owner: Option<(u32, u32)>,
+    pub(crate) file: bool,
+}
+
+pub(crate) struct Volume<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) guest: &'a str,
+    pub(crate) size: &'a str,
 }
 
 pub(crate) struct VmSpec<'a> {
@@ -99,26 +141,20 @@ pub(crate) struct VmSpec<'a> {
     pub(crate) image: &'a str,
     pub(crate) cpus: u32,
     pub(crate) memory: &'a str,
-    /// Persistent root disk size; the image's layers when `None`. Each
-    /// `native_fs` folder gets a disk of the same size.
     pub(crate) disk: Option<&'a str>,
+    pub(crate) entrypoint: Option<&'a str>,
     /// Folders that need a filesystem of their own, never an overlay
-    /// (Docker's storage stacks overlays).
-    pub(crate) native_fs: &'a [&'a str],
-    /// Takes over as PID 1 once the VM is set up, on a `/run` of the
-    /// sandbox's own; `None` runs the image's entrypoint.
+    /// (Docker's storage stacks overlays); created by `ensure_volume`.
+    pub(crate) volumes: &'a [Volume<'a>],
     pub(crate) init: Option<&'a str>,
     pub(crate) egress: Egress,
-    /// `(host, guest)` ports, published on the host's loopback only.
     pub(crate) publish: &'a [(u16, u16)],
-    /// Applied in order, so enclosing mounts come first.
     pub(crate) mounts: &'a [Mount<'a>],
     /// Ends up on the host's command line: non-secret values only.
     pub(crate) env: &'a [&'a str],
 }
 
 pub(crate) trait Sandbox {
-    /// The state plus the backend's own words for it, for `status`.
     fn describe(&self, vm: &str) -> Result<(BoxState, String)>;
 
     fn state(&self, vm: &str) -> Result<BoxState> {
@@ -129,6 +165,33 @@ pub(crate) trait Sandbox {
     fn start(&self, vm: &str) -> Result<()>;
     fn stop(&self, vm: &str) -> Result<()>;
     fn remove(&self, vm: &str) -> Result<()>;
+
+    fn stop_if_running(&self, vm: &str) -> Result<bool> {
+        let running = self.state(vm)? == BoxState::Running;
+        if running {
+            self.stop(vm)?;
+        }
+        Ok(running)
+    }
+
+    /// Removes `vm` if it exists. Trap: removing is a hard kill that loses
+    /// unsynced writes, so a running VM is stopped first.
+    fn discard(&self, vm: &str) -> Result<()> {
+        let state = self.state(vm)?;
+        if state == BoxState::Running {
+            self.stop(vm)?;
+        }
+        if state != BoxState::Missing {
+            self.remove(vm)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_volume(&self, name: &str, size: &str) -> Result<bool>;
+
+    fn remove_volume(&self, name: &str) -> Result<()>;
+
+    fn copy_out(&self, vm: &str, guest: &str, host: &Path) -> Result<()>;
 
     /// Runs `command` in `vm` as `user` (`None`: the image's default);
     /// returns its stdout. Secrets go in `stdin` only, and a failure's
@@ -141,9 +204,6 @@ pub(crate) trait Sandbox {
         stdin: Option<&[u8]>,
     ) -> Result<Vec<u8>>;
 
-    /// A shell in `vm` as `user`, starting in `workdir`: interactive
-    /// without `args`, else runs them as one command with their quoting
-    /// intact.
     fn shell(
         &self,
         vm: &str,
@@ -155,9 +215,45 @@ pub(crate) trait Sandbox {
 
     fn image_present(&self, image: &str) -> bool;
 
-    /// Imports an image archive streamed on `archive` under `tag`.
     fn load_image(&self, tag: &str, archive: Stdio) -> Result<()>;
 
-    /// How a VM reaches its host.
     fn host_address(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Egress, data_volume};
+
+    #[test]
+    fn data_volume_is_named_after_the_bay() {
+        assert_eq!(data_volume("work"), "hangar-bay-work-data");
+    }
+
+    #[test]
+    fn egress_records_name_each_kind_and_its_port() {
+        assert_eq!(Egress::Open.record(), "open");
+        assert_eq!(Egress::HostPort(5).record(), "host:5");
+        assert_eq!(Egress::OpenAndHostPort(5).record(), "open+host:5");
+        assert_eq!(Egress::HostPort(5).host_port(), Some(5));
+        assert_eq!(Egress::OpenAndHostPort(5).host_port(), None);
+        let remote = Egress::Remote("192.0.2.7".into(), 5);
+        assert_eq!(remote.record(), "remote:192.0.2.7:5");
+        assert_eq!(remote.proxy_address().as_deref(), Some("192.0.2.7:5"));
+    }
+
+    #[test]
+    fn a_remote_proxy_resolves_to_its_ipv4_address() {
+        let named = Egress::Remote("localhost".into(), 14322);
+        assert_eq!(
+            named.resolved().unwrap(),
+            Egress::Remote("127.0.0.1".into(), 14322)
+        );
+        let pinned = Egress::Remote("192.0.2.7".into(), 1);
+        assert_eq!(pinned.resolved().unwrap(), pinned);
+        assert_eq!(
+            Egress::HostPort(3).resolved().unwrap(),
+            Egress::HostPort(3)
+        );
+        assert!(Egress::Remote("nope.invalid".into(), 1).resolved().is_err());
+    }
 }

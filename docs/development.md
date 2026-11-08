@@ -15,8 +15,8 @@ Rust is handled by Cargo, the same with or without Nix:
 
 `nix develop` adds rustup, cargo-run-bin, cargo-binstall and the system
 tools: prek, nixfmt, yamlfmt, yamllint, shellcheck, actionlint, zizmor and
-gitleaks. Without Nix, install those yourself. Run `prek install` once to get the hooks on
-every commit.
+gitleaks. Without Nix, install those yourself. Run `prek install` once to
+get the hooks on every commit.
 
 ## Checks
 
@@ -35,61 +35,65 @@ nix flake check
 
 `nix flake check` builds the package and runs its tests (via nextest) and
 the module check (`nix/tests/module.nix`: the rendered `hangar.json`
-against `tests/module.json`). fmt, clippy and shellcheck run only through
-prek, with the pinned toolchain, so one Rust version gates the code. Add
-`--all-systems --no-build` to evaluate Linux on macOS.
+against `tests/module.json`, which `src/config.rs` also loads as a valid
+config). fmt, clippy and shellcheck run only through prek, with the
+pinned toolchain, so one Rust version gates the code. Add `--all-systems
+--no-build` to evaluate Linux on macOS.
 
 CI fails when line coverage drops below the floor in `ci.yml` (measured on
 macOS). Raise the floor as tests are added; never lower it.
 
-`tests/cli.rs` drives the real binary against two fakes in `tests/fakes/`:
-`msb.sh` stands in for msb (VM state in files, every call logged, a
-`fail-<step>` file triggers a failure) and `FakeVault` is a loopback HTTP
-server recording admin API calls. Tests assert on argv, requests and files,
-so they also prove secrets stay off the command line. A real `msb` on PATH
-is hidden from them.
+## Fakes
 
-No test ever calls the real keychain. Production calls it by absolute path,
-so a script on PATH can't stand in for it. `src/keychain.rs`'s unit tests
-give `OsKeychain` a fake tool script and cover every path. The CLI tests
-get theirs through `HANGAR_TEST_KEYCHAIN_TOOL`, which only debug builds
-read (`#[cfg(debug_assertions)]`): it never has the item, takes any store
-and logs each call. Tests that set `HANGAR_MASTER_PASSWORD` never reach it.
-A release build can't be redirected: the lookup is compiled out, and
-`nix/cli.nix` (its `postInstall`) and the release workflow fail if the
-variable's name shows up in the binary. So the CLI tests need a debug
-build: `tests/fakes` doesn't compile without `debug_assertions`, and the Nix
-package runs them with `checkType = "debug"`.
+No test touches a real VM, the network, `$HOME`, `~/.config` or the OS
+keychain:
 
-No test reaches the network either: unit tests give `src/oauth.rs` a
-fake `Https`, and `src/http.rs` is tested against loopback servers.
+- `sandbox::fake::FakeSandbox`: an in-process sandbox that records every
+  call, for the orchestration tests.
+- `proxy::fake::FakeProxy`: a proxy kind (`"kind": "fake"`, registered
+  only under `cfg(test)`) whose every answer is a field: egress, CA,
+  login, health, and a managed VM when wanted.
+- `tests/fakes/msb.sh`: stands in for msb in `tests/cli.rs`, which drives
+  the real binary. VM state lives in files, every call is logged, and a
+  `fail-<step>` file triggers a failure. Tests assert on argv and files,
+  so they also prove secrets stay off the command line. A real `msb` on
+  `PATH` is hidden from them.
+- `keychain::fake::FakeKeychain` and `prompt::fake::FakePrompt`: an
+  in-memory keychain and scripted answers, for token handling.
+- `tests/fakes/keychain.sh`: stands in for `security` / `secret-tool` in
+  `tests/cli.rs`, keeping items as files. Only debug builds take it
+  (`HANGAR_TEST_KEYCHAIN_TOOL`); the release build checks that.
+- `testing::serve_each`: a loopback HTTP server answering one request per
+  canned response, for CA downloads and health probes.
+- XDG variables point at a scratch dir in every test.
 
 ## End-to-end tests
 
-They need msb and must never touch real state:
+They need msb and must never touch real state or the user's VMs:
 
 ```sh
-export HANGAR_STATE_DIR=$(mktemp -d)
-export HANGAR_KEYCHAIN_SERVICE=hangar-e2e-$$
-export HANGAR_CONFIG=$HANGAR_STATE_DIR.json # a scratch hangar.json
-hangar up && hangar status
-hangar destroy --state --yes # also removes the keychain item
+export XDG_DATA_HOME=$(mktemp -d) XDG_CACHE_HOME=$(mktemp -d) \
+  XDG_STATE_HOME=$(mktemp -d)
+export HANGAR_CONFIG=$XDG_DATA_HOME/hangar.json # a scratch config
+export HANGAR_KEYCHAIN_SERVICE=hangar-e2e # keeps test tokens apart
+hangar up && hangar ps
+hangar rm NAME --data --yes # for each bay and proxy
 ```
 
-Never create or read the real `hangar` keychain item. The bay steps
-(VM `hangar-bay-default`; the tower is `hangar-tower`) need the bay
-image, published or through `imagePackage`/`imageLoader`: a bay boots its
-systemd. Use dummy credential values only.
+Use bay and proxy names no real config uses: VM names are
+`hangar-bay-<name>` and `hangar-proxy-<name>`. A bay boots its systemd, so
+it needs the bay image, published or through `imageLoader`. Use test
+tokens only; `rm NAME --data` deletes them from the keychain again.
 
 ## Logging
 
-Diagnostics go through the `log` facade to a small stderr logger
-(`src/logger.rs`). Levels: `-q` errors only, default info (`==>` progress),
-`-v` debug (every child command's argv), `-vv` trace (each vault request's
-method and path). `HANGAR_LOG=debug` sets the level when flags can't, e.g.
-for the launchd/systemd autostart. Never log headers, bodies or values:
-argv and paths are safe only because secrets travel on stdin and in
-bodies (`no_secret_reaches_any_log_level` checks this).
+Diagnostics go through the `log` facade (`src/logger.rs`) to stderr and
+to `$XDG_STATE_HOME/hangar/hangar.log`. Levels: `-q` errors only, default
+info (progress), `-v` debug (every child command's argv), `-vv`
+trace. The file keeps info and above even under `-q`. Only hangar's own
+targets are logged; ureq's and rustls' lines are dropped, since they may
+name a request's headers. Never log headers, bodies or values: argv and
+paths are safe only because secrets travel on stdin.
 
 ## Security checks
 
@@ -112,14 +116,14 @@ downloads the whole NVD feed on every run, so it's left out for now.
 - `image.yml`: on every push to `main` or a `v*` tag, builds the bay
   image on native amd64 and arm64 runners, writes its SBOM, and pushes a
   multi-arch image to `ghcr.io/zahidkizmaz/hangar-bay`; the run summary
-  prints the digest. A `v*` tag's image is the one that hangar version
-  uses by default.
-- `release.yml`: on `v*` tags, builds the binaries (aarch64-darwin,
-  x86_64-linux, aarch64-linux) in a matrix and attaches them with
-  `SHA256SUMS` to the GitHub release from one release job. Release builds
-  use the runner's Rust, because a Nix-built Linux binary links Nix's
-  glibc.
+  prints the digest. On a `v*` tag it then builds the binaries
+  (aarch64-darwin, x86_64-linux, aarch64-linux) with that digest baked in
+  (`HANGAR_BAY_IMAGE_DIGEST`), so a release runs exactly the image built
+  with it, and attaches them with `SHA256SUMS` to the GitHub release.
+  Release builds use the runner's Rust, because a Nix-built Linux binary
+  links Nix's glibc.
 - Renovate (`renovate.json5`): Cargo, GitHub Actions and flake inputs, with
   lock file maintenance; minor and patch updates automerge once a release
-  is 14 days old. That needs the Renovate GitHub app and a required CI
-  status check on `main`.
+  is 14 days old. Renovate also bumps the pinned Infisical image in
+  `src/proxy/infisical.rs`. That needs the Renovate GitHub app and a
+  required CI status check on `main`.

@@ -17,15 +17,39 @@ inspect)
 create)
   # A new bay has a fresh disk: no profile, no package record. Its home
   # may be a host mount, which outlives it.
+  # A proxy's process doesn't outlive its VM.
   case $4 in
   hangar-bay-*) rm -rf "$fake/profile" "$fake/hangar-packages-save" ;;
+  hangar-proxy-*) rm -f "$fake/proxy-up-$4" ;;
   esac
   echo Running >"$fake/vm-$4"
   exit 0 ;;
 start) echo Running >"$fake/vm-$3"; exit 0 ;;
-stop) echo Stopped >"$fake/vm-$3"; exit 0 ;;
+stop)
+  echo Stopped >"$fake/vm-$3"
+  case $3 in
+  hangar-bay-*) rm -f "$fake"/hangar-run-* ;;
+  hangar-proxy-*) rm -f "$fake/proxy-up-$3" ;;
+  esac
+  exit 0 ;;
 rm) rm -f "$fake/vm-$4"; exit 0 ;;
 load) exit 0 ;;
+volume)
+  # volume inspect NAME | create --kind disk --size N -q NAME | rm NAME
+  case $2 in
+  create) for name; do :; done; touch "$fake/volume-$name"; exit 0 ;;
+  *) name=$3 ;;
+  esac
+  [ -f "$fake/volume-$name" ] ||
+    { echo "error: volume not found: $name" >&2; exit 1; }
+  [ "$2" != rm ] || rm -f "$fake/volume-$name"
+  exit 0 ;;
+copy)
+  # copy -q VM:SRC DEST
+  src=${3#*:}
+  [ -e "$fake/vmfs$src" ] || { echo "error: stat $src" >&2; exit 1; }
+  cp "$fake/vmfs$src" "$4"
+  exit 0 ;;
 exec)
   # exec <tty> [--user U] [--workdir W] VM -- COMMAND…
   until [ "${1--}" = -- ]; do
@@ -44,7 +68,8 @@ want=root
 case "$1 $2" in
 "sh -c")
   case $4 in
-  hangar-run | hangar-run-status | hangar-setup-check | hangar-file | hangar-docker)
+  hangar-run | hangar-runs | hangar-run-stop | hangar-setup-check | \
+    hangar-file | hangar-docker)
     want=pilot ;;
   esac ;;
 "rm -f" | "sh -l" | "sh -lc") want=pilot ;;
@@ -68,7 +93,16 @@ case "$1 $2" in
 "sh -c")
   fails "$4"
   case $4 in
+  "") ;; # sh -c true: is the VM exec-ready
   hangar-booted) echo running ;;
+  hangar-infisical)
+    # The token on stdin; a test's server answers once this file exists.
+    cat >"$fake/hangar-infisical"
+    touch "$fake/proxy-up-$vm" ;;
+  hangar-ca | hangar-proxy-env)
+    cat >"$fake/$4.new"
+    if cmp -s "$fake/$4.new" "$fake/$4"; then rm "$fake/$4.new"; echo same
+    else mv "$fake/$4.new" "$fake/$4"; echo changed; fi ;;
   hangar-install)
     # . <proxy env> && exec nix profile add … <installable>
     for installable; do :; done
@@ -84,16 +118,21 @@ case "$1 $2" in
     cat >"$fake/vmfs$5"
     chmod "$6" "$fake/vmfs$5" ;;
   hangar-run)
-    # Pilot's user units: hangar-run <unit> <command> <description> <mode>.
-    # A file per active unit holds its description.
-    if [ "$8" = restart ]; then
-      echo "$5" >>"$fake/restarts"
-    elif [ -f "$fake/$5" ]; then
-      cat "$fake/$5"; exit 0
+    # hangar-run <unit> <command> <description> …: a file per active
+    # unit holds its description and the proxy env and CA it started with.
+    wanted="$7 $(cat "$fake/hangar-proxy-env" "$fake/hangar-ca" 2>/dev/null |
+      cksum)"
+    if [ "$(cat "$fake/$5" 2>/dev/null)" = "$wanted" ]; then
+      echo running; exit
     fi
-    echo "$7" >"$fake/$5"
-    echo started ;;
-  hangar-run-status) if [ -f "$fake/$5" ]; then echo active; fi ;;
+    [ ! -f "$fake/$5" ] || again=re
+    echo "$wanted" >"$fake/$5"
+    echo "${again}started" ;;
+  hangar-runs)
+    for unit in "$fake"/hangar-run-*.service; do
+      [ ! -f "$unit" ] || echo "${unit##*/} loaded active running"
+    done ;;
+  hangar-run-stop) rm -f "$fake/$5" ;;
   hangar-setup-check) cat "$fake/setup-check" 2>/dev/null || echo needed ;;
   *) cat >"$fake/$4" ;;
   esac ;;

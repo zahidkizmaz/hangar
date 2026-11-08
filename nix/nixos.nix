@@ -1,26 +1,20 @@
 { config, lib, ... }:
 let
   cfg = config.services.hangar;
-  # The keychain is the Secret Service on the session bus, unlocked at a
-  # graphical login. Without a password file, start with that session; a
-  # headless host sets tower.masterPasswordFile and starts at boot.
-  target =
-    if cfg.tower.masterPasswordFile == null then "graphical-session.target" else "default.target";
 in
 {
   imports = [ ./module.nix ];
 
   config = lib.mkIf cfg.enable {
-    # msb on PATH too, for `msb ls` and friends.
+    # The backend's CLI on PATH too, for `msb ls` and friends.
     environment.systemPackages = [
       cfg.package
     ]
-    ++ lib.optional (cfg.msbPackage != null) cfg.msbPackage;
+    ++ lib.optional (cfg.sandbox.package != null) cfg.sandbox.package;
 
     systemd.user.services.hangar = lib.mkIf cfg.autoStart {
-      description = "hangar: sandboxed bays behind a credential tower";
-      wantedBy = [ target ];
-      after = [ target ];
+      description = "hangar: sandboxed bays for AI agents";
+      wantedBy = [ "default.target" ];
       # A user unit: each user who logs in runs their own hangar.
       path = [ "/run/current-system/sw" ];
       serviceConfig = {

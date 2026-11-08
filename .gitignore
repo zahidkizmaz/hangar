@@ -15,8 +15,10 @@ result-*
 .env
 .env.*
 *.pem
+!src/proxy/testdata/*.pem
 *.key
 hangar.json
+!examples/*/hangar.json
 
 # Logs and scratch
 *.log

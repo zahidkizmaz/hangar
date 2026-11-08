@@ -2,7 +2,8 @@
 //! every call recorded.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use super::{BoxState, Egress, Sandbox, VmSpec};
@@ -13,7 +14,8 @@ use crate::process;
 pub(crate) struct Created {
     pub(crate) name: String,
     pub(crate) init: Option<String>,
-    pub(crate) native_fs: Vec<String>,
+    pub(crate) entrypoint: Option<String>,
+    pub(crate) volumes: Vec<String>,
     pub(crate) egress: Egress,
     pub(crate) publish: Vec<(u16, u16)>,
     pub(crate) mounts: Vec<String>,
@@ -22,20 +24,14 @@ pub(crate) struct Created {
 #[derive(Default)]
 pub(crate) struct FakeSandbox {
     pub(crate) states: RefCell<BTreeMap<String, BoxState>>,
-    /// `create NAME`, `exec NAME COMMAND…`, …; never stdin.
     pub(crate) calls: RefCell<Vec<String>>,
-    /// What each `exec` got on stdin, in call order.
     pub(crate) stdins: RefCell<Vec<Vec<u8>>>,
     pub(crate) created: RefCell<Vec<Created>>,
     pub(crate) images: RefCell<Vec<String>>,
-    /// `exec` prints the reply of the first pattern its call contains; a
-    /// VM has booted unless one says otherwise.
+    pub(crate) volumes: RefCell<BTreeSet<String>>,
     pub(crate) replies: RefCell<Vec<(String, String)>>,
-    /// Used up one by one before `replies`: `None` fails the exec.
     pub(crate) replies_once: RefCell<Vec<(String, Option<String>)>>,
-    /// `shell` commands exit 0 (else 1).
     pub(crate) shell_succeeds: Cell<bool>,
-    /// `create` leaves the VM behind, then fails.
     pub(crate) fail_create: Cell<bool>,
 }
 
@@ -48,22 +44,18 @@ impl FakeSandbox {
         fake
     }
 
-    /// Answers `exec` calls containing `pattern` with `reply`.
     pub(crate) fn reply(&self, pattern: &str, reply: &str) {
         self.replies
             .borrow_mut()
             .push((pattern.to_string(), reply.to_string()));
     }
 
-    /// Answers the next `exec` containing `pattern` with `reply`, or fails
-    /// it when `None`.
     pub(crate) fn reply_once(&self, pattern: &str, reply: Option<&str>) {
         self.replies_once
             .borrow_mut()
             .push((pattern.to_string(), reply.map(String::from)));
     }
 
-    /// Calls that change a VM or run something in it.
     pub(crate) fn changes(&self) -> Vec<String> {
         self.calls
             .borrow()
@@ -90,7 +82,6 @@ fn booted(call: &str) -> Vec<u8> {
     }
 }
 
-/// `user@vm`, or just `vm` for the image's default user.
 fn target(vm: &str, user: Option<&str>) -> String {
     user.map_or_else(|| vm.to_string(), |user| format!("{user}@{vm}"))
 }
@@ -112,8 +103,13 @@ impl Sandbox for FakeSandbox {
         self.created.borrow_mut().push(Created {
             name: spec.name.into(),
             init: spec.init.map(String::from),
-            native_fs: spec.native_fs.iter().map(|&path| path.into()).collect(),
-            egress: spec.egress,
+            entrypoint: spec.entrypoint.map(String::from),
+            volumes: spec
+                .volumes
+                .iter()
+                .map(|v| format!("{}:{}:{}", v.name, v.guest, v.size))
+                .collect(),
+            egress: spec.egress.clone(),
             publish: spec.publish.to_vec(),
             mounts: spec
                 .mounts
@@ -123,8 +119,9 @@ impl Sandbox for FakeSandbox {
                         .owner
                         .map(|(uid, gid)| format!(":{uid}:{gid}"))
                         .unwrap_or_default();
+                    let file = if mount.file { ":file" } else { "" };
                     format!(
-                        "{}:{}:{:?}{owner}",
+                        "{}:{}:{:?}{owner}{file}",
                         mount.host.display(),
                         mount.guest,
                         mount.mode
@@ -154,6 +151,25 @@ impl Sandbox for FakeSandbox {
     fn remove(&self, vm: &str) -> Result<()> {
         self.record(format!("remove {vm}"));
         self.states.borrow_mut().remove(vm);
+        Ok(())
+    }
+
+    fn ensure_volume(&self, name: &str, size: &str) -> Result<bool> {
+        let created = self.volumes.borrow_mut().insert(name.to_string());
+        if created {
+            self.record(format!("volume create {name} {size}"));
+        }
+        Ok(created)
+    }
+
+    fn remove_volume(&self, name: &str) -> Result<()> {
+        self.record(format!("volume rm {name}"));
+        self.volumes.borrow_mut().remove(name);
+        Ok(())
+    }
+
+    fn copy_out(&self, vm: &str, guest: &str, host: &Path) -> Result<()> {
+        self.record(format!("copy {vm}:{guest} {}", host.display()));
         Ok(())
     }
 
@@ -223,5 +239,26 @@ impl Sandbox for FakeSandbox {
 
     fn host_address(&self) -> &'static str {
         "host.fake"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FakeSandbox;
+    use crate::sandbox::Sandbox;
+    use std::path::Path;
+
+    #[test]
+    fn records_volumes_and_copy_out() {
+        let fake = FakeSandbox::default();
+        assert!(fake.ensure_volume("v", "40G").unwrap());
+        assert!(!fake.ensure_volume("v", "40G").unwrap());
+        fake.copy_out("vm", "/a", Path::new("/tmp/a")).unwrap();
+        fake.remove_volume("v").unwrap();
+        assert_eq!(
+            fake.changes(),
+            ["volume create v 40G", "copy vm:/a /tmp/a", "volume rm v"]
+        );
+        assert!(fake.ensure_volume("v", "40G").unwrap());
     }
 }

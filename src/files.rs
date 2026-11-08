@@ -1,7 +1,7 @@
 //! `files`: config files copied from the host into a bay. Secrets never
 //! go in: a refusal stops the whole step before anything is copied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -21,9 +21,9 @@ const MAX_FILE: u64 = 1024 * 1024;
 const MAX_TOTAL: u64 = 10 * 1024 * 1024;
 const MAX_FILES: usize = 1000;
 
-const HINT: &str = "files never copies secrets; store them with \
-                    'hangar credential set NAME' (see docs/configuration.md, \
-                    \"Your config files in the VM\")";
+const HINT: &str = "files never copies secrets; keep them out of the files \
+                    you copy (see docs/configuration.md, \"Your config \
+                    files in the VM\")";
 
 #[derive(Debug, PartialEq)]
 struct FileCopy {
@@ -32,7 +32,6 @@ struct FileCopy {
     contents: Vec<u8>,
 }
 
-/// VM path -> hash of what hangar last copied there.
 type Record = BTreeMap<String, String>;
 
 /// A VM path from config: absolute or `~/…`, always in pilot's home and
@@ -60,7 +59,6 @@ pub(crate) fn vm_path(raw: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-/// What a copy changed in the VM: paths only, never contents.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Copied {
     pub(crate) copied: Vec<String>,
@@ -69,29 +67,21 @@ pub(crate) struct Copied {
 
 pub(crate) enum Request<'a> {
     Declared,
-    /// `hangar copy SRC [DEST]`: never recorded as managed. DEST defaults
-    /// to SRC's place under the VM user's home.
-    AdHoc {
-        src: &'a str,
-        dest: Option<&'a str>,
-    },
+    AdHoc { src: &'a str, dest: Option<&'a str> },
 }
 
-pub(crate) fn copy_declared(hangar: &Hangar, bay: &Bay) -> Result<()> {
-    copy(hangar, bay, &Request::Declared).map(drop)
+pub(crate) fn copy_declared(hangar: &Hangar, bay: &Bay) -> Result<Copied> {
+    copy(hangar, bay, &Request::Declared)
 }
 
-/// The one way files reach the VM: every caller (`up`, `copy`, `restart`)
-/// goes through the safety check in [`plan`], the pure [`plan_copy`] and
-/// [`apply_copy`].
 pub(crate) fn copy(
     hangar: &Hangar,
     bay: &Bay,
     request: &Request,
 ) -> Result<Copied> {
-    let record_path = bay.dir.files();
+    let record_path = bay.dir.copies();
     let recorded = read_hashes(&record_path);
-    let declared = &bay.settings.files;
+    let declared = mounts::copies(&bay.settings.mounts);
     if matches!(request, Request::Declared)
         && declared.is_empty()
         && recorded.is_empty()
@@ -100,10 +90,12 @@ pub(crate) fn copy(
     }
     let home = &hangar.host_home;
     let (entries, managed) = match request {
-        Request::Declared => (declared.clone(), true),
+        Request::Declared => (declared, true),
         Request::AdHoc { src, dest } => {
             let (dest, src) = ad_hoc_entry(src, *dest, home)?;
-            if let Some(mount) = mount_at(&dest, &bay.settings.mounts) {
+            if let Some(mount) =
+                mount_at(&dest, &mounts::live(&bay.settings.mounts))
+            {
                 return Err(Error::with_hint(
                     format!("{dest} overlaps the mount at {mount}"),
                     "a mounted folder is live already; change it on the host",
@@ -146,10 +138,8 @@ fn ad_hoc_entry(
     Ok((dest, host.display().to_string()))
 }
 
-/// The record's text: part of a `run` entry's fingerprint, so a
-/// changed config file shows up as a changed input.
 pub(crate) fn record_text(bay: &Bay) -> String {
-    fs::read_to_string(bay.dir.files()).unwrap_or_default()
+    fs::read_to_string(bay.dir.copies()).unwrap_or_default()
 }
 
 pub(crate) fn host_home() -> Result<PathBuf> {
@@ -162,14 +152,10 @@ pub(crate) fn host_home() -> Result<PathBuf> {
 struct CopyPlan {
     write: Vec<usize>,
     delete: Vec<String>,
-    /// The record before any write; managed writes are added as they land.
     base: Record,
     managed: bool,
 }
 
-/// Declared (`managed`): write what changed, delete managed files whose
-/// entry is gone. Ad hoc: write everything, delete nothing, and forget the
-/// written paths' hashes so a declared entry for the same path wins again.
 fn plan_copy(copies: &[FileCopy], recorded: Record, managed: bool) -> CopyPlan {
     let wanted = |vm: &str| copies.iter().any(|copy| copy.vm == vm);
     let (base, delete): (Record, Record) = if managed {
@@ -192,8 +178,6 @@ fn plan_copy(copies: &[FileCopy], recorded: Record, managed: bool) -> CopyPlan {
     }
 }
 
-/// Deletes, then writes, saving the record after each managed write so a
-/// failure can't lose track of the ones before it.
 fn apply_copy(
     plan: CopyPlan,
     copies: &[FileCopy],
@@ -241,19 +225,20 @@ fn plan(
     let mut copies = Vec::new();
     let mut total = 0;
     for (vm, host) in files {
-        let host = host_path(host, home).context(format!("files.{vm}"))?;
-        // Resolved, so a symlinked parent can't hide hangar's folders; a
-        // missing source fails in `collect`.
-        if let Ok(resolved) = fs::canonicalize(&host) {
-            mounts::check_hangar_dirs(&resolved, roots)
-                .map_err(|why| refuse(&resolved, why))?;
-        }
-        collect(&host, vm, &mut copies, &mut total)?;
+        let host = host_path(host, home).context(format!("mounts.{vm}"))?;
+        let mut walk = Walk {
+            mount: vm,
+            roots,
+            copies: &mut copies,
+            total: &mut total,
+            entries: 0,
+            visiting: BTreeSet::new(),
+        };
+        walk.collect(&host, vm)?;
     }
     Ok(copies)
 }
 
-/// A host path from config: absolute, `~` or `~/…` (the host `$HOME`).
 pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
     let path = match raw.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -266,21 +251,43 @@ pub(crate) fn host_path(raw: &str, home: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn collect(
-    host: &Path,
-    vm: &str,
-    copies: &mut Vec<FileCopy>,
-    total: &mut u64,
-) -> Result<()> {
-    let meta = fs::symlink_metadata(host).context(host.display())?;
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        return Err(refuse(host, "is a symlink; point at its target instead"));
+struct Walk<'a> {
+    mount: &'a str,
+    roots: &'a Roots,
+    copies: &'a mut Vec<FileCopy>,
+    total: &'a mut u64,
+    entries: usize,
+    visiting: BTreeSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    fn collect(&mut self, link: &Path, vm: &str) -> Result<()> {
+        let host = &fs::canonicalize(link).context(link.display())?;
+        for path in [host, link] {
+            mounts::check_hangar_dirs(path, self.roots).map_err(|why| {
+                refuse(path, format!("{why} (mounts.{})", self.mount))
+            })?;
+        }
+        if [host, link, Path::new(vm)]
+            .into_iter()
+            .any(is_credentials_file)
+        {
+            return Err(refuse(host, "looks like a credentials file"));
+        }
+        let meta = fs::metadata(host).context(host.display())?;
+        if meta.is_dir() {
+            return self.collect_dir(host, vm);
+        }
+        if !meta.is_file() {
+            return Err(refuse(host, "isn't a regular file"));
+        }
+        self.add_file(host, vm, &meta)
     }
-    if is_credentials_file(host) || is_credentials_file(Path::new(vm)) {
-        return Err(refuse(host, "looks like a credentials file"));
-    }
-    if kind.is_dir() {
+
+    fn collect_dir(&mut self, host: &Path, vm: &str) -> Result<()> {
+        if !self.visiting.insert(host.to_path_buf()) {
+            return Err(refuse(host, "is a symlink loop"));
+        }
         let mut names = fs::read_dir(host)
             .and_then(Iterator::collect::<std::io::Result<Vec<_>>>)
             .context(host.display())?
@@ -290,49 +297,59 @@ fn collect(
         names.sort();
         for name in names {
             let child = host.join(&name);
+            self.entries += 1;
+            if self.entries > MAX_FILES {
+                return Err(refuse(&child, "takes files past 1000 files"));
+            }
             let Some(name) =
                 name.to_str().filter(|n| !n.contains(['\n', '\t']))
             else {
                 return Err(refuse(&child, "has an unsupported file name"));
             };
-            collect(&child, &format!("{vm}/{name}"), copies, total)?;
+            self.collect(&child, &format!("{vm}/{name}"))?;
         }
-        return Ok(());
+        self.visiting.remove(host);
+        Ok(())
     }
-    if !kind.is_file() {
-        return Err(refuse(host, "isn't a regular file"));
+
+    fn add_file(
+        &mut self,
+        host: &Path,
+        vm: &str,
+        meta: &fs::Metadata,
+    ) -> Result<()> {
+        if meta.len() > MAX_FILE {
+            let size = meta.len();
+            return Err(refuse(
+                host,
+                format!("is {size} bytes; the limit is 1 MiB"),
+            ));
+        }
+        *self.total += meta.len();
+        if *self.total > MAX_TOTAL {
+            return Err(refuse(host, "takes files past 10 MiB in total"));
+        }
+        if self.copies.len() == MAX_FILES {
+            return Err(refuse(host, "takes files past 1000 files"));
+        }
+        let contents = fs::read(host).context(host.display())?;
+        if let Some(what) = find_secret(&String::from_utf8_lossy(&contents)) {
+            return Err(refuse(
+                host,
+                format!("contains what looks like a credential ({what})"),
+            ));
+        }
+        self.copies.push(FileCopy {
+            vm: vm.to_string(),
+            executable: meta.permissions().mode() & 0o111 != 0,
+            contents,
+        });
+        Ok(())
     }
-    if meta.len() > MAX_FILE {
-        let size = meta.len();
-        return Err(refuse(
-            host,
-            format!("is {size} bytes; the limit is 1 MiB"),
-        ));
-    }
-    *total += meta.len();
-    if *total > MAX_TOTAL {
-        return Err(refuse(host, "takes files past 10 MiB in total"));
-    }
-    if copies.len() == MAX_FILES {
-        return Err(refuse(host, "takes files past 1000 files"));
-    }
-    let contents = fs::read(host).context(host.display())?;
-    if let Some(what) = find_secret(&String::from_utf8_lossy(&contents)) {
-        return Err(refuse(
-            host,
-            format!("contains what looks like a credential ({what})"),
-        ));
-    }
-    copies.push(FileCopy {
-        vm: vm.to_string(),
-        executable: meta.permissions().mode() & 0o111 != 0,
-        contents,
-    });
-    Ok(())
 }
 
 pub(crate) fn is_credentials_file(path: &Path) -> bool {
-    const DIRS: [&str; 4] = [".ssh", ".gnupg", ".aws", ".kube"];
+    const DIRS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", ".secrets"];
     const NAMES: [&str; 8] = [
         ".credentials.json",
         "credentials.json",
@@ -384,7 +401,6 @@ fn write(sandbox: &dyn Sandbox, vm: &str, copy: &FileCopy) -> Result<()> {
         .map(drop)
 }
 
-/// Over the mode and contents.
 fn hash(copy: &FileCopy) -> String {
     fnv(std::iter::once(u8::from(copy.executable))
         .chain(copy.contents.iter().copied()))
@@ -393,11 +409,12 @@ fn hash(copy: &FileCopy) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Copied, CopyPlan, FileCopy, Record, apply_copy, hash,
-        is_credentials_file, plan, plan_copy, vm_path,
+        Copied, CopyPlan, FileCopy, Record, Request, ad_hoc_entry, apply_copy,
+        copy as copy_files, copy_declared, hash, is_credentials_file, plan,
+        plan_copy, vm_path,
     };
     use crate::error::Result;
-    use crate::testing::{roots, scratch_dir};
+    use crate::testing::{hangar_with, roots, scratch_dir, settled};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -473,6 +490,7 @@ mod tests {
             "/h/.gnupg/gpg.conf",
             "/h/.kube/config",
             "/h/.config/gh/config.yml",
+            "/h/.secrets/proxy-token",
         ] {
             assert!(is_credentials_file(Path::new(path)), "{path}");
         }
@@ -544,8 +562,6 @@ mod tests {
         fs::write(home.join("token.md"), format!("ghp_{}", "x".repeat(36)))
             .unwrap();
         fs::write(home.join("big"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
-        std::os::unix::fs::symlink(home.join("token.md"), home.join("link"))
-            .unwrap();
         for (dir, file) in
             [("state/bays/other/home", "x"), ("cache/bays/other", "x")]
         {
@@ -557,7 +573,6 @@ mod tests {
         for (host, why) in [
             ("~/cfg", "looks like a credentials file"),
             ("~/token.md", "looks like a credential (ghp_)"),
-            ("~/link", "is a symlink"),
             ("~/big", "the limit is 1 MiB"),
             ("~/state", "hangar's own state"),
             ("~", "hangar's own state"),
@@ -576,7 +591,91 @@ mod tests {
         );
         assert!(error.contains("credentials file"), "{error}");
         let error = refusal(&home, "/home/pilot/x", "~/token.md");
-        assert!(error.contains("hangar credential set"), "{error}");
+        assert!(error.contains("never copies secrets"), "{error}");
+    }
+
+    fn link(target: &Path, at: &Path) {
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    fn planned(home: &Path, host: &str) -> crate::error::Result<Vec<FileCopy>> {
+        let files = BTreeMap::from([("/home/pilot/x".into(), host.into())]);
+        plan(&files, home, &roots(home, "state", "cache"))
+    }
+
+    #[test]
+    fn copy_follows_symlinks_and_checks_targets() {
+        let home = fs::canonicalize(scratch_dir("files-links")).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        fs::write(home.join("plain.md"), "be terse").unwrap();
+        link(&home.join(".ssh/id_ed25519"), &home.join("innocent"));
+        link(&home.join("plain.md"), &home.join("ok"));
+        let error = planned(&home, "~/innocent").unwrap_err().to_string();
+        assert!(error.contains("looks like a credentials file"), "{error}");
+        let copies = planned(&home, "~/ok").unwrap();
+        assert_eq!(copies[0].contents, b"be terse");
+        assert_eq!(copies[0].vm, "/home/pilot/x");
+    }
+
+    #[test]
+    fn copy_dir_symlink_to_secret_content_is_refused() {
+        let home = fs::canonicalize(scratch_dir("files-link-secret")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        fs::write(home.join("real/notes"), "sk-ant-api03-abcdefghijklmnop")
+            .unwrap();
+        fs::create_dir_all(home.join("dir")).unwrap();
+        link(&home.join("real"), &home.join("dir/inner"));
+        let error = planned(&home, "~/dir").unwrap_err().to_string();
+        assert!(
+            error.contains("looks like a credential (sk-ant-)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn copy_refuses_links_by_their_own_name_and_dir_webs() {
+        let home = fs::canonicalize(scratch_dir("files-names")).unwrap();
+        fs::create_dir_all(home.join("dotfiles/kube")).unwrap();
+        fs::write(home.join("dotfiles/kube/config"), "x").unwrap();
+        link(&home.join("dotfiles/kube"), &home.join(".kube"));
+        let error = planned(&home, "~/.kube").unwrap_err().to_string();
+        assert!(error.contains("credentials file"), "{error}");
+
+        fs::create_dir_all(home.join("web/l12")).unwrap();
+        fs::write(home.join("web/l12/f"), "x").unwrap();
+        for level in (0..12).rev() {
+            let dir = home.join(format!("web/l{level}"));
+            fs::create_dir_all(&dir).unwrap();
+            for name in ["a", "b"] {
+                link(
+                    &home.join(format!("web/l{}", level + 1)),
+                    &dir.join(name),
+                );
+            }
+        }
+        let error = planned(&home, "~/web/l0").unwrap_err().to_string();
+        assert!(error.contains("past 1000 files"), "{error}");
+    }
+
+    #[test]
+    fn copy_symlink_loop_is_refused() {
+        let home = fs::canonicalize(scratch_dir("files-loop")).unwrap();
+        fs::create_dir_all(home.join("d")).unwrap();
+        link(&home.join("d"), &home.join("d/again"));
+        let error = planned(&home, "~/d").unwrap_err().to_string();
+        assert!(error.contains("symlink loop"), "{error}");
+    }
+
+    #[test]
+    fn the_same_target_linked_twice_is_not_a_loop() {
+        let home = fs::canonicalize(scratch_dir("files-twice")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        fs::write(home.join("real/a"), "a").unwrap();
+        fs::create_dir_all(home.join("d")).unwrap();
+        link(&home.join("real"), &home.join("d/one"));
+        link(&home.join("real"), &home.join("d/two"));
+        assert_eq!(planned(&home, "~/d").unwrap().len(), 2);
     }
 
     #[test]
@@ -678,7 +777,6 @@ mod tests {
             ["/home/pilot/a", "/home/pilot/b"]
         );
 
-        // Ad hoc: written, but never recorded.
         let plan = plan_copy(&copies, Record::new(), false);
         let (_, written, _, last) = run_plan(plan, &copies, None);
         assert_eq!(written, ["/home/pilot/a", "/home/pilot/b"]);
@@ -705,5 +803,65 @@ mod tests {
         assert_ne!(hash(&plain), hash(&copy("/home/pilot/a", "y")));
         assert_ne!(hash(&plain), hash(&executable));
         assert_eq!(hash(&plain), hash(&copy("/elsewhere", "x")));
+    }
+
+    const CODE_MOUNT: &str = r#"{"bays": [{"name": "work", "proxy": null,
+        "mounts": {"~/code": {"host": "~/code", "mode": "rw",
+                   "unsafe": true}}}]}"#;
+    const CONFIG_COPY: &str = r#"{"bays": [{"name": "work", "proxy": null,
+        "mounts": {"~/cfg": {"host": "~/cfg", "mode": "copy"}}}]}"#;
+    const NO_MOUNTS: &str = r#"{"bays": [{"name": "work", "proxy": null}]}"#;
+
+    #[test]
+    fn ad_hoc_copies_without_a_dest_stay_inside_the_home() {
+        let home = scratch_dir("files-outside-home");
+        let error = ad_hoc_entry("/etc/hosts", None, &home).unwrap_err();
+        assert!(
+            error.message().contains("is outside your home"),
+            "{}",
+            error.message()
+        );
+        let (dest, _) = ad_hoc_entry("~/notes", None, &home).unwrap();
+        assert_eq!(dest, "/home/pilot/notes");
+    }
+
+    #[test]
+    fn ad_hoc_copies_refuse_to_land_inside_a_live_mount() {
+        let state = scratch_dir("files-overlap");
+        let hangar = hangar_with(CODE_MOUNT, &state, settled());
+        let bay = hangar.bay("work").unwrap();
+        let request = Request::AdHoc {
+            src: "~/notes",
+            dest: Some("~/code/notes"),
+        };
+        let error = copy_files(&hangar, &bay, &request).unwrap_err();
+        assert!(
+            error.message().contains("overlaps the mount at"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_copy_dropped_from_the_config_is_removed_from_the_vm() {
+        let state = scratch_dir("files-dropped");
+        let sandbox = settled();
+        let hangar = hangar_with(CONFIG_COPY, &state, sandbox.clone());
+        fs::write(hangar.host_home.join("cfg"), "settings").unwrap();
+        let bay = hangar.bay("work").unwrap();
+        let copied = copy_declared(&hangar, &bay).unwrap();
+        assert_eq!(copied.copied, ["/home/pilot/cfg"]);
+
+        let hangar = hangar_with(NO_MOUNTS, &state, sandbox.clone());
+        let bay = hangar.bay("work").unwrap();
+        let copied = copy_declared(&hangar, &bay).unwrap();
+        assert_eq!(copied.removed, ["/home/pilot/cfg"]);
+        let calls = sandbox.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("rm -f -- /home/pilot/cfg")),
+            "{calls:?}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-name: bay image
+name: bay image and release
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+      - uses: DeterminateSystems/determinate-nix-action@16f94ba7aae399b9f9077c254b6719ec6de7e3e3 # v3.24.2
       # No Nix cache: a published image must not build from a cache that
       # pull requests can write to.
       - run: nix build ".#packages.$SYSTEM.bay-image"
@@ -44,7 +44,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: >-
           nix run --inputs-from . nixpkgs#sbomnix -- ./result --cdx "sbom-$ARCH.cdx.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ matrix.arch }}
           path: sbom-${{ matrix.arch }}.cdx.json
@@ -65,8 +65,11 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
     steps:
       - name: multi-arch manifest
+        id: manifest
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
@@ -79,3 +82,62 @@ jobs:
           digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" \
             --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "Pin this: \`$IMAGE@$digest\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+
+  # A release's binaries carry its image's digest, so the image they run
+  # is the one built here even if the tag is re-pushed. Built by the
+  # runner's rustup (rust-toolchain.toml), not Nix: a Nix-built binary
+  # links /nix/store paths. Linux builds are static (musl).
+  binaries:
+    if: github.ref_type == 'tag'
+    timeout-minutes: 30
+    needs: manifest
+    strategy:
+      matrix:
+        include:
+          - {runner: macos-26, target: aarch64-darwin, rust: aarch64-apple-darwin}
+          - {runner: ubuntu-26.04, target: x86_64-linux, rust: x86_64-unknown-linux-musl}
+          - {runner: ubuntu-26.04-arm, target: aarch64-linux, rust: aarch64-unknown-linux-musl}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+      RUST_TARGET: ${{ matrix.rust }}
+      HANGAR_BAY_IMAGE_DIGEST: ${{ needs.manifest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: check the digest
+        run: |
+          [[ "$HANGAR_BAY_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "not an image digest: $HANGAR_BAY_IMAGE_DIGEST" >&2
+            exit 1
+          }
+      - run: rustup target add "$RUST_TARGET"
+      - run: cargo build --release --locked --target "$RUST_TARGET"
+      - run: cp "target/$RUST_TARGET/release/hangar" "hangar-$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hangar-${{ matrix.target }}
+          path: hangar-${{ matrix.target }}
+
+  # One job creates the release: parallel jobs racing to create it fail
+  # with "already_exists".
+  release:
+    timeout-minutes: 30
+    needs: binaries
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          merge-multiple: true
+      - run: sha256sum hangar-* >SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --generate-notes hangar-* SHA256SUMS

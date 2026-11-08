@@ -1,6 +1,5 @@
 //! One hangar at a time: commands that change state hold an exclusive
-//! lock on `$XDG_STATE_HOME/hangar/lock`, outside `stateDir`, which
-//! `destroy --state` deletes.
+//! lock on `$XDG_STATE_HOME/hangar/lock`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
@@ -12,7 +11,6 @@ pub(crate) struct Lock {
     _file: File,
 }
 
-/// Takes the lock, calling `waiting` once if another hangar holds it.
 pub(crate) fn acquire(path: &Path, waiting: impl FnOnce()) -> Result<Lock> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).context(dir.display())?;

@@ -1,0 +1,14 @@
+{
+  "proxies": {
+    "vault": {
+      "kind": "agent-vault",
+      "run": "managed",
+      "bays": { "oss": "oss" }
+    }
+  },
+  "defaults": { "proxy": "vault" },
+  "bays": [
+    { "name": "work", "apps": ["claude-code"] },
+    { "name": "oss", "apps": ["claude-code", "codex"] }
+  ]
+}

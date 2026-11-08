@@ -1,7 +1,5 @@
 use std::fmt;
 
-/// A message plus, when there's an obvious next step, a hint. Humans see
-/// `message: hint`; `--json` keeps them apart.
 #[derive(Debug)]
 pub(crate) struct Error {
     message: String,
@@ -47,7 +45,6 @@ impl fmt::Display for Error {
     }
 }
 
-/// `.context("…")` for results and options, prefixing the cause.
 pub(crate) trait Context<T> {
     fn context(self, message: impl fmt::Display) -> Result<T>;
 }

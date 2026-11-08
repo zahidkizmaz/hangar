@@ -1,21 +1,15 @@
-//! Every child process is built here, so none inherits the master
-//! password, and started here, so each one is logged at debug.
+//! Every child process is built and started here, so each one is logged at
+//! debug.
 
 use std::io::{ErrorKind, Write};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
 use crate::error::{Context, Error, Result};
 
-const SECRET_VAR: &str = "HANGAR_MASTER_PASSWORD";
-
 pub(crate) fn command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.env_remove(SECRET_VAR);
-    command
+    Command::new(program)
 }
 
-/// Runs `command`, writing `stdin` if given, and returns its output
-/// whatever the exit status.
 pub(crate) fn output(
     command: &mut Command,
     stdin: Option<&[u8]>,
@@ -65,7 +59,7 @@ pub(crate) fn describe(command: &Command) -> String {
 
 pub(crate) fn spawn_error(command: &Command, error: &std::io::Error) -> Error {
     let program = command.get_program().to_string_lossy();
-    if error.kind() == ErrorKind::NotFound {
+    if matches!(error.kind(), ErrorKind::NotFound) {
         Error::new(format!("{program} not found on PATH"))
     } else {
         Error::new(format!("could not run {program}: {error}"))
@@ -78,13 +72,25 @@ pub(crate) fn stderr(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SECRET_VAR, command};
+    use super::spawn_error;
+    use std::io::{Error, ErrorKind};
+    use std::process::Command;
 
     #[test]
-    fn children_never_inherit_the_master_password() {
-        let removed = command("env")
-            .get_envs()
-            .any(|(key, value)| key == SECRET_VAR && value.is_none());
-        assert!(removed);
+    fn a_missing_program_is_reported_as_not_on_path() {
+        let error = Error::from(ErrorKind::NotFound);
+        let message = spawn_error(&Command::new("nope"), &error);
+        assert_eq!(message.message(), "nope not found on PATH");
+    }
+
+    #[test]
+    fn any_other_spawn_failure_keeps_its_cause() {
+        let error = Error::from(ErrorKind::PermissionDenied);
+        let message = spawn_error(&Command::new("nope"), &error);
+        assert!(
+            message.message().starts_with("could not run nope: "),
+            "{}",
+            message.message()
+        );
     }
 }
